@@ -1,0 +1,25 @@
+stewart_control/
+│
+├── main.py
+│
+├── gui/
+│   ├── gui_main.py
+│   └── gui_layout.py
+│
+├── kinematics/
+│   ├── geometry.py
+│   ├── ik_solver.py
+│   └── validation.py
+│
+├── visualization/
+│   ├── visualizer3d.py
+│   └── animator.py
+│
+├── routines/
+│   └── demo_routines.py
+│
+├── comms/
+│   ├── arduino_protocol.py
+│   └── serial_sender.py
+│
+└── config.py
