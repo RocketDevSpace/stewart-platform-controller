@@ -130,8 +130,6 @@ while True:
     display = frame.copy()
     warped = None
     ball_mask = None
-    
-    print("Detected IDs:", ids)
 
     if ids is not None:
         ids = ids.flatten()
