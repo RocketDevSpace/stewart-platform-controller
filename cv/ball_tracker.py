@@ -1,16 +1,23 @@
 import cv2
 import numpy as np
 import time
-
+import math
 
 # =========================
 # USER SETTINGS
 # =========================
 
-PLATFORM_SIZE_MM = 160
-WARP_SIZE_PX = 700   # slightly higher res = better ball tracking
-
+PLATFORM_SIZE_MM = 240.0
+WARP_SIZE_PX = 800
 CAMERA_INDEX = 0
+
+ARUCO_SIZE_MM = 37.5
+
+# Velocity smoothing factor (0 = none, 1 = infinite smoothing)
+VEL_ALPHA = 0.7   # 0.7 = strong smoothing
+
+# Velocity arrow scaling (mm/s → pixels)
+VEL_ARROW_SCALE = 0.15
 
 # =========================
 # ARUCO SETUP
@@ -20,17 +27,18 @@ aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 aruco_params = cv2.aruco.DetectorParameters()
 detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-CORNER_IDS = [0, 1, 2, 3]  # clockwise order
+CORNER_IDS = [0, 1, 2, 3]
 
-dst_pts = np.array([
-    [0, 0],
-    [WARP_SIZE_PX - 1, 0],
-    [WARP_SIZE_PX - 1, WARP_SIZE_PX - 1],
-    [0, WARP_SIZE_PX - 1]
-], dtype=np.float32)
+# Marker centers in STEWART PLATFORM COORDINATES (mm)
+aruco_world_mm = {
+    0: np.array([ 60.0,  60.0]),   # front right
+    1: np.array([-60.0,  60.0]),   # back right
+    2: np.array([-60.0, -60.0]),   # back left
+    3: np.array([ 60.0, -60.0])    # front left
+}
 
 # =========================
-# HSV SLIDER WINDOW
+# HSV CONTROLS
 # =========================
 
 def nothing(x):
@@ -54,41 +62,8 @@ def get_marker_center(corners):
     pts = corners[0]
     return np.mean(pts, axis=0)
 
-def compute_missing_corner(points_dict):
-    """
-    points_dict contains {id: point} for some of the IDs 0,1,2,3.
-    If exactly one is missing, compute it using square/parallelogram rule.
-    """
-
-    missing = [i for i in CORNER_IDS if i not in points_dict]
-
-    if len(missing) != 1:
-        return points_dict  # nothing to do
-
-    m = missing[0]
-
-    # parallelogram logic for a square with corners:
-    # 0 -> 1 -> 2 -> 3 clockwise
-    # 0 opposite 2, 1 opposite 3
-
-    if m == 0:
-        # P0 = P1 + P3 - P2
-        points_dict[0] = points_dict[1] + points_dict[3] - points_dict[2]
-    elif m == 1:
-        # P1 = P0 + P2 - P3
-        points_dict[1] = points_dict[0] + points_dict[2] - points_dict[3]
-    elif m == 2:
-        # P2 = P1 + P3 - P0
-        points_dict[2] = points_dict[1] + points_dict[3] - points_dict[0]
-    elif m == 3:
-        # P3 = P0 + P2 - P1
-        points_dict[3] = points_dict[0] + points_dict[2] - points_dict[1]
-
-    return points_dict
-
 def find_ball_center(mask):
     kernel = np.ones((5, 5), np.uint8)
-
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
@@ -110,17 +85,30 @@ def find_ball_center(mask):
 
     return (int(x), int(y)), int(radius)
 
+# Convert mm → warp pixel
+def mm_to_warp_px(x_mm, y_mm):
+    px_per_mm = WARP_SIZE_PX / PLATFORM_SIZE_MM
+    cx = WARP_SIZE_PX // 2
+    cy = WARP_SIZE_PX // 2
+
+    px = cx + x_mm * px_per_mm
+    py = cy - y_mm * px_per_mm  # minus because image Y is downward
+
+    return [px, py]
+
 # =========================
-# CAMERA SETUP
+# CAMERA
 # =========================
 
 cap = cv2.VideoCapture(CAMERA_INDEX)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-last_time = time.time()
-frame_count = 0
-fps = 0
 
+prev_ball_mm = None
+prev_time = None
+
+vx_smooth = 0
+vy_smooth = 0
 
 print("Press Q to quit.")
 
@@ -132,121 +120,132 @@ while True:
     ret, frame = cap.read()
     if not ret:
         break
-
-    # Fix mirrored camera feed
+    
+    # Restore horizontal flip (REQUIRED for your camera)
     frame = cv2.flip(frame, 1)
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
     corners, ids, rejected = detector.detectMarkers(gray)
 
     display = frame.copy()
-
     warped = None
     ball_mask = None
+    
+    print("Detected IDs:", ids)
 
     if ids is not None:
         ids = ids.flatten()
         cv2.aruco.drawDetectedMarkers(display, corners, ids)
 
-        marker_centers = {}
+        marker_centers_px = {}
 
         for i, marker_id in enumerate(ids):
             if marker_id in CORNER_IDS:
-                marker_centers[marker_id] = get_marker_center(corners[i])
+                marker_centers_px[marker_id] = get_marker_center(corners[i])
+                
 
-        # If we have at least 3 markers, we can attempt warp
-        if len(marker_centers) >= 3:
+        if len(marker_centers_px) == 4:
 
-            # If exactly 3 markers, compute missing corner
-            if len(marker_centers) == 3:
-                marker_centers = compute_missing_corner(marker_centers)
+            src_pts = []
+            dst_pts = []
 
-            # Now if we have 4 (real or computed), warp
-            if all(mid in marker_centers for mid in CORNER_IDS):
+            for mid in CORNER_IDS:
+                src_pts.append(marker_centers_px[mid])
 
-                src_pts = np.array([
-                    marker_centers[0],
-                    marker_centers[1],
-                    marker_centers[2],
-                    marker_centers[3]
-                ], dtype=np.float32)
+                x_mm, y_mm = aruco_world_mm[mid]
+                dst_pts.append(mm_to_warp_px(x_mm, y_mm))
 
-                H, _ = cv2.findHomography(src_pts, dst_pts)
+            src_pts = np.array(src_pts, dtype=np.float32)
+            dst_pts = np.array(dst_pts, dtype=np.float32)
 
-                if H is not None:
-                    warped = cv2.warpPerspective(frame, H, (WARP_SIZE_PX, WARP_SIZE_PX))
+            H, _ = cv2.findHomography(src_pts, dst_pts)
 
-                    # Get HSV slider values
-                    hmin = cv2.getTrackbarPos("H Min", "HSV Controls")
-                    hmax = cv2.getTrackbarPos("H Max", "HSV Controls")
-                    smin = cv2.getTrackbarPos("S Min", "HSV Controls")
-                    smax = cv2.getTrackbarPos("S Max", "HSV Controls")
-                    vmin = cv2.getTrackbarPos("V Min", "HSV Controls")
-                    vmax = cv2.getTrackbarPos("V Max", "HSV Controls")
+            if H is not None:
 
-                    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+                warped = cv2.warpPerspective(frame, H, (WARP_SIZE_PX, WARP_SIZE_PX))
 
-                    lower = np.array([hmin, smin, vmin])
-                    upper = np.array([hmax, smax, vmax])
+                hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
 
-                    ball_mask = cv2.inRange(hsv, lower, upper)
+                hmin = cv2.getTrackbarPos("H Min", "HSV Controls")
+                hmax = cv2.getTrackbarPos("H Max", "HSV Controls")
+                smin = cv2.getTrackbarPos("S Min", "HSV Controls")
+                smax = cv2.getTrackbarPos("S Max", "HSV Controls")
+                vmin = cv2.getTrackbarPos("V Min", "HSV Controls")
+                vmax = cv2.getTrackbarPos("V Max", "HSV Controls")
 
-                    ball = find_ball_center(ball_mask)
+                lower = np.array([hmin, smin, vmin])
+                upper = np.array([hmax, smax, vmax])
 
-                    # Draw center crosshair
-                    cx = WARP_SIZE_PX // 2
-                    cy = WARP_SIZE_PX // 2
-                    cv2.line(warped, (cx, 0), (cx, WARP_SIZE_PX), (255, 255, 255), 1)
-                    cv2.line(warped, (0, cy), (WARP_SIZE_PX, cy), (255, 255, 255), 1)
+                ball_mask = cv2.inRange(hsv, lower, upper)
 
-                    if ball is not None:
-                        (bx, by), radius = ball
+                ball = find_ball_center(ball_mask)
 
-                        cv2.circle(warped, (bx, by), radius, (0, 255, 0), 2)
-                        cv2.circle(warped, (bx, by), 4, (0, 0, 255), -1)
+                cx = WARP_SIZE_PX // 2
+                cy = WARP_SIZE_PX // 2
 
-                        mm_per_px = PLATFORM_SIZE_MM / WARP_SIZE_PX
+                cv2.line(warped, (cx, 0), (cx, WARP_SIZE_PX), (255,255,255), 1)
+                cv2.line(warped, (0, cy), (WARP_SIZE_PX, cy), (255,255,255), 1)
 
-                        ball_x_mm = (bx - cx) * mm_per_px
-                        ball_y_mm = (by - cy) * mm_per_px
+                if ball is not None:
 
-                        cv2.putText(
+                    (bx, by), radius = ball
+                    cv2.circle(warped, (bx, by), radius, (0,255,0), 2)
+                    cv2.circle(warped, (bx, by), 4, (0,0,255), -1)
+
+                    mm_per_px = PLATFORM_SIZE_MM / WARP_SIZE_PX
+
+                    x_mm = (bx - cx) * mm_per_px
+                    y_mm = (cy - by) * mm_per_px
+
+                    current_time = time.time()
+
+                    if prev_ball_mm is not None:
+                        dt = current_time - prev_time
+
+                        vx_raw = (x_mm - prev_ball_mm[0]) / dt
+                        vy_raw = (y_mm - prev_ball_mm[1]) / dt
+
+                        # smoothing
+                        vx_smooth = VEL_ALPHA * vx_smooth + (1 - VEL_ALPHA) * vx_raw
+                        vy_smooth = VEL_ALPHA * vy_smooth + (1 - VEL_ALPHA) * vy_raw
+
+                        speed = math.sqrt(vx_smooth**2 + vy_smooth**2)
+                        angle = math.degrees(math.atan2(vy_smooth, vx_smooth))
+
+                        # draw velocity arrow
+                        arrow_px_x = int(bx + vx_smooth * VEL_ARROW_SCALE)
+                        arrow_px_y = int(by - vy_smooth * VEL_ARROW_SCALE)
+
+                        cv2.arrowedLine(
                             warped,
-                            f"Ball X={ball_x_mm:.1f} mm  Y={ball_y_mm:.1f} mm",
-                            (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8,
-                            (255, 255, 255),
-                            2
+                            (bx, by),
+                            (arrow_px_x, arrow_px_y),
+                            (255,0,0),
+                            3
                         )
 
-                        print(f"Ball position: X={ball_x_mm:.1f} mm, Y={ball_y_mm:.1f} mm")
+                        cv2.putText(warped,
+                            f"X={x_mm:.1f}mm Y={y_mm:.1f}mm",
+                            (20,40),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
 
-                    # Show marker count info
-                    cv2.putText(
-                        warped,
-                        f"Markers visible: {len([m for m in ids if m in CORNER_IDS])}/4",
-                        (20, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 255),
-                        2
-                    )
-                    
-    frame_count += 1    
-    now = time.time()
-    
-    if now - last_time >= 1.0:
-        fps = frame_count / (now - last_time)
-        frame_count = 0
-        last_time = now
-        print(f"CV FPS: {fps:.1f}")
+                        cv2.putText(warped,
+                            f"Vx={vx_raw:.1f} Vy={vy_raw:.1f} (raw)",
+                            (20,70),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(200,200,200),2)
 
+                        cv2.putText(warped,
+                            f"Vx={vx_smooth:.1f} Vy={vy_smooth:.1f} (smooth)",
+                            (20,100),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
 
-    # Display windows
-    cv2.putText(display, f"FPS: {fps:.1f}", (20, 60),
-            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        cv2.putText(warped,
+                            f"Speed={speed:.1f} mm/s  Angle={angle:.1f} deg",
+                            (20,130),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+
+                    prev_ball_mm = (x_mm, y_mm)
+                    prev_time = current_time
 
     cv2.imshow("Camera View", display)
 
