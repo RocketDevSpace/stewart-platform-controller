@@ -3,259 +3,271 @@ import numpy as np
 import time
 import math
 
-# =========================
-# USER SETTINGS
-# =========================
 
-PLATFORM_SIZE_MM = 240.0
-WARP_SIZE_PX = 800
-CAMERA_INDEX = 0
+class BallTracker:
 
-ARUCO_SIZE_MM = 37.5
+    # =========================
+    # INIT
+    # =========================
 
-# Velocity smoothing factor (0 = none, 1 = infinite smoothing)
-VEL_ALPHA = 0.7   # 0.7 = strong smoothing
+    def __init__(self,
+                 camera_index=0,
+                 platform_size_mm=240.0,
+                 warp_size_px=800,
+                 aruco_size_mm=37.5,
+                 vel_alpha=0.7,
+                 show_debug=True):
 
-# Velocity arrow scaling (mm/s → pixels)
-VEL_ARROW_SCALE = 0.15
+        self.PLATFORM_SIZE_MM = platform_size_mm
+        self.WARP_SIZE_PX = warp_size_px
+        self.ARUCO_SIZE_MM = aruco_size_mm
+        self.VEL_ALPHA = vel_alpha
+        self.VEL_ARROW_SCALE = 0.15
+        self.show_debug = show_debug
 
-# =========================
-# ARUCO SETUP
-# =========================
+        # --- ArUco setup ---
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.aruco_params = cv2.aruco.DetectorParameters()
+        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
-aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-aruco_params = cv2.aruco.DetectorParameters()
-detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+        self.CORNER_IDS = [0, 1, 2, 3]
 
-CORNER_IDS = [0, 1, 2, 3]
+        self.aruco_world_mm = {
+            0: np.array([60.0, 60.0]),
+            1: np.array([-60.0, 60.0]),
+            2: np.array([-60.0, -60.0]),
+            3: np.array([60.0, -60.0])
+        }
 
-# Marker centers in STEWART PLATFORM COORDINATES (mm)
-aruco_world_mm = {
-    0: np.array([ 60.0,  60.0]),   # front right
-    1: np.array([-60.0,  60.0]),   # back right
-    2: np.array([-60.0, -60.0]),   # back left
-    3: np.array([ 60.0, -60.0])    # front left
-}
+        # --- Camera ---
+        self.cap = cv2.VideoCapture(camera_index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-# =========================
-# HSV CONTROLS
-# =========================
+        if not self.cap.isOpened():
+            raise RuntimeError("Camera failed to open.")
 
-def nothing(x):
-    pass
+        # --- Velocity state ---
+        self.prev_ball_mm = None
+        self.prev_time = None
+        self.vx_smooth = 0
+        self.vy_smooth = 0
 
-cv2.namedWindow("HSV Controls", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("HSV Controls", 500, 300)
+        # --- HSV window (optional) ---
+        if self.show_debug:
+            self._init_hsv_controls()
 
-cv2.createTrackbar("H Min", "HSV Controls", 10, 179, nothing)
-cv2.createTrackbar("H Max", "HSV Controls", 28, 179, nothing)
-cv2.createTrackbar("S Min", "HSV Controls", 83, 255, nothing)
-cv2.createTrackbar("S Max", "HSV Controls", 255, 255, nothing)
-cv2.createTrackbar("V Min", "HSV Controls", 125, 255, nothing)
-cv2.createTrackbar("V Max", "HSV Controls", 255, 255, nothing)
+    # =========================
+    # HSV TRACKBARS
+    # =========================
 
-# =========================
-# HELPERS
-# =========================
+    def _init_hsv_controls(self):
+        def nothing(x): pass
 
-def get_marker_center(corners):
-    pts = corners[0]
-    return np.mean(pts, axis=0)
+        cv2.namedWindow("HSV Controls", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("HSV Controls", 500, 300)
 
-def find_ball_center(mask):
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        cv2.createTrackbar("H Min", "HSV Controls", 10, 179, nothing)
+        cv2.createTrackbar("H Max", "HSV Controls", 28, 179, nothing)
+        cv2.createTrackbar("S Min", "HSV Controls", 83, 255, nothing)
+        cv2.createTrackbar("S Max", "HSV Controls", 255, 255, nothing)
+        cv2.createTrackbar("V Min", "HSV Controls", 125, 255, nothing)
+        cv2.createTrackbar("V Max", "HSV Controls", 255, 255, nothing)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # =========================
+    # HELPERS
+    # =========================
 
-    if not contours:
-        return None
+    def get_marker_center(self, corners):
+        pts = corners[0]
+        return np.mean(pts, axis=0)
 
-    largest = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(largest)
+    def find_ball_center(self, mask):
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    if area < 150:
-        return None
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    (x, y), radius = cv2.minEnclosingCircle(largest)
+        if not contours:
+            return None
 
-    if radius < 4:
-        return None
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
 
-    return (int(x), int(y)), int(radius)
+        if area < 150:
+            return None
 
-# Convert mm → warp pixel
-def mm_to_warp_px(x_mm, y_mm):
-    px_per_mm = WARP_SIZE_PX / PLATFORM_SIZE_MM
-    cx = WARP_SIZE_PX // 2
-    cy = WARP_SIZE_PX // 2
+        (x, y), radius = cv2.minEnclosingCircle(largest)
 
-    px = cx + x_mm * px_per_mm
-    py = cy - y_mm * px_per_mm  # minus because image Y is downward
+        if radius < 4:
+            return None
 
-    return [px, py]
+        return (int(x), int(y)), int(radius)
 
-# =========================
-# CAMERA
-# =========================
+    def mm_to_warp_px(self, x_mm, y_mm):
+        px_per_mm = self.WARP_SIZE_PX / self.PLATFORM_SIZE_MM
+        cx = self.WARP_SIZE_PX // 2
+        cy = self.WARP_SIZE_PX // 2
 
-cap = cv2.VideoCapture(CAMERA_INDEX)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        px = cx + x_mm * px_per_mm
+        py = cy - y_mm * px_per_mm
+        return [px, py]
 
-prev_ball_mm = None
-prev_time = None
+    # =========================
+    # MAIN UPDATE (NON-BLOCKING)
+    # =========================
 
-vx_smooth = 0
-vy_smooth = 0
+    def update(self):
 
-print("Press Q to quit.")
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
 
-# =========================
-# MAIN LOOP
-# =========================
+        frame = cv2.flip(frame, 1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    
-    # Restore horizontal flip (REQUIRED for your camera)
-    frame = cv2.flip(frame, 1)
+        corners, ids, _ = self.detector.detectMarkers(gray)
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, rejected = detector.detectMarkers(gray)
+        warped = None
 
-    display = frame.copy()
-    warped = None
-    ball_mask = None
+        if ids is None:
+            self._debug_show(frame, None, None)
+            return None
 
-    if ids is not None:
         ids = ids.flatten()
-        cv2.aruco.drawDetectedMarkers(display, corners, ids)
 
         marker_centers_px = {}
 
         for i, marker_id in enumerate(ids):
-            if marker_id in CORNER_IDS:
-                marker_centers_px[marker_id] = get_marker_center(corners[i])
-                
+            if marker_id in self.CORNER_IDS:
+                marker_centers_px[marker_id] = self.get_marker_center(corners[i])
 
-        if len(marker_centers_px) == 4:
+        if len(marker_centers_px) != 4:
+            self._debug_show(frame, None, None)
+            return None
 
-            src_pts = []
-            dst_pts = []
+        src_pts = []
+        dst_pts = []
 
-            for mid in CORNER_IDS:
-                src_pts.append(marker_centers_px[mid])
+        for mid in self.CORNER_IDS:
+            src_pts.append(marker_centers_px[mid])
+            x_mm, y_mm = self.aruco_world_mm[mid]
+            dst_pts.append(self.mm_to_warp_px(x_mm, y_mm))
 
-                x_mm, y_mm = aruco_world_mm[mid]
-                dst_pts.append(mm_to_warp_px(x_mm, y_mm))
+        src_pts = np.array(src_pts, dtype=np.float32)
+        dst_pts = np.array(dst_pts, dtype=np.float32)
 
-            src_pts = np.array(src_pts, dtype=np.float32)
-            dst_pts = np.array(dst_pts, dtype=np.float32)
+        H, _ = cv2.findHomography(src_pts, dst_pts)
 
-            H, _ = cv2.findHomography(src_pts, dst_pts)
+        if H is None:
+            self._debug_show(frame, None, None)
+            return None
 
-            if H is not None:
+        warped = cv2.warpPerspective(frame, H, (self.WARP_SIZE_PX, self.WARP_SIZE_PX))
 
-                warped = cv2.warpPerspective(frame, H, (WARP_SIZE_PX, WARP_SIZE_PX))
+        hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
 
-                hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+        if self.show_debug:
+            hmin = cv2.getTrackbarPos("H Min", "HSV Controls")
+            hmax = cv2.getTrackbarPos("H Max", "HSV Controls")
+            smin = cv2.getTrackbarPos("S Min", "HSV Controls")
+            smax = cv2.getTrackbarPos("S Max", "HSV Controls")
+            vmin = cv2.getTrackbarPos("V Min", "HSV Controls")
+            vmax = cv2.getTrackbarPos("V Max", "HSV Controls")
+        else:
+            # default values if no debug
+            hmin, hmax = 10, 28
+            smin, smax = 83, 255
+            vmin, vmax = 125, 255
 
-                hmin = cv2.getTrackbarPos("H Min", "HSV Controls")
-                hmax = cv2.getTrackbarPos("H Max", "HSV Controls")
-                smin = cv2.getTrackbarPos("S Min", "HSV Controls")
-                smax = cv2.getTrackbarPos("S Max", "HSV Controls")
-                vmin = cv2.getTrackbarPos("V Min", "HSV Controls")
-                vmax = cv2.getTrackbarPos("V Max", "HSV Controls")
+        lower = np.array([hmin, smin, vmin])
+        upper = np.array([hmax, smax, vmax])
 
-                lower = np.array([hmin, smin, vmin])
-                upper = np.array([hmax, smax, vmax])
+        mask = cv2.inRange(hsv, lower, upper)
+        ball = self.find_ball_center(mask)
 
-                ball_mask = cv2.inRange(hsv, lower, upper)
+        if ball is None:
+            self._debug_show(frame, warped, mask)
+            return None
 
-                ball = find_ball_center(ball_mask)
+        (bx, by), radius = ball
 
-                cx = WARP_SIZE_PX // 2
-                cy = WARP_SIZE_PX // 2
+        cx = self.WARP_SIZE_PX // 2
+        cy = self.WARP_SIZE_PX // 2
 
-                cv2.line(warped, (cx, 0), (cx, WARP_SIZE_PX), (255,255,255), 1)
-                cv2.line(warped, (0, cy), (WARP_SIZE_PX, cy), (255,255,255), 1)
+        mm_per_px = self.PLATFORM_SIZE_MM / self.WARP_SIZE_PX
+        x_mm = (bx - cx) * mm_per_px
+        y_mm = (cy - by) * mm_per_px
 
-                if ball is not None:
+        current_time = time.time()
 
-                    (bx, by), radius = ball
-                    cv2.circle(warped, (bx, by), radius, (0,255,0), 2)
-                    cv2.circle(warped, (bx, by), 4, (0,0,255), -1)
+        if self.prev_ball_mm is None:
+            vx = 0
+            vy = 0
+        else:
+            dt = current_time - self.prev_time
+            if dt <= 0:
+                vx = 0
+                vy = 0
+            else:
+                vx_raw = (x_mm - self.prev_ball_mm[0]) / dt
+                vy_raw = (y_mm - self.prev_ball_mm[1]) / dt
 
-                    mm_per_px = PLATFORM_SIZE_MM / WARP_SIZE_PX
+                self.vx_smooth = self.VEL_ALPHA * self.vx_smooth + (1 - self.VEL_ALPHA) * vx_raw
+                self.vy_smooth = self.VEL_ALPHA * self.vy_smooth + (1 - self.VEL_ALPHA) * vy_raw
 
-                    x_mm = (bx - cx) * mm_per_px
-                    y_mm = (cy - by) * mm_per_px
+                vx = self.vx_smooth
+                vy = self.vy_smooth
 
-                    current_time = time.time()
+        self.prev_ball_mm = (x_mm, y_mm)
+        self.prev_time = current_time
 
-                    if prev_ball_mm is not None:
-                        dt = current_time - prev_time
+        self._debug_show(frame, warped, mask, bx, by, vx, vy)
 
-                        vx_raw = (x_mm - prev_ball_mm[0]) / dt
-                        vy_raw = (y_mm - prev_ball_mm[1]) / dt
+        return {
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "vx_mm_s": vx,
+            "vy_mm_s": vy
+        }
 
-                        # smoothing
-                        vx_smooth = VEL_ALPHA * vx_smooth + (1 - VEL_ALPHA) * vx_raw
-                        vy_smooth = VEL_ALPHA * vy_smooth + (1 - VEL_ALPHA) * vy_raw
+    # =========================
+    # DEBUG DISPLAY
+    # =========================
 
-                        speed = math.sqrt(vx_smooth**2 + vy_smooth**2)
-                        angle = math.degrees(math.atan2(vy_smooth, vx_smooth))
+    def _debug_show(self, frame, warped, mask, bx=None, by=None, vx=0, vy=0):
+        if not self.show_debug:
+            return
 
-                        # draw velocity arrow
-                        arrow_px_x = int(bx + vx_smooth * VEL_ARROW_SCALE)
-                        arrow_px_y = int(by - vy_smooth * VEL_ARROW_SCALE)
+        cv2.imshow("Camera View", frame)
 
-                        cv2.arrowedLine(
-                            warped,
-                            (bx, by),
-                            (arrow_px_x, arrow_px_y),
-                            (255,0,0),
-                            3
-                        )
+        if warped is not None:
+            if bx is not None:
+                cv2.circle(warped, (bx, by), 5, (0, 0, 255), -1)
 
-                        cv2.putText(warped,
-                            f"X={x_mm:.1f}mm Y={y_mm:.1f}mm",
-                            (20,40),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
+                arrow_px_x = int(bx + vx * self.VEL_ARROW_SCALE)
+                arrow_px_y = int(by - vy * self.VEL_ARROW_SCALE)
 
-                        cv2.putText(warped,
-                            f"Vx={vx_raw:.1f} Vy={vy_raw:.1f} (raw)",
-                            (20,70),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(200,200,200),2)
+                cv2.arrowedLine(warped,
+                                (bx, by),
+                                (arrow_px_x, arrow_px_y),
+                                (255, 0, 0),
+                                2)
 
-                        cv2.putText(warped,
-                            f"Vx={vx_smooth:.1f} Vy={vy_smooth:.1f} (smooth)",
-                            (20,100),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+            cv2.imshow("Warped Platform View", warped)
 
-                        cv2.putText(warped,
-                            f"Speed={speed:.1f} mm/s  Angle={angle:.1f} deg",
-                            (20,130),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+        if mask is not None:
+            cv2.imshow("Ball Mask", mask)
 
-                    prev_ball_mm = (x_mm, y_mm)
-                    prev_time = current_time
+        cv2.waitKey(1)
 
-    cv2.imshow("Camera View", display)
+    # =========================
+    # CLEANUP
+    # =========================
 
-    if warped is not None:
-        cv2.imshow("Warped Platform View", warped)
-
-    if ball_mask is not None:
-        cv2.imshow("Ball Mask", ball_mask)
-
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord("q"):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+    def release(self):
+        if self.cap:
+            self.cap.release()
+        if self.show_debug:
+            cv2.destroyAllWindows()

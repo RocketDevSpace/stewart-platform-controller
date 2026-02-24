@@ -7,6 +7,8 @@ from stewart_control.visualization.visualizer3d import StewartVisualizer
 from stewart_control.comms.serial_sender import SerialSender
 from stewart_control.comms.arduino_protocol import format_command
 from stewart_control.routines.routines import ROUTINES
+from stewart_control.cv.ball_tracker import BallTracker
+from stewart_control.cv.ball_controller import BallController
 import time
 
 
@@ -49,6 +51,21 @@ class StewartGUILayout(QWidget):
         self.profile_enabled = True
         self.profile_every_n = 10  # print every 10 steps
         self._profile_step_counter = 0
+        
+        # --- Ball balancing system ---
+        self.ball_tracker = BallTracker()
+        self.ball_controller = BallController(
+            kp=0.014,
+            kd=0.024,
+            max_tilt_deg=8.0
+        )
+        
+        self.vision_enabled = False
+        
+        # Timer for control loop (separate from routine timer)
+        self.vision_timer = QTimer()
+        self.vision_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.vision_timer.timeout.connect(self._vision_control_step)
 
         
     
@@ -90,8 +107,41 @@ class StewartGUILayout(QWidget):
         control_layout.addWidget(self.cancel_routine_btn)
 
 
+        # --- Vision Controls ---
+        control_layout.addWidget(QLabel("Ball Balancing Control"))
+        
         self.vision_button = QPushButton('Enable Vision Mode')
+        self.vision_button.setStyleSheet("background-color: darkgreen; color: white;")
+        self.vision_button.clicked.connect(self.toggle_vision_mode)
         control_layout.addWidget(self.vision_button)
+        
+        self.cancel_vision_btn = QPushButton("🛑 Cancel Vision Mode")
+        self.cancel_vision_btn.setStyleSheet("background-color: darkred; color: white;")
+        self.cancel_vision_btn.clicked.connect(self.disable_vision_mode)
+        self.cancel_vision_btn.setEnabled(False)
+        control_layout.addWidget(self.cancel_vision_btn)
+        
+        # --- Kp Slider ---
+        self.kp_label = QLabel("Kp: 0.03")
+        self.kp_slider = QSlider(QtCore.Qt.Horizontal)
+        self.kp_slider.setMinimum(0)
+        self.kp_slider.setMaximum(100)
+        self.kp_slider.setValue(30)  # 0.03 scaled by 1000
+        self.kp_slider.valueChanged.connect(self.update_pd_gains)
+        
+        control_layout.addWidget(self.kp_label)
+        control_layout.addWidget(self.kp_slider)
+        
+        # --- Kd Slider ---
+        self.kd_label = QLabel("Kd: 0.008")
+        self.kd_slider = QSlider(QtCore.Qt.Horizontal)
+        self.kd_slider.setMinimum(0)
+        self.kd_slider.setMaximum(100)
+        self.kd_slider.setValue(8)  # 0.008 scaled by 1000
+        self.kd_slider.valueChanged.connect(self.update_pd_gains)
+        
+        control_layout.addWidget(self.kd_label)
+        control_layout.addWidget(self.kd_slider)
 
         self.send_button = QPushButton('SEND TO ARDUINO')
         self.send_button.setStyleSheet("background-color: red; color: white; font-size: 16pt;")
@@ -748,3 +798,101 @@ class StewartGUILayout(QWidget):
                     clipped.append((i, original, 10))
     
         return safe_angles, clipped
+
+    def update_pd_gains(self):
+        kp = self.kp_slider.value() / 1000.0
+        kd = self.kd_slider.value() / 1000.0
+    
+        self.kp_label.setText(f"Kp: {kp:.3f}")
+        self.kd_label.setText(f"Kd: {kd:.3f}")
+    
+        self.ball_controller.set_gains(kp, kd)
+        
+    def toggle_vision_mode(self):
+        if not self.vision_enabled:
+            self.enable_vision_mode()
+        else:
+            self.disable_vision_mode()
+    
+    
+    def enable_vision_mode(self):
+        self.preview_output.append("[INFO] Vision mode enabled.")
+        self.vision_enabled = True
+    
+        self.vision_button.setText("Vision Mode ACTIVE")
+        self.vision_button.setStyleSheet("background-color: orange; color: black;")
+    
+        self.cancel_vision_btn.setEnabled(True)
+    
+        # Disable manual sliders
+        for slider in self.sliders.values():
+            slider.setEnabled(False)
+    
+        # Start control loop (50 Hz)
+        self.vision_timer.start(20)
+    
+    
+    def disable_vision_mode(self):
+        self.preview_output.append("[INFO] Vision mode disabled.")
+        self.vision_enabled = False
+    
+        self.vision_timer.stop()
+    
+        self.vision_button.setText("Enable Vision Mode")
+        self.vision_button.setStyleSheet("background-color: darkgreen; color: white;")
+    
+        self.cancel_vision_btn.setEnabled(False)
+    
+        # Re-enable sliders
+        for slider in self.sliders.values():
+            slider.setEnabled(True)
+            
+    def _vision_control_step(self):
+        if not self.vision_enabled:
+            return
+    
+        try:
+            # --- 1. Get ball state ---
+            ball_state = self.ball_tracker.update()
+    
+            if ball_state is None:
+                return
+    
+            # --- 2. Compute desired tilt ---
+            roll_deg, pitch_deg = self.ball_controller.compute(ball_state)
+    
+            # --- 3. Build pose (only roll/pitch controlled) ---
+            pose = {
+                "x": 0,
+                "y": 0,
+                "z": self.sliders["Z"].value(),  # keep current heiqght
+                "roll": roll_deg,
+                "pitch": pitch_deg,
+                "yaw": 0
+            }
+    
+            # --- 4. Solve IK ---
+            ik_result = self.ik_solver.solve_pose(
+                pose['x'], pose['y'], pose['z'],
+                pose['roll'], pose['pitch'], pose['yaw'],
+                prev_arm_points=self.visualizer.prev_arm_points
+            )
+    
+            if not ik_result["success"]:
+                self.preview_output.append("[WARN] IK failed in vision loop.")
+                return
+    
+            angles = [int(round(a)) for a in ik_result["servo_angles_deg"]]
+    
+            safe_angles, clipped = self.safety_clip_servos(angles)
+    
+            cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
+    
+            # --- 5. Send to hardware ---
+            self.serial.send_command(cmd.encode())
+    
+            # --- 6. Update visualizer ---
+            self.visualizer.update_platform(pose)
+    
+        except Exception as e:
+            self.preview_output.append(f"[VISION ERROR] {e}")
