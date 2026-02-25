@@ -55,8 +55,8 @@ class StewartGUILayout(QWidget):
         # --- Ball balancing system ---
         self.ball_tracker = BallTracker()
         self.ball_controller = BallController(
-            kp=0.014,
-            kd=0.024,
+            kp=0.005,
+            kd=0.010,
             max_tilt_deg=8.0
         )
         
@@ -122,22 +122,22 @@ class StewartGUILayout(QWidget):
         control_layout.addWidget(self.cancel_vision_btn)
         
         # --- Kp Slider ---
-        self.kp_label = QLabel("Kp: 0.03")
+        self.kp_label = QLabel("Kp: 0.05")
         self.kp_slider = QSlider(QtCore.Qt.Horizontal)
         self.kp_slider.setMinimum(0)
         self.kp_slider.setMaximum(100)
-        self.kp_slider.setValue(30)  # 0.03 scaled by 1000
+        self.kp_slider.setValue(5)  # 0.005 scaled by 1000
         self.kp_slider.valueChanged.connect(self.update_pd_gains)
         
         control_layout.addWidget(self.kp_label)
         control_layout.addWidget(self.kp_slider)
         
         # --- Kd Slider ---
-        self.kd_label = QLabel("Kd: 0.008")
+        self.kd_label = QLabel("Kd: 0.010")
         self.kd_slider = QSlider(QtCore.Qt.Horizontal)
         self.kd_slider.setMinimum(0)
         self.kd_slider.setMaximum(100)
-        self.kd_slider.setValue(8)  # 0.008 scaled by 1000
+        self.kd_slider.setValue(10)  # 0.010 scaled by 1000
         self.kd_slider.valueChanged.connect(self.update_pd_gains)
         
         control_layout.addWidget(self.kd_label)

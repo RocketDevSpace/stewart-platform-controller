@@ -143,9 +143,44 @@ class BallTracker:
             if marker_id in self.CORNER_IDS:
                 marker_centers_px[marker_id] = self.get_marker_center(corners[i])
 
-        if len(marker_centers_px) != 4:
+        if len(marker_centers_px) < 3:
             self._debug_show(frame, None, None)
             return None
+        
+        if len(marker_centers_px) == 3:
+        
+            missing_id = list(set(self.CORNER_IDS) - set(marker_centers_px.keys()))[0]
+        
+            # Find neighbors in square order
+            order = self.CORNER_IDS
+            idx = order.index(missing_id)
+        
+            prev_id = order[(idx - 1) % 4]
+            next_id = order[(idx + 1) % 4]
+        
+            if prev_id in marker_centers_px and next_id in marker_centers_px:
+        
+                # Opposite corner is the one not prev/next/missing
+                opposite_id = order[(idx + 2) % 4]
+        
+                if opposite_id in marker_centers_px:
+        
+                    A = marker_centers_px[prev_id]
+                    B = marker_centers_px[opposite_id]
+                    C = marker_centers_px[next_id]
+        
+                    # Parallelogram estimate
+                    estimated = A + C - B
+        
+                    marker_centers_px[missing_id] = estimated
+        
+                else:
+                    # Cannot reconstruct
+                    self._debug_show(frame, None, None)
+                    return None
+            else:
+                self._debug_show(frame, None, None)
+                return None
 
         src_pts = []
         dst_pts = []

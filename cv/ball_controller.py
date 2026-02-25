@@ -45,6 +45,9 @@ class BallController:
         self.max_tilt_deg = max_tilt_deg
 
         self.enabled = True
+        
+        self.pitch_offset = 1.8
+        self.roll_offset = -0.4
 
     # ---------------------------
     # Public Interface
@@ -102,6 +105,9 @@ class BallController:
         # PD control
         pitch = self.kp * ex + self.kd * (-vx)
         roll = -(self.kp * ey + self.kd * (-vy))
+        
+        pitch = pitch + self.pitch_offset
+        roll = roll + self.roll_offset
 
         # ---------------------------
         # Safety Clamping
@@ -109,6 +115,8 @@ class BallController:
 
         roll = self._clamp(roll, -self.max_tilt_deg, self.max_tilt_deg)
         pitch = self._clamp(pitch, -self.max_tilt_deg, self.max_tilt_deg)
+        
+        print(f"pitch={pitch:.3f}, roll_y={roll:.3f}")
 
         return roll, pitch
 
