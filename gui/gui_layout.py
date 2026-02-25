@@ -10,6 +10,7 @@ from stewart_control.routines.routines import ROUTINES
 from stewart_control.cv.ball_tracker import BallTracker
 from stewart_control.cv.ball_controller import BallController
 import time
+import threading
 
 
 
@@ -66,6 +67,16 @@ class StewartGUILayout(QWidget):
         self.vision_timer = QTimer()
         self.vision_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.vision_timer.timeout.connect(self._vision_control_step)
+        
+        self._latest_pose = None
+        self._pose_lock = threading.Lock()
+        self._vis_thread_running = True
+        
+        self._vis_thread = threading.Thread(
+            target=self._visualizer_loop,
+            daemon=True
+        )
+        self._vis_thread.start()
 
         
     
@@ -769,6 +780,8 @@ class StewartGUILayout(QWidget):
          # Close serial if needed
          if hasattr(self, 'serial'):
              self.serial.disconnect()  # or implement proper cleanup
+             
+         self._vis_thread_running = False
      
          event.accept()
      
@@ -847,52 +860,89 @@ class StewartGUILayout(QWidget):
         for slider in self.sliders.values():
             slider.setEnabled(True)
             
+    def _visualizer_loop(self):
+        import time
+    
+        while self._vis_thread_running:
+            pose = None
+    
+            with self._pose_lock:
+                if self._latest_pose is not None:
+                    pose = self._latest_pose.copy()
+    
+            if pose is not None:
+                self.visualizer.update_platform(pose)
+    
+            time.sleep(0.03)  # ~30 Hz visual update
+            
     def _vision_control_step(self):
+        loop_start = time.perf_counter()
+    
         if not self.vision_enabled:
             return
     
         try:
             # --- 1. Get ball state ---
+            t0 = time.perf_counter()
             ball_state = self.ball_tracker.update()
+            t1 = time.perf_counter()
     
             if ball_state is None:
                 return
     
             # --- 2. Compute desired tilt ---
             roll_deg, pitch_deg = self.ball_controller.compute(ball_state)
+            t2 = time.perf_counter()
     
-            # --- 3. Build pose (only roll/pitch controlled) ---
+            # --- 3. Build pose ---
             pose = {
                 "x": 0,
                 "y": 0,
-                "z": self.sliders["Z"].value(),  # keep current heiqght
+                "z": self.sliders["Z"].value(),
                 "roll": roll_deg,
                 "pitch": pitch_deg,
                 "yaw": 0
             }
     
             # --- 4. Solve IK ---
+            t3 = time.perf_counter()
             ik_result = self.ik_solver.solve_pose(
                 pose['x'], pose['y'], pose['z'],
                 pose['roll'], pose['pitch'], pose['yaw'],
                 prev_arm_points=self.visualizer.prev_arm_points
             )
+            t4 = time.perf_counter()
     
             if not ik_result["success"]:
                 self.preview_output.append("[WARN] IK failed in vision loop.")
                 return
     
             angles = [int(round(a)) for a in ik_result["servo_angles_deg"]]
-    
             safe_angles, clipped = self.safety_clip_servos(angles)
     
             cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
     
             # --- 5. Send to hardware ---
+            t5 = time.perf_counter()
             self.serial.send_command(cmd.encode())
+            t6 = time.perf_counter()
     
             # --- 6. Update visualizer ---
-            self.visualizer.update_platform(pose)
+            t7 = time.perf_counter()
+            with self._pose_lock:
+                self._latest_pose = pose
+            t8 = time.perf_counter()
     
         except Exception as e:
             self.preview_output.append(f"[VISION ERROR] {e}")
+    
+        loop_end = time.perf_counter()
+    
+        print(f"""
+    Ball update: {(t1-t0)*1000:.2f} ms
+    PD compute: {(t2-t1)*1000:.3f} ms
+    IK solve: {(t4-t3)*1000:.2f} ms
+    Serial send: {(t6-t5)*1000:.2f} ms
+    Visualizer: {(t8-t7)*1000:.2f} ms
+    Total loop: {(loop_end-loop_start)*1000:.2f} ms
+    """)

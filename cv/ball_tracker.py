@@ -119,8 +119,10 @@ class BallTracker:
     # =========================
 
     def update(self):
+        t0 = time.perf_counter()
 
         ret, frame = self.cap.read()
+        t1 = time.perf_counter()
         if not ret:
             return None
 
@@ -142,6 +144,8 @@ class BallTracker:
         for i, marker_id in enumerate(ids):
             if marker_id in self.CORNER_IDS:
                 marker_centers_px[marker_id] = self.get_marker_center(corners[i])
+                
+        t2 = time.perf_counter()
 
         if len(marker_centers_px) < 3:
             self._debug_show(frame, None, None)
@@ -236,6 +240,8 @@ class BallTracker:
         y_mm = (cy - by) * mm_per_px
 
         current_time = time.time()
+        
+        t3 = time.perf_counter()
 
         if self.prev_ball_mm is None:
             vx = 0
@@ -259,6 +265,10 @@ class BallTracker:
         self.prev_time = current_time
 
         self._debug_show(frame, warped, mask, bx, by, vx, vy)
+        
+        print(f"Capture: {(t1-t0)*1000:.1f} ms")
+        print(f"Aruco: {(t2-t1)*1000:.1f} ms")
+        print(f"Ball: {(t3-t2)*1000:.1f} ms")
 
         return {
             "x_mm": x_mm,

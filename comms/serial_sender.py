@@ -35,6 +35,7 @@ class SerialSender:
             print("[SERIAL] Disconnected")
 
     def send_command(self, cmd):
+        t0 = time.perf_counter()
         if self.ser is None or not self.ser.is_open:
             print("[SERIAL ERROR] Not connected")
             return
@@ -43,6 +44,8 @@ class SerialSender:
             self.ser.write(cmd)
         except Exception as e:
             print(f"[SERIAL ERROR] Send failed: {e}")
+        t1 = time.perf_counter()
+        print(f"Servo write: {(t1-t0)*100:.2f} ms")
 
     def set_receive_callback(self, callback_func):
         """

@@ -6,6 +6,7 @@ Created on Tue Feb 24 16:13:27 2026
 """
 
 import math
+import time
 from dataclasses import dataclass
 
 
@@ -46,8 +47,8 @@ class BallController:
 
         self.enabled = True
         
-        self.pitch_offset = 1.8
-        self.roll_offset = -0.4
+        self.pitch_offset = 0
+        self.roll_offset = 0
 
     # ---------------------------
     # Public Interface
@@ -75,6 +76,7 @@ class BallController:
         Returns:
             (roll_deg, pitch_deg)
         """
+        t0 = time.perf_counter()
 
         if not self.enabled:
             return 0.0, 0.0
@@ -116,7 +118,11 @@ class BallController:
         roll = self._clamp(roll, -self.max_tilt_deg, self.max_tilt_deg)
         pitch = self._clamp(pitch, -self.max_tilt_deg, self.max_tilt_deg)
         
-        print(f"pitch={pitch:.3f}, roll_y={roll:.3f}")
+        t1 = time.perf_counter()
+        
+        print(f"PD compute: {(t1-t0)*1000:.3f} ms")
+        
+        # print(f"pitch={pitch:.3f}, roll_y={roll:.3f}")
 
         return roll, pitch
 
