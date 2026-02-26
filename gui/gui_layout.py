@@ -12,7 +12,83 @@ from stewart_control.cv.ball_controller import BallController
 import time
 import threading
 
+class VisionWorker(QtCore.QObject):
 
+    pose_ready = pyqtSignal(dict)
+    log_ready = pyqtSignal(str)
+
+    def __init__(self, ik_solver, serial, get_z_func, safety_clip_func, kp, kd):
+        super().__init__()
+        self.ik_solver = ik_solver
+        self.serial = serial
+        self.get_z = get_z_func
+        self.safety_clip = safety_clip_func
+        self.kp = kp
+        self.kd = kd
+        self.running = False
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        self.running = True
+        
+        # --- Ball balancing system --- 
+        self.ball_tracker = BallTracker() 
+        self.ball_controller = BallController( 
+            kp=0.005, 
+            kd=0.010, 
+            max_tilt_deg=8.0 
+            )
+
+        while self.running:
+            loop_start = time.perf_counter()
+
+
+            try:
+                ball_state = self.ball_tracker.update()
+                if ball_state is None:
+                    QtCore.QThread.msleep(2)
+                    continue
+
+                roll_deg, pitch_deg = self.ball_controller.compute(ball_state)
+
+                pose = {
+                    "x": 0,
+                    "y": 0,
+                    "z": self.get_z(),   # safe call into GUI getter
+                    "roll": roll_deg,
+                    "pitch": pitch_deg,
+                    "yaw": 0
+                }
+
+                ik_result = self.ik_solver.solve_pose(
+                    pose['x'], pose['y'], pose['z'],
+                    pose['roll'], pose['pitch'], pose['yaw']
+                )
+
+                if not ik_result["success"]:
+                    continue
+
+                angles = [int(round(a)) for a in ik_result["servo_angles_deg"]]
+                safe_angles, _ = self.safety_clip(angles)
+
+                cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
+                self.serial.send_command(cmd.encode())
+
+                # Send pose to GUI thread safely
+                self.pose_ready.emit(pose)
+
+            except Exception as e:
+                self.log_ready.emit(f"[VISION ERROR] {e}")
+
+            loop_end = time.perf_counter()
+            loop_ms = (loop_end - loop_start) * 1000
+
+            # Target ~50Hz
+            sleep_ms = max(0, 20 - int(loop_ms))
+            QtCore.QThread.msleep(sleep_ms)
+
+    def stop(self):
+        self.running = False
 
 class StewartGUILayout(QWidget):
     serial_line_received = pyqtSignal(str)
@@ -53,32 +129,29 @@ class StewartGUILayout(QWidget):
         self.profile_every_n = 10  # print every 10 steps
         self._profile_step_counter = 0
         
-        # --- Ball balancing system ---
-        self.ball_tracker = BallTracker()
-        self.ball_controller = BallController(
-            kp=0.005,
-            kd=0.010,
-            max_tilt_deg=8.0
+        # --- Ball balancing system --- 
+        self.vision_worker = VisionWorker(
+            self.ik_solver,
+            self.serial,
+            lambda: self.sliders["Z"].value(),
+            self.safety_clip_servos,
+            kp=self.kp_slider.value() / 1000.0,
+            kd=self.kd_slider.value() / 1000.0
         )
         
         self.vision_enabled = False
         
-        # Timer for control loop (separate from routine timer)
-        self.vision_timer = QTimer()
-        self.vision_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        self.vision_timer.timeout.connect(self._vision_control_step)
+    
+        # --- Vision Thread ---
+        self.vision_thread = QtCore.QThread()
         
-        self._latest_pose = None
-        self._pose_lock = threading.Lock()
-        self._vis_thread_running = True
         
-        self._vis_thread = threading.Thread(
-            target=self._visualizer_loop,
-            daemon=True
-        )
-        self._vis_thread.start()
-
+        self.vision_worker.moveToThread(self.vision_thread)
         
+        self.vision_thread.started.connect(self.vision_worker.run)
+        self.vision_worker.pose_ready.connect(self.visualizer.update_platform)
+        self.vision_worker.log_ready.connect(self.preview_output.append)
+                
     
         
     def append_serial_line(self, line):
@@ -767,23 +840,19 @@ class StewartGUILayout(QWidget):
 
     
     def closeEvent(self, event):
-         # Stop routine timer if it's running
-         if hasattr(self, 'routine_timer') and self.routine_timer.isActive():
-             self.routine_timer.stop()
-     
-         # Optional: disconnect signals to be extra safe
-         try:
-             self.routine_timer.timeout.disconnect()
-         except:
-             pass
-     
-         # Close serial if needed
-         if hasattr(self, 'serial'):
-             self.serial.disconnect()  # or implement proper cleanup
-             
-         self._vis_thread_running = False
-     
-         event.accept()
+
+        if self.vision_thread.isRunning():
+            self.vision_worker.stop()
+            self.vision_thread.quit()
+            self.vision_thread.wait()
+    
+        if hasattr(self, 'routine_timer') and self.routine_timer.isActive():
+            self.routine_timer.stop()
+    
+        if hasattr(self, 'serial'):
+            self.serial.disconnect()
+    
+        event.accept()
      
     def safety_clip_servos(self, angles):
         """
@@ -819,7 +888,9 @@ class StewartGUILayout(QWidget):
         self.kp_label.setText(f"Kp: {kp:.3f}")
         self.kd_label.setText(f"Kd: {kd:.3f}")
     
-        self.ball_controller.set_gains(kp, kd)
+        if hasattr(self, "vision_worker"):
+            self.vision_worker.kp = kp
+            self.vision_worker.kd = kd
         
     def toggle_vision_mode(self):
         if not self.vision_enabled:
@@ -830,119 +901,31 @@ class StewartGUILayout(QWidget):
     
     def enable_vision_mode(self):
         self.preview_output.append("[INFO] Vision mode enabled.")
-        self.vision_enabled = True
     
         self.vision_button.setText("Vision Mode ACTIVE")
         self.vision_button.setStyleSheet("background-color: orange; color: black;")
-    
         self.cancel_vision_btn.setEnabled(True)
     
-        # Disable manual sliders
         for slider in self.sliders.values():
             slider.setEnabled(False)
     
-        # Start control loop (50 Hz)
-        self.vision_timer.start(20)
+        if not self.vision_thread.isRunning():
+            self.vision_thread.start()
     
     
     def disable_vision_mode(self):
         self.preview_output.append("[INFO] Vision mode disabled.")
-        self.vision_enabled = False
     
-        self.vision_timer.stop()
+        self.vision_worker.stop()
+        self.vision_thread.quit()
+        self.vision_thread.wait()
     
         self.vision_button.setText("Enable Vision Mode")
         self.vision_button.setStyleSheet("background-color: darkgreen; color: white;")
-    
         self.cancel_vision_btn.setEnabled(False)
     
-        # Re-enable sliders
         for slider in self.sliders.values():
             slider.setEnabled(True)
             
-    def _visualizer_loop(self):
-        import time
-    
-        while self._vis_thread_running:
-            pose = None
-    
-            with self._pose_lock:
-                if self._latest_pose is not None:
-                    pose = self._latest_pose.copy()
-    
-            if pose is not None:
-                self.visualizer.update_platform(pose)
-    
-            time.sleep(0.03)  # ~30 Hz visual update
+
             
-    def _vision_control_step(self):
-        loop_start = time.perf_counter()
-    
-        if not self.vision_enabled:
-            return
-    
-        try:
-            # --- 1. Get ball state ---
-            t0 = time.perf_counter()
-            ball_state = self.ball_tracker.update()
-            t1 = time.perf_counter()
-    
-            if ball_state is None:
-                return
-    
-            # --- 2. Compute desired tilt ---
-            roll_deg, pitch_deg = self.ball_controller.compute(ball_state)
-            t2 = time.perf_counter()
-    
-            # --- 3. Build pose ---
-            pose = {
-                "x": 0,
-                "y": 0,
-                "z": self.sliders["Z"].value(),
-                "roll": roll_deg,
-                "pitch": pitch_deg,
-                "yaw": 0
-            }
-    
-            # --- 4. Solve IK ---
-            t3 = time.perf_counter()
-            ik_result = self.ik_solver.solve_pose(
-                pose['x'], pose['y'], pose['z'],
-                pose['roll'], pose['pitch'], pose['yaw'],
-                prev_arm_points=self.visualizer.prev_arm_points
-            )
-            t4 = time.perf_counter()
-    
-            if not ik_result["success"]:
-                self.preview_output.append("[WARN] IK failed in vision loop.")
-                return
-    
-            angles = [int(round(a)) for a in ik_result["servo_angles_deg"]]
-            safe_angles, clipped = self.safety_clip_servos(angles)
-    
-            cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
-    
-            # --- 5. Send to hardware ---
-            t5 = time.perf_counter()
-            self.serial.send_command(cmd.encode())
-            t6 = time.perf_counter()
-    
-            # --- 6. Update visualizer ---
-            t7 = time.perf_counter()
-            with self._pose_lock:
-                self._latest_pose = pose
-            t8 = time.perf_counter()
-    
-        except Exception as e:
-            self.preview_output.append(f"[VISION ERROR] {e}")
-    
-        loop_end = time.perf_counter()
-    
-        print(f"""
-    Ball update: {(t1-t0)*1000:.2f} ms
-    PD compute: {(t2-t1)*1000:.3f} ms
-    IK solve: {(t4-t3)*1000:.2f} ms
-    Serial send: {(t6-t5)*1000:.2f} ms
-    Visualizer: {(t8-t7)*1000:.2f} ms
-    Total loop: {(loop_end-loop_start)*1000:.2f} ms
-    """)
