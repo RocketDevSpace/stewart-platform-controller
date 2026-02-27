@@ -103,11 +103,11 @@ class StewartGUIView(QWidget):
 
         pd = QGroupBox("PD Gains")
         pd_layout = QVBoxLayout()
-        self.kp_label = QLabel("Kp: 0.005")
+        self.kp_label = QLabel("Kp: 0.050")
         self.kp_slider = QSlider(QtCore.Qt.Horizontal)
         self.kp_slider.setMinimum(0)
-        self.kp_slider.setMaximum(100)
-        self.kp_slider.setValue(5)
+        self.kp_slider.setMaximum(300)
+        self.kp_slider.setValue(50)
         self.kd_label = QLabel("Kd: 0.010")
         self.kd_slider = QSlider(QtCore.Qt.Horizontal)
         self.kd_slider.setMinimum(0)
@@ -123,7 +123,7 @@ class StewartGUIView(QWidget):
         hsv = QGroupBox("HSV Thresholds")
         hsv_layout = QVBoxLayout()
         self.hsv_controls = {}
-        defaults = [("H Min", 10, 179), ("H Max", 28, 179), ("S Min", 83, 255), ("S Max", 255, 255), ("V Min", 125, 255), ("V Max", 255, 255)]
+        defaults = [("H Min", 5, 179), ("H Max", 35, 179), ("S Min", 50, 255), ("S Max", 255, 255), ("V Min", 40, 255), ("V Max", 255, 255)]
         for name, val, maxv in defaults:
             lbl = QLabel(f"{name}: {val}")
             sld = QSlider(QtCore.Qt.Horizontal)

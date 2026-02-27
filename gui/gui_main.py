@@ -14,6 +14,8 @@ from stewart_control.config import (
     LOG_EVERY_N,
     SERIAL_PORT,
     TIMING_PLOT_POINTS,
+    TRACKER_REACQUIRE_VALID_FRAMES,
+    GUI_SNAPSHOT_HZ,
     VISUALIZER_HZ,
     VISION_LOOP_HZ,
 )
@@ -35,6 +37,7 @@ class StewartGUIController(StewartGUIView):
     serial_line_received = pyqtSignal(str)
     vision_gains_updated = pyqtSignal(float, float)
     vision_hsv_updated = pyqtSignal(int, int, int, int, int, int)
+    vision_snapshot_consumed = pyqtSignal()
 
     def __init__(self, ik_solver=None):
         self.ik_solver = ik_solver or _DefaultIKSolver()
@@ -49,19 +52,52 @@ class StewartGUIController(StewartGUIView):
         self._timing_plot_update_every = 5
         self._vision_counter = 0
         self._y_zoom = 1.0
+        self._valid_streak = 0
         self._last_neutral_send = 0.0
 
         self._vision_thread = None
         self._vision_worker = None
 
-        self._timing_keys = ["ball_update", "pd_compute", "ik_solve", "serial_enqueue", "visualizer_gui", "total"]
-        self._tracker_keys = ["trk_capture", "trk_aruco", "trk_h", "trk_warp", "trk_hsv", "trk_contour", "trk_kin", "trk_overlay"]
+        self._timing_keys = [
+            "ball_update",
+            "pd_compute",
+            "ik_solve",
+            "serial_enqueue",
+            "visualizer_gui",
+            "frame_to_worker_ms",
+            "worker_to_gui_ms",
+            "frame_to_cmd",
+            "total",
+        ]
+        self._tracker_keys = [
+            "trk_capture",
+            "trk_frame_age",
+            "trk_cap_period",
+            "trk_aruco",
+            "trk_aruco_retry",
+            "trk_h",
+            "trk_warp",
+            "trk_hsv",
+            "trk_contour",
+            "trk_kin",
+            "trk_overlay",
+            "trk_radius_px",
+            "trk_area",
+            "trk_circularity",
+            "trk_fill",
+            "trk_dt_s",
+            "trk_gray_mean",
+            "trk_aruco_ids",
+        ]
         self._timing_colors = {
             "ball_update": "#38bdf8",
             "pd_compute": "#34d399",
             "ik_solve": "#f43f5e",
             "serial_enqueue": "#a78bfa",
             "visualizer_gui": "#f59e0b",
+            "frame_to_worker_ms": "#0ea5e9",
+            "worker_to_gui_ms": "#64748b",
+            "frame_to_cmd": "#22d3ee",
             "total": "#e2e8f0",
         }
         timing_capacity = max(TIMING_PLOT_POINTS, int(VISION_LOOP_HZ * 35))
@@ -347,8 +383,20 @@ class StewartGUIController(StewartGUIView):
             max_tilt_deg=8.0,
             camera_index=CAMERA_INDEX,
             loop_hz=VISION_LOOP_HZ,
+            snapshot_hz=GUI_SNAPSHOT_HZ,
             emit_camera_every_n=1,
+            command_sender=self.serial.enqueue_command,
         )
+        try:
+            bt = self._vision_worker.ball_tracker
+            self._log_preview(
+                f"[CAMERA] backend={bt.camera_backend} mode={bt.camera_mode} "
+                f"measured_period={bt.camera_measured_period_ms:.1f}ms "
+                f"(~{(1000.0 / bt.camera_measured_period_ms) if bt.camera_measured_period_ms > 0 else 0:.1f} FPS) "
+                f"gray={getattr(bt, 'camera_gray_mean', 0.0):.1f}"
+            )
+        except Exception:
+            pass
         self._vision_worker.moveToThread(self._vision_thread)
         self._vision_thread.finished.connect(self._on_vision_thread_finished)
         self._vision_thread.started.connect(self._vision_worker.start)
@@ -357,6 +405,7 @@ class StewartGUIController(StewartGUIView):
         self._vision_worker.stopped.connect(self._on_vision_worker_stopped)
         self.vision_gains_updated.connect(self._vision_worker.set_gains)
         self.vision_hsv_updated.connect(self._vision_worker.set_hsv)
+        self.vision_snapshot_consumed.connect(self._vision_worker.mark_snapshot_consumed)
         self._vision_thread.start()
         self.update_pd_gains()
         self._emit_hsv_values()
@@ -371,6 +420,10 @@ class StewartGUIController(StewartGUIView):
             pass
         try:
             self.vision_hsv_updated.disconnect(self._vision_worker.set_hsv)
+        except TypeError:
+            pass
+        try:
+            self.vision_snapshot_consumed.disconnect(self._vision_worker.mark_snapshot_consumed)
         except TypeError:
             pass
         QtCore.QMetaObject.invokeMethod(self._vision_worker, "stop", QtCore.Qt.QueuedConnection)
@@ -395,89 +448,116 @@ class StewartGUIController(StewartGUIView):
         self._log_preview(f"[VISION ERROR] {msg}")
 
     def _on_control_snapshot(self, snapshot):
-        if not self.vision_enabled:
-            return
+        try:
+            if not self.vision_enabled:
+                return
 
-        if not snapshot.tracking_valid:
-            now = time.perf_counter()
-            if now - self._last_neutral_send > 0.2:
-                neutral_pose = {
-                    "x": 0.0,
-                    "y": 0.0,
-                    "z": float(self._vision_z_setpoint),
-                    "roll": 0.0,
-                    "pitch": 0.0,
-                    "yaw": 0.0,
-                }
-                ik = self.ik_solver.solve_pose(
-                    neutral_pose["x"],
-                    neutral_pose["y"],
-                    neutral_pose["z"],
-                    neutral_pose["roll"],
-                    neutral_pose["pitch"],
-                    neutral_pose["yaw"],
-                    prev_arm_points=None,
+            if not snapshot.tracking_valid:
+                if snapshot.reason == "stale_frame_repeat":
+                    self._vision_counter += 1
+                    if self._vision_counter % LOG_EVERY_N == 0:
+                        self._log_preview(
+                            "[TRACK] stale frame repeat; waiting for fresh camera frame "
+                            f"(age={snapshot.timings_ms.get('trk_frame_age', 0.0):.1f}ms)"
+                        )
+                    return
+                self._valid_streak = 0
+                now = time.perf_counter()
+                if snapshot.miss_count >= 20 and (now - self._last_neutral_send > 0.5):
+                    neutral_pose = {
+                        "x": 0.0,
+                        "y": 0.0,
+                        "z": float(self._vision_z_setpoint),
+                        "roll": 0.0,
+                        "pitch": 0.0,
+                        "yaw": 0.0,
+                    }
+                    ik = self.ik_solver.solve_pose(
+                        neutral_pose["x"],
+                        neutral_pose["y"],
+                        neutral_pose["z"],
+                        neutral_pose["roll"],
+                        neutral_pose["pitch"],
+                        neutral_pose["yaw"],
+                        prev_arm_points=None,
+                    )
+                    if ik.get("success", False):
+                        safe_angles = [max(0, min(180, int(round(a)))) for a in ik["servo_angles_deg"]]
+                        cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
+                        self.serial.enqueue_command(cmd, policy="latest")
+                        self._last_neutral_send = now
+                self._vision_counter += 1
+                if self._vision_counter % LOG_EVERY_N == 0:
+                    self._log_preview(f"[TRACK] no ball detected (miss={snapshot.miss_count}) reason={snapshot.reason}")
+                return
+
+            self._valid_streak += 1
+            if self._valid_streak < TRACKER_REACQUIRE_VALID_FRAMES:
+                if self._vision_counter % LOG_EVERY_N == 0:
+                    self._log_preview(f"[TRACK] reacquire gating {self._valid_streak}/{TRACKER_REACQUIRE_VALID_FRAMES}")
+                return
+
+            if not snapshot.ik_success:
+                self._vision_counter += 1
+                if self._vision_counter % LOG_EVERY_N == 0:
+                    self._log_preview("[WARN] IK failed in vision loop.")
+                return
+
+            safe_angles = [max(0, min(180, int(a))) for a in snapshot.servo_angles]
+
+            vis_ms = 0.0
+            now_perf = time.perf_counter()
+            if now_perf - self._last_visualizer_update >= (1.0 / max(1, VISUALIZER_HZ)):
+                self._last_visualizer_update = now_perf
+                t_vis0 = time.perf_counter()
+                self.visualizer.update_platform(snapshot.pose, ik_result=snapshot.ik_result)
+                t_vis1 = time.perf_counter()
+                vis_ms = (t_vis1 - t_vis0) * 1000.0
+
+            timings = dict(snapshot.timings_ms)
+            timings["serial_enqueue"] = float(timings.get("cmd_enqueue_worker", 0.0))
+            timings["visualizer_gui"] = vis_ms
+            timings["frame_to_worker_ms"] = float(timings.get("frame_to_worker_ms", 0.0))
+            timings["worker_to_gui_ms"] = max(0.0, (now_perf - snapshot.worker_emit_perf_ts) * 1000.0) if snapshot.worker_emit_perf_ts > 0 else 0.0
+            timings["frame_to_cmd"] = float(timings.get("frame_to_cmd_worker", 0.0))
+
+            now = time.time()
+            self._timing_timestamps.append(now)
+            for key in self._timing_keys:
+                self._timing_history[key].append(float(timings.get(key, 0.0)))
+            for key in self._tracker_keys:
+                self._timing_history.setdefault(key, deque(maxlen=self._timing_timestamps.maxlen))
+                self._timing_history[key].append(float(timings.get(key, 0.0)))
+            self._trim_timing_history(now)
+
+            self._update_camera_views(snapshot)
+            self._update_timing_diagnostics()
+            self._vision_counter += 1
+
+            if self._vision_counter % LOG_EVERY_N == 0:
+                bs = snapshot.ball_state
+                terms = snapshot.control_terms
+                self._log_preview(
+                    "[CONTROL TRACE] "
+                    f"ball=({bs.x_mm:.2f},{bs.y_mm:.2f})mm "
+                    f"vel=({bs.vx_mm_s:.2f},{bs.vy_mm_s:.2f})mm/s "
+                    f"pos_err=({terms['position_vec_mm'][0]:.2f},{terms['position_vec_mm'][1]:.2f}) "
+                    f"p=({terms['p_term'][0]:.3f},{terms['p_term'][1]:.3f}) "
+                    f"d=({terms['d_term'][0]:.3f},{terms['d_term'][1]:.3f}) "
+                    f"pd_vec=({terms['pd_vec'][0]:.4f},{terms['pd_vec'][1]:.4f}) "
+                    f"raw=(r{terms['roll_raw']:.3f},p{terms['pitch_raw']:.3f}) "
+                    f"clamp=(r{terms['roll_clamped']:.3f},p{terms['pitch_clamped']:.3f}) "
+                    f"cmd=(r{terms['roll_cmd']:.3f},p{terms['pitch_cmd']:.3f},z{snapshot.pose['z']:.2f}) "
+                    f"age={snapshot.timings_ms.get('trk_frame_age', 0.0):.1f}ms "
+                    f"f2w={timings.get('frame_to_worker_ms', 0.0):.1f}ms "
+                    f"cmd_age={timings.get('frame_to_cmd', 0.0):.1f}ms "
+                    f"w2g={timings.get('worker_to_gui_ms', 0.0):.1f}ms "
+                    f"rad={snapshot.timings_ms.get('trk_radius_px', 0.0):.1f}px "
+                    f"area={snapshot.timings_ms.get('trk_area', 0.0):.0f} "
+                    f"cmd={safe_angles}"
                 )
-                if ik.get("success", False):
-                    safe_angles = [max(0, min(180, int(round(a)))) for a in ik["servo_angles_deg"]]
-                    cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
-                    self.serial.enqueue_command(cmd, policy="latest")
-                    self._last_neutral_send = now
-            self._vision_counter += 1
-            if self._vision_counter % LOG_EVERY_N == 0:
-                self._log_preview("[TRACK] no ball detected -> neutral hold")
-            return
-
-        if not snapshot.ik_success:
-            self._vision_counter += 1
-            if self._vision_counter % LOG_EVERY_N == 0:
-                self._log_preview("[WARN] IK failed in vision loop.")
-            return
-
-        safe_angles = [max(0, min(180, int(a))) for a in snapshot.servo_angles]
-        cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
-        t_serial0 = time.perf_counter()
-        self.serial.enqueue_command(cmd, policy="latest")
-        t_serial1 = time.perf_counter()
-
-        vis_ms = 0.0
-        now_perf = time.perf_counter()
-        if now_perf - self._last_visualizer_update >= (1.0 / max(1, VISUALIZER_HZ)):
-            self._last_visualizer_update = now_perf
-            t_vis0 = time.perf_counter()
-            self.visualizer.update_platform(snapshot.pose, ik_result=snapshot.ik_result)
-            t_vis1 = time.perf_counter()
-            vis_ms = (t_vis1 - t_vis0) * 1000.0
-
-        timings = dict(snapshot.timings_ms)
-        timings["serial_enqueue"] = (t_serial1 - t_serial0) * 1000.0
-        timings["visualizer_gui"] = vis_ms
-
-        now = time.time()
-        self._timing_timestamps.append(now)
-        for key in self._timing_keys:
-            self._timing_history[key].append(float(timings.get(key, 0.0)))
-        for key in self._tracker_keys:
-            self._timing_history.setdefault(key, deque(maxlen=self._timing_timestamps.maxlen))
-            self._timing_history[key].append(float(timings.get(key, 0.0)))
-        self._trim_timing_history(now)
-
-        self._update_camera_views(snapshot)
-        self._update_timing_diagnostics()
-        self._vision_counter += 1
-
-        if self._vision_counter % LOG_EVERY_N == 0:
-            bs = snapshot.ball_state
-            terms = snapshot.control_terms
-            self._log_preview(
-                "[CONTROL TRACE] "
-                f"ball=({bs.x_mm:.2f},{bs.y_mm:.2f})mm "
-                f"vel=({bs.vx_mm_s:.2f},{bs.vy_mm_s:.2f})mm/s "
-                f"pos_err=({terms['position_vec_mm'][0]:.2f},{terms['position_vec_mm'][1]:.2f}) "
-                f"pd_vec=({terms['pd_vec'][0]:.4f},{terms['pd_vec'][1]:.4f}) "
-                f"pose=(r{snapshot.pose['roll']:.3f},p{snapshot.pose['pitch']:.3f},z{snapshot.pose['z']:.2f}) "
-                f"cmd={safe_angles}"
-            )
+        finally:
+            self.vision_snapshot_consumed.emit()
 
     def _trim_timing_history(self, now):
         while self._timing_timestamps and (now - self._timing_timestamps[0]) > self._timing_window_s:
@@ -500,7 +580,9 @@ class StewartGUIController(StewartGUIView):
             "Vision Timing Avg (ms): "
             f"ball={avgs['ball_update']:.2f}, pd={avgs['pd_compute']:.2f}, "
             f"ik={avgs['ik_solve']:.2f}, serQ={avgs['serial_enqueue']:.2f}, "
-            f"vis={avgs['visualizer_gui']:.2f}, total={avgs['total']:.2f}, zoom={self._y_zoom:.2f}x"
+            f"vis={avgs['visualizer_gui']:.2f}, f2w={avgs['frame_to_worker_ms']:.2f}, "
+            f"w2g={avgs['worker_to_gui_ms']:.2f}, "
+            f"f2c={avgs['frame_to_cmd']:.2f}, total={avgs['total']:.2f}, zoom={self._y_zoom:.2f}x"
         )
 
         if self._vision_counter % LOG_EVERY_N == 0:
@@ -511,13 +593,23 @@ class StewartGUIController(StewartGUIView):
             self._log_preview(
                 "[TRACKER AVG] "
                 f"fetch={trk['trk_capture']:.2f}ms "
+                f"age={trk['trk_frame_age']:.2f}ms "
+                f"cap_period={trk['trk_cap_period']:.2f}ms "
                 f"aruco={trk['trk_aruco']:.2f}ms "
+                f"aruco_retry={trk['trk_aruco_retry']:.2f}ms "
                 f"H={trk['trk_h']:.2f}ms "
                 f"warp={trk['trk_warp']:.2f}ms "
                 f"hsv={trk['trk_hsv']:.2f}ms "
                 f"contour={trk['trk_contour']:.2f}ms "
                 f"kin={trk['trk_kin']:.2f}ms "
-                f"overlay={trk['trk_overlay']:.2f}ms"
+                f"overlay={trk['trk_overlay']:.2f}ms "
+                f"radius={trk['trk_radius_px']:.1f}px "
+                f"area={trk['trk_area']:.1f} "
+                f"circ={trk['trk_circularity']:.2f} "
+                f"fill={trk['trk_fill']:.2f} "
+                f"gray={trk['trk_gray_mean']:.1f} "
+                f"ids={trk['trk_aruco_ids']:.1f} "
+                f"dt={trk['trk_dt_s']*1000.0:.1f}ms"
             )
 
         if not force_redraw and (self._vision_counter % self._timing_plot_update_every != 0):

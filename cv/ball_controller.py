@@ -41,12 +41,16 @@ class BallController:
         kp: float = 0.05,
         kd: float = 0.01,
         max_tilt_deg: float = 10.0,
+        max_tilt_rate_deg_s: float = 300.0,
+        d_term_limit_deg: float | None = 2.5,
         debug_level: int = DEBUG_LEVEL,
         log_every_n: int = LOG_EVERY_N,
     ):
         self.kp = kp
         self.kd = kd
         self.max_tilt_deg = max_tilt_deg
+        self.max_tilt_rate_deg_s = max_tilt_rate_deg_s
+        self.d_term_limit_deg = d_term_limit_deg
 
         self.enabled = True
         self.debug_level = debug_level
@@ -55,6 +59,9 @@ class BallController:
         
         self.pitch_offset = 0
         self.roll_offset = 0
+        self._prev_roll_cmd = 0.0
+        self._prev_pitch_cmd = 0.0
+        self._prev_cmd_time = None
 
     # ---------------------------
     # Public Interface
@@ -141,16 +148,54 @@ class BallController:
 
         pos_vec_x = -x
         pos_vec_y = -y
-        pd_x = self.kp * pos_vec_x + self.kd * (-vx)
-        pd_y = self.kp * pos_vec_y + self.kd * (-vy)
+        p_x = self.kp * pos_vec_x
+        p_y = self.kp * pos_vec_y
+        d_x = self.kd * (-vx)
+        d_y = self.kd * (-vy)
+        if self.d_term_limit_deg is not None:
+            d_x = self._clamp(d_x, -self.d_term_limit_deg, self.d_term_limit_deg)
+            d_y = self._clamp(d_y, -self.d_term_limit_deg, self.d_term_limit_deg)
 
-        roll, pitch = self.compute(ball_state)
+        pd_x = p_x + d_x
+        pd_y = p_y + d_y
+
+        # Map planar control vector to platform axes.
+        pitch_raw = pd_x + self.pitch_offset
+        roll_raw = -pd_y + self.roll_offset
+        roll_clamped = self._clamp(roll_raw, -self.max_tilt_deg, self.max_tilt_deg)
+        pitch_clamped = self._clamp(pitch_raw, -self.max_tilt_deg, self.max_tilt_deg)
+        roll, pitch = self._apply_slew_limit(roll_clamped, pitch_clamped)
         terms = {
             "position_vec_mm": (pos_vec_x, pos_vec_y),
             "velocity_vec_mm_s": (vx, vy),
             "pd_vec": (pd_x, pd_y),
+            "p_term": (p_x, p_y),
+            "d_term": (d_x, d_y),
+            "roll_raw": roll_raw,
+            "pitch_raw": pitch_raw,
+            "roll_clamped": roll_clamped,
+            "pitch_clamped": pitch_clamped,
+            "roll_cmd": roll,
+            "pitch_cmd": pitch,
         }
         return roll, pitch, terms
+
+    def _apply_slew_limit(self, roll, pitch):
+        now = time.perf_counter()
+        if self._prev_cmd_time is None:
+            self._prev_cmd_time = now
+            self._prev_roll_cmd = roll
+            self._prev_pitch_cmd = pitch
+            return roll, pitch
+
+        dt = max(1e-4, now - self._prev_cmd_time)
+        self._prev_cmd_time = now
+        max_step = self.max_tilt_rate_deg_s * dt
+        roll_limited = self._prev_roll_cmd + self._clamp(roll - self._prev_roll_cmd, -max_step, max_step)
+        pitch_limited = self._prev_pitch_cmd + self._clamp(pitch - self._prev_pitch_cmd, -max_step, max_step)
+        self._prev_roll_cmd = roll_limited
+        self._prev_pitch_cmd = pitch_limited
+        return roll_limited, pitch_limited
 
     # ---------------------------
     # Internal Helpers
