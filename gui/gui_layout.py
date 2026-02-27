@@ -27,30 +27,22 @@ class VisionMonitorWindow(QWidget):
         root.setSpacing(10)
 
         self.camera_view_label = QLabel("Camera View (Disabled)")
-        self.warped_view_label = QLabel("Warped View (Disabled)")
-        self.mask_view_label = QLabel("Mask View (Disabled)")
-        self.visualizer_placeholder = QLabel("3D Visualizer (Disabled)")
+        self.warped_view_label = QLabel("Warped Vector View (Disabled)")
+        self.hsv_view_label = QLabel("HSV/Mask View (Disabled)")
 
-        for lbl in [self.camera_view_label, self.warped_view_label, self.mask_view_label, self.visualizer_placeholder]:
+        for lbl in [self.camera_view_label, self.warped_view_label, self.hsv_view_label]:
             lbl.setAlignment(QtCore.Qt.AlignCenter)
             lbl.setMinimumSize(480, 320)
             lbl.setFrameShape(QtWidgets.QFrame.Box)
+            lbl.setStyleSheet("border:1px solid #2a3b59; background:#0f1726;")
 
-        self.vis_figure = Figure()
-        self.vis_canvas = FigureCanvas(self.vis_figure)
-        vis_container = QVBoxLayout()
-        vis_container.addWidget(self.vis_canvas)
-        vis_widget = QWidget()
-        vis_widget.setLayout(vis_container)
-
-        root.addWidget(self.camera_view_label, 0, 0)
-        root.addWidget(self.warped_view_label, 0, 1)
-        root.addWidget(self.mask_view_label, 1, 0)
-        root.addWidget(vis_widget, 1, 1)
+        root.addWidget(self.warped_view_label, 0, 0, 2, 1)
+        root.addWidget(self.camera_view_label, 0, 1)
+        root.addWidget(self.hsv_view_label, 1, 1)
         root.setRowStretch(0, 1)
         root.setRowStretch(1, 1)
-        root.setColumnStretch(0, 1)
-        root.setColumnStretch(1, 1)
+        root.setColumnStretch(0, 3)
+        root.setColumnStretch(1, 2)
         self.setLayout(root)
         self.resize(1400, 900)
 
@@ -150,6 +142,11 @@ class StewartGUIView(QWidget):
     def _build_telemetry_panel(self):
         box = QGroupBox("Telemetry")
         layout = QVBoxLayout()
+
+        self.visualizer_figure = Figure(figsize=(6, 3.8))
+        self.visualizer_canvas = FigureCanvas(self.visualizer_figure)
+        self.visualizer_canvas.setMinimumHeight(360)
+        layout.addWidget(self.visualizer_canvas)
 
         self.timing_summary_label = QLabel("Vision Timing Avg (ms): waiting for data...")
         self.timing_summary_label.setWordWrap(True)

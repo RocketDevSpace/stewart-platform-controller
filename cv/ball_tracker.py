@@ -96,7 +96,7 @@ class BallTracker:
 
     @staticmethod
     def find_ball_center(mask):
-        kernel = np.ones((5, 5), np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -204,7 +204,10 @@ class BallTracker:
             src_pts = np.array(src_pts, dtype=np.float32)
             dst_pts = np.array(dst_pts, dtype=np.float32)
 
-            H, _ = cv2.findHomography(src_pts, dst_pts)
+            if len(src_pts) == 4:
+                H = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            else:
+                H, _ = cv2.findHomography(src_pts, dst_pts)
             if H is None:
                 return None
             self._last_H = H
@@ -243,7 +246,8 @@ class BallTracker:
 
         self.prev_ball_mm = (x_mm, y_mm)
         self.prev_time = current_time
-        self._draw_vectors(warped, bx, by, vx, vy, x_mm, y_mm)
+        if return_debug_frames:
+            self._draw_vectors(warped, bx, by, vx, vy, x_mm, y_mm)
 
         self._log_counter += 1
         if self.debug_level >= 2 and (self._log_counter % self.log_every_n == 0):
@@ -260,7 +264,7 @@ class BallTracker:
         if return_debug_frames:
             result["camera_bgr"] = frame
             result["warped_bgr"] = warped
-            result["mask_bgr"] = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            result["mask_gray"] = mask
         return result
 
     def release(self):

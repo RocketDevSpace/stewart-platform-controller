@@ -20,7 +20,7 @@ class ControlSnapshot:
     control_terms: dict
     camera_bgr: object | None = None
     warped_bgr: object | None = None
-    mask_bgr: object | None = None
+    mask_gray: object | None = None
 
 
 class VisionControlWorker(QtCore.QObject):
@@ -165,7 +165,7 @@ class VisionControlWorker(QtCore.QObject):
                 control_terms=control_terms,
                 camera_bgr=ball_state_dict.get("camera_bgr"),
                 warped_bgr=ball_state_dict.get("warped_bgr"),
-                mask_bgr=ball_state_dict.get("mask_bgr"),
+                mask_gray=ball_state_dict.get("mask_gray"),
             )
             self.snapshot_ready.emit(snapshot)
         except Exception as exc:

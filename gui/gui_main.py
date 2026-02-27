@@ -62,8 +62,9 @@ class StewartGUIController(StewartGUIView):
             "visualizer_gui": "#f59e0b",
             "total": "#e2e8f0",
         }
-        self._timing_history = {k: deque(maxlen=TIMING_PLOT_POINTS) for k in self._timing_keys}
-        self._timing_timestamps = deque(maxlen=TIMING_PLOT_POINTS)
+        timing_capacity = max(TIMING_PLOT_POINTS, int(VISION_LOOP_HZ * 35))
+        self._timing_history = {k: deque(maxlen=timing_capacity) for k in self._timing_keys}
+        self._timing_timestamps = deque(maxlen=timing_capacity)
         self._timing_window_s = 30.0
 
         self.serial = SerialSender(SERIAL_PORT)
@@ -71,7 +72,7 @@ class StewartGUIController(StewartGUIView):
         self.serial.connect()
         self.serial.set_receive_callback(lambda line: self.serial_line_received.emit(line))
 
-        self.visualizer = StewartVisualizer(self.monitor_window.vis_canvas)
+        self.visualizer = StewartVisualizer(self.visualizer_canvas)
         self._init_timing_plot_style()
         self._init_signals()
         self._init_routines()
@@ -181,9 +182,9 @@ class StewartGUIController(StewartGUIView):
         labels = [
             self.monitor_window.camera_view_label,
             self.monitor_window.warped_view_label,
-            self.monitor_window.mask_view_label,
+            self.monitor_window.hsv_view_label,
         ]
-        titles = ["Camera View", "Warped View", "Mask View"]
+        titles = ["Camera View", "Warped Vector View", "HSV/Mask View"]
         for lbl, title in zip(labels, titles):
             if enabled:
                 lbl.setText(f"{title} (Waiting...)")
@@ -197,7 +198,10 @@ class StewartGUIController(StewartGUIView):
     def _cv_to_pixmap(img, target_w, target_h):
         if img is None:
             return None
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if len(img.shape) == 2:
+            rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
         return QtGui.QPixmap.fromImage(qimg).scaled(
@@ -208,7 +212,7 @@ class StewartGUIController(StewartGUIView):
         for widget, frame in [
             (self.monitor_window.camera_view_label, snapshot.camera_bgr),
             (self.monitor_window.warped_view_label, snapshot.warped_bgr),
-            (self.monitor_window.mask_view_label, snapshot.mask_bgr),
+            (self.monitor_window.hsv_view_label, snapshot.mask_gray),
         ]:
             pix = self._cv_to_pixmap(frame, widget.width(), widget.height())
             if pix is not None:
@@ -341,7 +345,7 @@ class StewartGUIController(StewartGUIView):
             max_tilt_deg=8.0,
             camera_index=CAMERA_INDEX,
             loop_hz=VISION_LOOP_HZ,
-            emit_camera_every_n=max(1, int(VISION_LOOP_HZ / 20)),
+            emit_camera_every_n=max(1, int(VISION_LOOP_HZ / 10)),
         )
         self._vision_worker.moveToThread(self._vision_thread)
         self._vision_thread.finished.connect(self._on_vision_thread_finished)
