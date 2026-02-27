@@ -143,6 +143,7 @@ LOG_EVERY_N = 25
 # IO defaults
 SERIAL_PORT = "COM4"
 CAMERA_INDEX = 0
+CAMERA_DEBUG_WINDOWS = True
 
 # Loop rates
 VISION_LOOP_HZ = 50
@@ -153,3 +154,6 @@ GUI_LOG_MAX_LINES = 500
 
 # Serial queue behavior
 SERIAL_QUEUE_MAX = 256
+
+# Timing plot config
+TIMING_PLOT_POINTS = 300

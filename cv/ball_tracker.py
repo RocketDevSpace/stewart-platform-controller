@@ -18,6 +18,8 @@ class BallTracker:
                  aruco_size_mm=37.5,
                  vel_alpha=0.7,
                  show_debug=True,
+                 pd_kp=0.005,
+                 pd_kd=0.010,
                  debug_level=DEBUG_LEVEL,
                  log_every_n=LOG_EVERY_N):
 
@@ -26,7 +28,11 @@ class BallTracker:
         self.ARUCO_SIZE_MM = aruco_size_mm
         self.VEL_ALPHA = vel_alpha
         self.VEL_ARROW_SCALE = 0.15
+        self.POS_ARROW_SCALE = 0.20
+        self.PD_ARROW_SCALE = 40.0
         self.show_debug = show_debug
+        self.pd_kp = float(pd_kp)
+        self.pd_kd = float(pd_kd)
         self.debug_level = debug_level
         self.log_every_n = max(1, int(log_every_n))
         self._log_counter = 0
@@ -119,6 +125,10 @@ class BallTracker:
         px = cx + x_mm * px_per_mm
         py = cy - y_mm * px_per_mm
         return [px, py]
+
+    def set_pd_gains(self, kp, kd):
+        self.pd_kp = float(kp)
+        self.pd_kd = float(kd)
 
     # =========================
     # MAIN UPDATE (NON-BLOCKING)
@@ -270,7 +280,7 @@ class BallTracker:
         self.prev_ball_mm = (x_mm, y_mm)
         self.prev_time = current_time
 
-        self._debug_show(frame, warped, mask, bx, by, vx, vy)
+        self._debug_show(frame, warped, mask, bx, by, vx, vy, x_mm, y_mm)
         
         self._log_counter += 1
         if self.debug_level >= 2 and (self._log_counter % self.log_every_n == 0):
@@ -289,24 +299,59 @@ class BallTracker:
     # DEBUG DISPLAY
     # =========================
 
-    def _debug_show(self, frame, warped, mask, bx=None, by=None, vx=0, vy=0):
+    def _debug_show(self, frame, warped, mask, bx=None, by=None, vx=0, vy=0, x_mm=0.0, y_mm=0.0):
         if not self.show_debug:
             return
 
         cv2.imshow("Camera View", frame)
 
         if warped is not None:
+            center_px = (self.WARP_SIZE_PX // 2, self.WARP_SIZE_PX // 2)
+            cv2.drawMarker(
+                warped,
+                center_px,
+                (0, 255, 255),
+                markerType=cv2.MARKER_CROSS,
+                markerSize=16,
+                thickness=2,
+            )
+
             if bx is not None:
                 cv2.circle(warped, (bx, by), 5, (0, 0, 255), -1)
 
-                arrow_px_x = int(bx + vx * self.VEL_ARROW_SCALE)
-                arrow_px_y = int(by - vy * self.VEL_ARROW_SCALE)
+                # Velocity vector (blue)
+                vel_end = (
+                    int(bx + vx * self.VEL_ARROW_SCALE),
+                    int(by - vy * self.VEL_ARROW_SCALE),
+                )
+                cv2.arrowedLine(warped, (bx, by), vel_end, (255, 0, 0), 2)
 
-                cv2.arrowedLine(warped,
-                                (bx, by),
-                                (arrow_px_x, arrow_px_y),
-                                (255, 0, 0),
-                                2)
+                # Position-to-center vector (yellow)
+                pos_vec_x = -x_mm
+                pos_vec_y = -y_mm
+                pos_end = (
+                    int(bx + pos_vec_x * self.POS_ARROW_SCALE),
+                    int(by - pos_vec_y * self.POS_ARROW_SCALE),
+                )
+                cv2.arrowedLine(warped, (bx, by), pos_end, (0, 255, 255), 2)
+
+                # Resultant PD vector in control-space (green)
+                pd_x = self.pd_kp * pos_vec_x + self.pd_kd * (-vx)
+                pd_y = self.pd_kp * pos_vec_y + self.pd_kd * (-vy)
+                pd_end = (
+                    int(bx + pd_x * self.PD_ARROW_SCALE),
+                    int(by - pd_y * self.PD_ARROW_SCALE),
+                )
+                cv2.arrowedLine(warped, (bx, by), pd_end, (0, 255, 0), 2)
+
+                cv2.putText(warped, "Center", (center_px[0] + 8, center_px[1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(warped, "Vel", (vel_end[0] + 4, vel_end[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1, cv2.LINE_AA)
+                cv2.putText(warped, "Pos->Center", (pos_end[0] + 4, pos_end[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(warped, "PD", (pd_end[0] + 4, pd_end[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
 
             cv2.imshow("Warped Platform View", warped)
 

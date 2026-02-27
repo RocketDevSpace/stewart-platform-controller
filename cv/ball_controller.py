@@ -90,17 +90,7 @@ class BallController:
         if ball_state is None:
             return 0.0, 0.0
 
-        # Accept dict or BallState
-        if isinstance(ball_state, dict):
-            x = ball_state["x_mm"]
-            y = ball_state["y_mm"]
-            vx = ball_state["vx_mm_s"]
-            vy = ball_state["vy_mm_s"]
-        else:
-            x = ball_state.x_mm
-            y = ball_state.y_mm
-            vx = ball_state.vx_mm_s
-            vy = ball_state.vy_mm_s
+        x, y, vx, vy = self._extract_state(ball_state)
 
         # ---------------------------
         # Control Law
@@ -134,9 +124,53 @@ class BallController:
 
         return roll, pitch
 
+    def compute_with_terms(self, ball_state: dict | BallState):
+        """
+        Compute desired platform tilt and expose planar PD terms for diagnostics.
+        Returns:
+            (roll_deg, pitch_deg, terms_dict)
+        """
+        if not self.enabled or ball_state is None:
+            return 0.0, 0.0, {
+                "position_vec_mm": (0.0, 0.0),
+                "velocity_vec_mm_s": (0.0, 0.0),
+                "pd_vec": (0.0, 0.0),
+            }
+
+        x, y, vx, vy = self._extract_state(ball_state)
+
+        pos_vec_x = -x
+        pos_vec_y = -y
+        pd_x = self.kp * pos_vec_x + self.kd * (-vx)
+        pd_y = self.kp * pos_vec_y + self.kd * (-vy)
+
+        roll, pitch = self.compute(ball_state)
+        terms = {
+            "position_vec_mm": (pos_vec_x, pos_vec_y),
+            "velocity_vec_mm_s": (vx, vy),
+            "pd_vec": (pd_x, pd_y),
+        }
+        return roll, pitch, terms
+
     # ---------------------------
     # Internal Helpers
     # ---------------------------
+
+    @staticmethod
+    def _extract_state(ball_state: dict | BallState):
+        if isinstance(ball_state, dict):
+            return (
+                float(ball_state["x_mm"]),
+                float(ball_state["y_mm"]),
+                float(ball_state["vx_mm_s"]),
+                float(ball_state["vy_mm_s"]),
+            )
+        return (
+            float(ball_state.x_mm),
+            float(ball_state.y_mm),
+            float(ball_state.vx_mm_s),
+            float(ball_state.vy_mm_s),
+        )
 
     @staticmethod
     def _clamp(value: float, min_val: float, max_val: float):

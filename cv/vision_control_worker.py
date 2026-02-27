@@ -17,6 +17,7 @@ class ControlSnapshot:
     ik_success: bool
     timings_ms: dict
     ik_result: dict
+    control_terms: dict
 
 
 class VisionControlWorker(QtCore.QObject):
@@ -45,7 +46,12 @@ class VisionControlWorker(QtCore.QObject):
         self._counter = 0
 
         self.ball_controller = BallController(kp=kp, kd=kd, max_tilt_deg=max_tilt_deg)
-        self.ball_tracker = BallTracker(camera_index=camera_index, show_debug=tracker_debug)
+        self.ball_tracker = BallTracker(
+            camera_index=camera_index,
+            show_debug=tracker_debug,
+            pd_kp=kp,
+            pd_kd=kd,
+        )
 
     @QtCore.pyqtSlot()
     def start(self):
@@ -73,6 +79,7 @@ class VisionControlWorker(QtCore.QObject):
     @QtCore.pyqtSlot(float, float)
     def set_gains(self, kp, kd):
         self.ball_controller.set_gains(kp, kd)
+        self.ball_tracker.set_pd_gains(kp, kd)
 
     @QtCore.pyqtSlot()
     def _tick(self):
@@ -94,7 +101,7 @@ class VisionControlWorker(QtCore.QObject):
                 vy_mm_s=ball_state_dict["vy_mm_s"],
             )
 
-            roll_deg, pitch_deg = self.ball_controller.compute(ball_state)
+            roll_deg, pitch_deg, control_terms = self.ball_controller.compute_with_terms(ball_state)
             t2 = time.perf_counter()
 
             pose = {
@@ -146,6 +153,7 @@ class VisionControlWorker(QtCore.QObject):
                 ik_success=ik_result.get("success", False),
                 timings_ms=timings_ms,
                 ik_result=ik_result,
+                control_terms=control_terms,
             )
             self.snapshot_ready.emit(snapshot)
         except Exception as exc:

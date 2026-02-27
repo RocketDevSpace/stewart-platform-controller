@@ -14,11 +14,13 @@ from matplotlib.figure import Figure
 
 from stewart_control.comms.serial_sender import SerialSender
 from stewart_control.config import (
+    CAMERA_DEBUG_WINDOWS,
     CAMERA_INDEX,
     DEBUG_LEVEL,
     GUI_LOG_MAX_LINES,
     LOG_EVERY_N,
     SERIAL_PORT,
+    TIMING_PLOT_POINTS,
     VISUALIZER_HZ,
     VISION_LOOP_HZ,
 )
@@ -27,6 +29,7 @@ from stewart_control.routines.routines import ROUTINES
 from stewart_control.visualization.visualizer3d import StewartVisualizer
 
 import time
+from collections import deque
 
 
 class _DefaultIKSolver:
@@ -52,6 +55,7 @@ class StewartGUILayout(QWidget):
         self.vision_enabled = False
         self._vision_counter = 0
         self._last_visualizer_update = 0.0
+        self._timing_plot_update_every = 5
 
         self._routine_timer_mode = None
         self._routine_send_handler = None
@@ -59,6 +63,23 @@ class StewartGUILayout(QWidget):
 
         self._vision_thread = None
         self._vision_worker = None
+        self._timing_keys = [
+            "ball_update",
+            "pd_compute",
+            "ik_solve",
+            "serial_enqueue",
+            "visualizer_gui",
+            "total",
+        ]
+        self._timing_colors = {
+            "ball_update": "#1f77b4",
+            "pd_compute": "#2ca02c",
+            "ik_solve": "#d62728",
+            "serial_enqueue": "#9467bd",
+            "visualizer_gui": "#ff7f0e",
+            "total": "#111111",
+        }
+        self._timing_history = {k: deque(maxlen=TIMING_PLOT_POINTS) for k in self._timing_keys}
 
         self.routine_timer = QTimer()
         self.routine_timer.setTimerType(QtCore.Qt.PreciseTimer)
@@ -187,6 +208,19 @@ class StewartGUILayout(QWidget):
         self.serial_monitor.textChanged.connect(lambda: self._trim_text_widget(self.serial_monitor))
         control_layout.addWidget(QLabel("Serial Monitor:"))
         control_layout.addWidget(self.serial_monitor)
+
+        self.timing_summary_label = QLabel("Vision Timing Avg (ms): waiting for data...")
+        self.timing_summary_label.setWordWrap(True)
+        control_layout.addWidget(self.timing_summary_label)
+
+        self.timing_figure = Figure(figsize=(5, 2.2))
+        self.timing_canvas = FigureCanvas(self.timing_figure)
+        self.timing_canvas.setFixedHeight(220)
+        self.timing_ax = self.timing_figure.add_subplot(111)
+        self.timing_ax.set_title("Vision Loop Step Timings (ms)")
+        self.timing_ax.set_xlabel("Samples")
+        self.timing_ax.set_ylabel("ms")
+        control_layout.addWidget(self.timing_canvas)
 
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
@@ -649,7 +683,7 @@ class StewartGUILayout(QWidget):
             max_tilt_deg=8.0,
             camera_index=CAMERA_INDEX,
             loop_hz=VISION_LOOP_HZ,
-            tracker_debug=False,
+            tracker_debug=CAMERA_DEBUG_WINDOWS,
         )
         self._vision_worker.moveToThread(self._vision_thread)
         self._vision_thread.started.connect(self._vision_worker.start)
@@ -681,6 +715,10 @@ class StewartGUILayout(QWidget):
             return
         self._log_preview("[INFO] Vision mode enabled.")
         self.vision_enabled = True
+        self._vision_counter = 0
+        self._last_visualizer_update = 0.0
+        for key in self._timing_keys:
+            self._timing_history[key].clear()
         self.vision_button.setText("Vision Mode ACTIVE")
         self.vision_button.setStyleSheet("background-color: orange; color: black;")
         self.cancel_vision_btn.setEnabled(True)
@@ -701,6 +739,7 @@ class StewartGUILayout(QWidget):
         if not self.preview_mode:
             for slider in self.sliders.values():
                 slider.setEnabled(True)
+        self.timing_summary_label.setText("Vision Timing Avg (ms): waiting for data...")
 
     def _on_vision_error(self, msg):
         self._log_preview(f"[VISION ERROR] {msg}")
@@ -716,21 +755,89 @@ class StewartGUILayout(QWidget):
 
         safe_angles, clipped = self.safety_clip_servos(snapshot.servo_angles)
         cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
+        t_serial0 = time.perf_counter()
         self.serial.enqueue_command(cmd, policy="latest")
+        t_serial1 = time.perf_counter()
 
         now = time.perf_counter()
+        vis_ms = 0.0
         if now - self._last_visualizer_update >= (1.0 / max(1, VISUALIZER_HZ)):
             self._last_visualizer_update = now
+            t_vis0 = time.perf_counter()
             self.visualizer.update_platform(snapshot.pose, ik_result=snapshot.ik_result)
+            t_vis1 = time.perf_counter()
+            vis_ms = (t_vis1 - t_vis0) * 1000.0
+
+        timings = dict(snapshot.timings_ms)
+        timings["serial_enqueue"] = (t_serial1 - t_serial0) * 1000.0
+        timings["visualizer_gui"] = vis_ms
+        for key in self._timing_keys:
+            self._timing_history[key].append(float(timings.get(key, 0.0)))
+
+        self._update_timing_diagnostics()
 
         self._vision_counter += 1
         if DEBUG_LEVEL >= 2 and (self._vision_counter % LOG_EVERY_N == 0):
-            t = snapshot.timings_ms
+            t = timings
             self._log_preview(
                 "[VISION] "
                 f"ball={t['ball_update']:.2f}ms "
                 f"pd={t['pd_compute']:.2f}ms "
                 f"ik={t['ik_solve']:.2f}ms "
+                f"serQ={t['serial_enqueue']:.2f}ms "
+                f"vis={t['visualizer_gui']:.2f}ms "
                 f"total={t['total']:.2f}ms "
                 f"clips={len(clipped)}"
             )
+
+    def _update_timing_diagnostics(self):
+        if len(self._timing_history["total"]) == 0:
+            return
+
+        averages = {}
+        for key in self._timing_keys:
+            data = self._timing_history[key]
+            if data:
+                averages[key] = sum(data) / len(data)
+            else:
+                averages[key] = 0.0
+
+        self.timing_summary_label.setText(
+            "Vision Timing Avg (ms): "
+            f"ball={averages['ball_update']:.2f}, "
+            f"pd={averages['pd_compute']:.2f}, "
+            f"ik={averages['ik_solve']:.2f}, "
+            f"serQ={averages['serial_enqueue']:.2f}, "
+            f"vis={averages['visualizer_gui']:.2f}, "
+            f"total={averages['total']:.2f}"
+        )
+
+        if self._vision_counter % LOG_EVERY_N == 0:
+            self._log_preview(
+                "[VISION AVG] "
+                f"ball={averages['ball_update']:.2f}ms, "
+                f"pd={averages['pd_compute']:.2f}ms, "
+                f"ik={averages['ik_solve']:.2f}ms, "
+                f"serQ={averages['serial_enqueue']:.2f}ms, "
+                f"vis={averages['visualizer_gui']:.2f}ms, "
+                f"total={averages['total']:.2f}ms"
+            )
+
+        if self._vision_counter % self._timing_plot_update_every != 0:
+            return
+
+        self.timing_ax.cla()
+        self.timing_ax.set_title("Vision Loop Step Timings (ms)")
+        self.timing_ax.set_xlabel("Samples")
+        self.timing_ax.set_ylabel("ms")
+
+        for key in self._timing_keys:
+            y = list(self._timing_history[key])
+            if not y:
+                continue
+            x = list(range(len(y)))
+            self.timing_ax.plot(x, y, label=key, linewidth=1.5, color=self._timing_colors[key])
+
+        self.timing_ax.grid(True, alpha=0.3)
+        self.timing_ax.legend(loc="upper right", fontsize=7)
+        self.timing_canvas.draw_idle()
