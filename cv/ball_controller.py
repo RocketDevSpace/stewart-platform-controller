@@ -8,7 +8,19 @@ Created on Tue Feb 24 16:13:27 2026
 import math
 import time
 from dataclasses import dataclass
-from stewart_control.config import DEBUG_LEVEL, LOG_EVERY_N
+from stewart_control.config import (
+    AUTO_TRIM_ENABLED,
+    AUTO_TRIM_KI_DEG_PER_MM_S,
+    AUTO_TRIM_MAX_DEG,
+    AUTO_TRIM_SETTLE_HOLD_S,
+    AUTO_TRIM_SETTLE_RADIUS_MM,
+    AUTO_TRIM_SETTLE_SPEED_MM_S,
+    AUTO_TRIM_STEP_LIMIT_DEG,
+    DEBUG_LEVEL,
+    LOG_EVERY_N,
+    MANUAL_PITCH_TRIM_DEG,
+    MANUAL_ROLL_TRIM_DEG,
+)
 
 
 @dataclass
@@ -57,8 +69,18 @@ class BallController:
         self.log_every_n = max(1, int(log_every_n))
         self._log_counter = 0
         
-        self.pitch_offset = 0
-        self.roll_offset = 0
+        self.pitch_offset = float(MANUAL_PITCH_TRIM_DEG)
+        self.roll_offset = float(MANUAL_ROLL_TRIM_DEG)
+        self.auto_trim_enabled = bool(AUTO_TRIM_ENABLED)
+        self.auto_trim_ki = float(AUTO_TRIM_KI_DEG_PER_MM_S)
+        self.auto_trim_max_deg = float(AUTO_TRIM_MAX_DEG)
+        self.auto_trim_settle_speed_mm_s = float(AUTO_TRIM_SETTLE_SPEED_MM_S)
+        self.auto_trim_settle_radius_mm = float(AUTO_TRIM_SETTLE_RADIUS_MM)
+        self.auto_trim_settle_hold_s = float(AUTO_TRIM_SETTLE_HOLD_S)
+        self.auto_trim_step_limit_deg = float(AUTO_TRIM_STEP_LIMIT_DEG)
+        self._settled_time_s = 0.0
+        self._last_trim_update_time = None
+        self._auto_trim_update_count = 0
         self._prev_roll_cmd = 0.0
         self._prev_pitch_cmd = 0.0
         self._prev_cmd_time = None
@@ -81,6 +103,19 @@ class BallController:
 
     def disable(self):
         self.enabled = False
+
+    def reset_trim(self):
+        self.roll_offset = float(MANUAL_ROLL_TRIM_DEG)
+        self.pitch_offset = float(MANUAL_PITCH_TRIM_DEG)
+        self._settled_time_s = 0.0
+        self._auto_trim_update_count = 0
+
+    def set_trim(self, roll_offset_deg: float, pitch_offset_deg: float):
+        self.roll_offset = float(roll_offset_deg)
+        self.pitch_offset = float(pitch_offset_deg)
+
+    def set_auto_trim_enabled(self, enabled: bool):
+        self.auto_trim_enabled = bool(enabled)
 
     def compute(self, ball_state: dict | BallState):
         """
@@ -159,6 +194,8 @@ class BallController:
         pd_x = p_x + d_x
         pd_y = p_y + d_y
 
+        self._update_auto_trim(x, y, vx, vy)
+
         # Map planar control vector to platform axes.
         pitch_raw = pd_x + self.pitch_offset
         roll_raw = -pd_y + self.roll_offset
@@ -177,8 +214,47 @@ class BallController:
             "pitch_clamped": pitch_clamped,
             "roll_cmd": roll,
             "pitch_cmd": pitch,
+            "roll_offset": self.roll_offset,
+            "pitch_offset": self.pitch_offset,
+            "trim_settled_s": self._settled_time_s,
+            "trim_updates": self._auto_trim_update_count,
+            "auto_trim_enabled": self.auto_trim_enabled,
         }
         return roll, pitch, terms
+
+    def _update_auto_trim(self, x, y, vx, vy):
+        now = time.perf_counter()
+        if self._last_trim_update_time is None:
+            self._last_trim_update_time = now
+            return
+
+        dt = max(1e-4, now - self._last_trim_update_time)
+        self._last_trim_update_time = now
+
+        if (not self.auto_trim_enabled) or (not self.enabled):
+            self._settled_time_s = 0.0
+            return
+
+        speed = math.hypot(vx, vy)
+        radius = math.hypot(x, y)
+        settled = (speed <= self.auto_trim_settle_speed_mm_s) and (radius <= self.auto_trim_settle_radius_mm)
+        if not settled:
+            self._settled_time_s = 0.0
+            return
+
+        self._settled_time_s += dt
+        if self._settled_time_s < self.auto_trim_settle_hold_s:
+            return
+
+        # Very slow integral-style trim to cancel static bias.
+        roll_rate = self.auto_trim_ki * y
+        pitch_rate = self.auto_trim_ki * (-x)
+        roll_step = self._clamp(roll_rate * dt, -self.auto_trim_step_limit_deg, self.auto_trim_step_limit_deg)
+        pitch_step = self._clamp(pitch_rate * dt, -self.auto_trim_step_limit_deg, self.auto_trim_step_limit_deg)
+
+        self.roll_offset = self._clamp(self.roll_offset + roll_step, -self.auto_trim_max_deg, self.auto_trim_max_deg)
+        self.pitch_offset = self._clamp(self.pitch_offset + pitch_step, -self.auto_trim_max_deg, self.auto_trim_max_deg)
+        self._auto_trim_update_count += 1
 
     def _apply_slew_limit(self, roll, pitch):
         now = time.perf_counter()

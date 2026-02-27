@@ -73,6 +73,9 @@ class StewartGUIController(StewartGUIView):
             "trk_capture",
             "trk_frame_age",
             "trk_cap_period",
+            "trk_slow_streak",
+            "trk_runtime_applied",
+            "trk_runtime_tries",
             "trk_aruco",
             "trk_aruco_retry",
             "trk_h",
@@ -552,6 +555,8 @@ class StewartGUIController(StewartGUIView):
                     f"f2w={timings.get('frame_to_worker_ms', 0.0):.1f}ms "
                     f"cmd_age={timings.get('frame_to_cmd', 0.0):.1f}ms "
                     f"w2g={timings.get('worker_to_gui_ms', 0.0):.1f}ms "
+                    f"trim=(r{terms.get('roll_offset', 0.0):.3f},p{terms.get('pitch_offset', 0.0):.3f}) "
+                    f"settled={terms.get('trim_settled_s', 0.0):.2f}s "
                     f"rad={snapshot.timings_ms.get('trk_radius_px', 0.0):.1f}px "
                     f"area={snapshot.timings_ms.get('trk_area', 0.0):.0f} "
                     f"cmd={safe_angles}"
@@ -595,6 +600,9 @@ class StewartGUIController(StewartGUIView):
                 f"fetch={trk['trk_capture']:.2f}ms "
                 f"age={trk['trk_frame_age']:.2f}ms "
                 f"cap_period={trk['trk_cap_period']:.2f}ms "
+                f"slow={trk['trk_slow_streak']:.1f} "
+                f"rt_applied={trk['trk_runtime_applied']:.1f} "
+                f"rt_tries={trk['trk_runtime_tries']:.1f} "
                 f"aruco={trk['trk_aruco']:.2f}ms "
                 f"aruco_retry={trk['trk_aruco_retry']:.2f}ms "
                 f"H={trk['trk_h']:.2f}ms "

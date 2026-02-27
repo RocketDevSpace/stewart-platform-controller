@@ -144,6 +144,9 @@ class VisionControlWorker(QtCore.QObject):
                 tracker_profile = getattr(self.ball_tracker, "last_profile_ms", {}) or {}
                 timings_ms["trk_frame_age"] = float(tracker_profile.get("frame_age", 0.0))
                 timings_ms["trk_cap_period"] = float(tracker_profile.get("capture_period", 0.0))
+                timings_ms["trk_slow_streak"] = float(tracker_profile.get("slow_streak", 0.0))
+                timings_ms["trk_runtime_applied"] = float(tracker_profile.get("runtime_profile_applied", 0.0))
+                timings_ms["trk_runtime_tries"] = float(tracker_profile.get("runtime_profile_tries", 0.0))
                 snapshot = ControlSnapshot(
                     timestamp=time.time(),
                     frame_ts=0.0,
@@ -229,6 +232,9 @@ class VisionControlWorker(QtCore.QObject):
             timings_ms["trk_capture"] = tracker_profile.get("capture_fetch", 0.0)
             timings_ms["trk_frame_age"] = tracker_profile.get("frame_age", 0.0)
             timings_ms["trk_cap_period"] = tracker_profile.get("capture_period", 0.0)
+            timings_ms["trk_slow_streak"] = tracker_profile.get("slow_streak", 0.0)
+            timings_ms["trk_runtime_applied"] = tracker_profile.get("runtime_profile_applied", 0.0)
+            timings_ms["trk_runtime_tries"] = tracker_profile.get("runtime_profile_tries", 0.0)
             timings_ms["trk_aruco"] = tracker_profile.get("aruco_detect", 0.0)
             timings_ms["trk_aruco_retry"] = tracker_profile.get("aruco_retry", 0.0)
             timings_ms["trk_h"] = tracker_profile.get("homography", 0.0)

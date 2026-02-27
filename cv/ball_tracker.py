@@ -101,6 +101,9 @@ class BallTracker:
         self._prev_capture_ts = 0.0
         self._slow_capture_streak = 0
         self._runtime_speed_profile_applied = False
+        self._last_runtime_profile_apply_ts = 0.0
+        self._runtime_profile_attempts = 0
+        self.camera_index = int(camera_index)
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
         self._last_processed_frame_ts = 0.0
@@ -272,21 +275,21 @@ class BallTracker:
         while self._capture_running:
             ret, frame = self.cap.read()
             if not ret:
-                if not self._runtime_speed_profile_applied:
-                    self._slow_capture_streak += 1
-                    if self._slow_capture_streak >= 30:
-                        self._apply_runtime_speed_profile()
-                        self._slow_capture_streak = 0
+                self._slow_capture_streak += 1
+                if self._slow_capture_streak >= 12:
+                    self._apply_runtime_speed_profile()
+                    self._slow_capture_streak = 0
                 time.sleep(0.001)
                 continue
             now = time.perf_counter()
             if self._prev_capture_ts > 0:
                 dt_ms = (now - self._prev_capture_ts) * 1000.0
-                if dt_ms > 70.0:
+                slow_now = (dt_ms > 45.0) or (self._capture_period_ms > 45.0 and self._capture_period_ms > 0.0)
+                if slow_now:
                     self._slow_capture_streak += 1
                 else:
                     self._slow_capture_streak = max(0, self._slow_capture_streak - 1)
-                if (not self._runtime_speed_profile_applied) and self._slow_capture_streak >= 15:
+                if self._slow_capture_streak >= 10:
                     self._apply_runtime_speed_profile()
                     self._slow_capture_streak = 0
             with self._capture_lock:
@@ -297,20 +300,91 @@ class BallTracker:
                 self._latest_frame_ts = now
 
     def _apply_runtime_speed_profile(self):
-        # Force a stable low-latency mode if runtime capture drifts toward ~10 FPS.
+        # Force a stable low-latency mode if runtime capture drifts.
+        now = time.perf_counter()
+        if (now - self._last_runtime_profile_apply_ts) < 1.5:
+            return
+        self._last_runtime_profile_apply_ts = now
+        self._runtime_profile_attempts += 1
         try:
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            self.cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
+            self.cap.set(cv2.CAP_PROP_FPS, max(30, CAMERA_TARGET_FPS))
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
             self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
             self.cap.set(cv2.CAP_PROP_EXPOSURE, max(float(CAMERA_EXPOSURE), -4.0))
+            # Let camera settle before measuring.
+            for _ in range(5):
+                self.cap.read()
+            p_ms, g_mean = self._measure_camera_stats(self.cap, samples=10)
             self._runtime_speed_profile_applied = True
             if self.debug_level >= 1:
                 print(
                     "[CAMERA] Runtime speed profile enabled "
-                    f"(fps_target={CAMERA_TARGET_FPS}, exp={max(float(CAMERA_EXPOSURE), -4.0):.1f})"
+                    f"(fps_target={max(30, CAMERA_TARGET_FPS)}, exp={max(float(CAMERA_EXPOSURE), -4.0):.1f}, "
+                    f"period~{p_ms:.1f}ms, gray={g_mean:.1f}, tries={self._runtime_profile_attempts})"
                 )
+            if p_ms > 50.0:
+                self._reopen_camera_runtime_profile()
         except Exception:
             pass
+
+    def _reopen_camera_runtime_profile(self):
+        backend_order = []
+        b = str(getattr(self, "camera_backend", "")).upper()
+        if b == "DSHOW":
+            backend_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+        elif b == "MSMF":
+            backend_order = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+        else:
+            backend_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+
+        best_cap = None
+        best_period = 1e9
+        best_backend = None
+        best_gray = 0.0
+        for backend in backend_order:
+            cap = cv2.VideoCapture(self.camera_index, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FPS, max(30, CAMERA_TARGET_FPS))
+            try:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                cap.set(cv2.CAP_PROP_EXPOSURE, max(float(CAMERA_EXPOSURE), -4.0))
+            except Exception:
+                pass
+            p_ms, g_mean = self._measure_camera_stats(cap, samples=10)
+            if p_ms < best_period:
+                if best_cap is not None:
+                    best_cap.release()
+                best_cap = cap
+                best_period = p_ms
+                best_backend = backend
+                best_gray = g_mean
+            else:
+                cap.release()
+
+        if best_cap is not None:
+            old = self.cap
+            self.cap = best_cap
+            self.camera_backend = self._backend_name(best_backend)
+            self.camera_measured_period_ms = float(best_period)
+            self.camera_gray_mean = float(best_gray)
+            self._capture_period_ms = best_period
+            self._prev_capture_ts = 0.0
+            try:
+                old.release()
+            except Exception:
+                pass
+            if self.debug_level >= 1:
+                print(
+                    "[CAMERA] Runtime reopen selected "
+                    f"backend={self.camera_backend} period~{best_period:.1f}ms gray={best_gray:.1f}"
+                )
 
     def set_pd_gains(self, kp, kd):
         self.pd_kp = float(kp)
@@ -393,13 +467,16 @@ class BallTracker:
     def update(self, return_debug_frames=False):
         t0 = time.perf_counter()
         with self._capture_lock:
-            frame = None if self._latest_frame is None else self._latest_frame.copy()
             frame_ts = self._latest_frame_ts
-        if frame is None:
+            latest_frame = self._latest_frame
+        if latest_frame is None:
             self.last_status_reason = "no_camera_frame"
             self.last_profile_ms = {
                 "frame_age": 0.0,
                 "capture_period": self._capture_period_ms,
+                "slow_streak": float(self._slow_capture_streak),
+                "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
+                "runtime_profile_tries": float(self._runtime_profile_attempts),
             }
             return None
         if frame_ts > 0 and self._last_processed_frame_ts > 0 and frame_ts <= self._last_processed_frame_ts:
@@ -407,13 +484,20 @@ class BallTracker:
             self.last_profile_ms = {
                 "frame_age": 0.0,
                 "capture_period": self._capture_period_ms,
+                "slow_streak": float(self._slow_capture_streak),
+                "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
+                "runtime_profile_tries": float(self._runtime_profile_attempts),
             }
             return None
+        frame = latest_frame.copy()
         t1 = time.perf_counter()
         frame_age_ms = max(0.0, (t1 - frame_ts) * 1000.0) if frame_ts > 0 else 0.0
         self.last_profile_ms = {
             "frame_age": frame_age_ms,
             "capture_period": self._capture_period_ms,
+            "slow_streak": float(self._slow_capture_streak),
+            "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
+            "runtime_profile_tries": float(self._runtime_profile_attempts),
         }
 
         self._frame_counter += 1
@@ -597,6 +681,9 @@ class BallTracker:
                 "capture_fetch": (t1 - t0) * 1000.0,
                 "frame_age": frame_age_ms,
                 "capture_period": self._capture_period_ms,
+                "slow_streak": float(self._slow_capture_streak),
+                "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
+                "runtime_profile_tries": float(self._runtime_profile_attempts),
                 "aruco_detect": (t_aruco1 - t_aruco0) * 1000.0,
                 "aruco_retry": aruco_retry_ms,
                 "homography": homography_ms,
