@@ -9,9 +9,11 @@ from stewart_control.config import (
     CAMERA_ALLOW_FALLBACK_RESOLUTION,
     CAMERA_AUTO_EXPOSURE,
     CAMERA_EXPOSURE,
+    CAMERA_EXPOSURE_TUNE_ENABLED,
     CAMERA_FALLBACK_HEIGHT,
     CAMERA_FALLBACK_WIDTH,
     CAMERA_FORCE_BACKEND,
+    CAMERA_GAIN,
     CAMERA_BUFFER_SIZE,
     CAMERA_HEIGHT,
     CAMERA_TARGET_FPS,
@@ -143,6 +145,62 @@ class BallTracker:
             return "ANY"
         return str(backend)
 
+    @staticmethod
+    def _safe_cam_get(cap, prop, default=float("nan")):
+        try:
+            return float(cap.get(prop))
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _fourcc_to_str(value):
+        try:
+            iv = int(value)
+            return "".join([chr((iv >> (8 * i)) & 0xFF) for i in range(4)])
+        except Exception:
+            return "????"
+
+    def _camera_props_snapshot(self, cap):
+        fps = self._safe_cam_get(cap, cv2.CAP_PROP_FPS)
+        w = self._safe_cam_get(cap, cv2.CAP_PROP_FRAME_WIDTH)
+        h = self._safe_cam_get(cap, cv2.CAP_PROP_FRAME_HEIGHT)
+        auto_exp = self._safe_cam_get(cap, cv2.CAP_PROP_AUTO_EXPOSURE)
+        exp = self._safe_cam_get(cap, cv2.CAP_PROP_EXPOSURE)
+        gain = self._safe_cam_get(cap, cv2.CAP_PROP_GAIN)
+        fourcc = self._safe_cam_get(cap, cv2.CAP_PROP_FOURCC)
+        return {
+            "fps": fps,
+            "w": w,
+            "h": h,
+            "auto_exp": auto_exp,
+            "exp": exp,
+            "gain": gain,
+            "fourcc": fourcc,
+        }
+
+    def _log_camera_probe(self, label, backend_name, props, period_ms=None, gray_mean=None, details=None, extra=""):
+        msg = (
+            f"[CAMERA][{label}] backend={backend_name} "
+            f"fps={props['fps']:.1f} w={props['w']:.0f} h={props['h']:.0f} "
+            f"auto_exp={props['auto_exp']:.2f} exp={props['exp']:.3f} "
+            f"gain={props['gain']:.2f} fourcc={self._fourcc_to_str(props['fourcc'])}"
+        )
+        if period_ms is not None:
+            msg += f" period={float(period_ms):.1f}ms"
+        if gray_mean is not None:
+            msg += f" gray={float(gray_mean):.1f}"
+        if details:
+            msg += (
+                f" n={int(details.get('n', 0))}"
+                f" p10={float(details.get('p10', 0.0)):.1f}ms"
+                f" p90={float(details.get('p90', 0.0)):.1f}ms"
+                f" min={float(details.get('min', 0.0)):.1f}ms"
+                f" max={float(details.get('max', 0.0)):.1f}ms"
+            )
+        if extra:
+            msg += f" {extra}"
+        print(msg)
+
     def _configure_camera(self, cap):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
@@ -154,10 +212,11 @@ class BallTracker:
         except Exception:
             pass
         if not CAMERA_AUTO_EXPOSURE:
-            try:
-                cap.set(cv2.CAP_PROP_EXPOSURE, CAMERA_EXPOSURE)
-            except Exception:
-                pass
+            self._apply_manual_exposure(cap, float(CAMERA_EXPOSURE), settle_reads=2)
+        try:
+            cap.set(cv2.CAP_PROP_GAIN, float(CAMERA_GAIN))
+        except Exception:
+            pass
         try:
             cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
         except Exception:
@@ -170,14 +229,46 @@ class BallTracker:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
 
-    def _measure_camera_stats(self, cap, samples=18):
+    @staticmethod
+    def _apply_manual_exposure(cap, exposure_value: float, settle_reads: int = 0):
+        auto_set_ok = False
+        exp_set_ok_1 = False
+        exp_set_ok_2 = False
+        try:
+            auto_set_ok = bool(cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25))
+        except Exception:
+            pass
+        try:
+            exp_set_ok_1 = bool(cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure_value)))
+            exp_set_ok_2 = bool(cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure_value)))
+        except Exception:
+            pass
+        for _ in range(max(0, int(settle_reads))):
+            try:
+                cap.read()
+            except Exception:
+                break
+        return {
+            "auto_set_ok": auto_set_ok,
+            "exp_set_ok_1": exp_set_ok_1,
+            "exp_set_ok_2": exp_set_ok_2,
+        }
+
+    def _measure_camera_stats(self, cap, samples=8, warmup=0, with_details=False):
         t_prev = None
         periods = []
         gray_levels = []
+        ok_frames = 0
+        for _ in range(max(0, int(warmup))):
+            try:
+                cap.read()
+            except Exception:
+                pass
         for _ in range(samples):
             ret, frame = cap.read()
             if not ret:
                 continue
+            ok_frames += 1
             t_now = time.perf_counter()
             if t_prev is not None:
                 periods.append((t_now - t_prev) * 1000.0)
@@ -187,9 +278,72 @@ class BallTracker:
             except Exception:
                 pass
         if not periods:
+            if with_details:
+                return 1e9, 0.0, {"n": 0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0, "ok_frames": ok_frames}
             return 1e9, 0.0
         gray_mean = float(sum(gray_levels) / len(gray_levels)) if gray_levels else 0.0
-        return float(sum(periods) / len(periods)), gray_mean
+        # Median is more robust to a dropped frame right after a property change.
+        period_arr = np.array(periods, dtype=float)
+        period_ms = float(np.median(period_arr))
+        if with_details:
+            details = {
+                "n": len(periods),
+                "p10": float(np.percentile(period_arr, 10)),
+                "p90": float(np.percentile(period_arr, 90)),
+                "min": float(np.min(period_arr)),
+                "max": float(np.max(period_arr)),
+                "ok_frames": ok_frames,
+            }
+            return period_ms, gray_mean, details
+        return period_ms, gray_mean
+
+    def _retune_manual_exposure(self, cap, base_period, base_gray):
+        # Some webcams ignore requested manual exposure exactly. If startup is too dark,
+        # probe nearby values and pick the brightest mode that keeps cadence acceptable.
+        if CAMERA_AUTO_EXPOSURE:
+            return base_period, base_gray
+        if not CAMERA_EXPOSURE_TUNE_ENABLED:
+            return base_period, base_gray
+        if base_gray >= 22.0:
+            return base_period, base_gray
+
+        base_exp = float(CAMERA_EXPOSURE)
+        candidates = [base_exp, base_exp - 1.0, base_exp - 2.0, base_exp + 1.0, base_exp + 2.0]
+        seen = set()
+        probes = []
+        for exp in candidates:
+            if exp in seen:
+                continue
+            seen.add(exp)
+            try:
+                self._apply_manual_exposure(cap, exp, settle_reads=2)
+            except Exception:
+                pass
+            p_try, g_try = self._measure_camera_stats(cap, samples=4, warmup=1)
+            probes.append((p_try, g_try, exp))
+        if not probes:
+            return base_period, base_gray
+
+        # Speed-first selection: choose fastest cadence, then brightest among near-fastest.
+        fastest = min(t[0] for t in probes)
+        near_fast = [t for t in probes if t[0] <= (fastest + 12.0)]
+        p_best, g_best, exp_best = max(near_fast, key=lambda t: t[1])
+
+        # If everything is still very dark, try auto exposure but only accept if cadence stays reasonable.
+        if g_best < 20.0:
+            p_auto, g_auto = base_period, base_gray
+            try:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+                p_auto, g_auto = self._measure_camera_stats(cap, samples=4, warmup=2)
+            except Exception:
+                pass
+            if p_auto <= max(55.0, p_best + 10.0) and g_auto >= g_best + 8.0:
+                return p_auto, g_auto
+        try:
+            self._apply_manual_exposure(cap, exp_best, settle_reads=2)
+        except Exception:
+            pass
+        return p_best, g_best
 
     def _open_best_camera(self, camera_index):
         if CAMERA_FORCE_BACKEND.upper() == "DSHOW":
@@ -206,20 +360,95 @@ class BallTracker:
         best_mode = f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}"
         best_gray = 0.0
 
+        if self.debug_level >= 1:
+            print(
+                "[CAMERA] startup config "
+                f"target={CAMERA_WIDTH}x{CAMERA_HEIGHT}@{CAMERA_TARGET_FPS} "
+                f"forced_backend={CAMERA_FORCE_BACKEND} "
+                f"manual={'no' if CAMERA_AUTO_EXPOSURE else 'yes'} "
+                f"exp={float(CAMERA_EXPOSURE):.2f} gain={float(CAMERA_GAIN):.2f}"
+            )
+
         for backend in backends:
             cap = cv2.VideoCapture(camera_index, backend)
             if not cap.isOpened():
                 cap.release()
                 continue
+            backend_name = self._backend_name(backend)
+            if self.debug_level >= 1:
+                self._log_camera_probe(
+                    "open",
+                    backend_name,
+                    self._camera_props_snapshot(cap),
+                )
             self._configure_camera(cap)
-            period, gray_mean = self._measure_camera_stats(cap)
+            if self.debug_level >= 1:
+                self._log_camera_probe(
+                    "configured",
+                    backend_name,
+                    self._camera_props_snapshot(cap),
+                )
+            if not CAMERA_AUTO_EXPOSURE and not CAMERA_EXPOSURE_TUNE_ENABLED:
+                # Hard-lock configured manual exposure before measuring.
+                set_result = self._apply_manual_exposure(cap, float(CAMERA_EXPOSURE), settle_reads=4)
+                if self.debug_level >= 1:
+                    self._log_camera_probe(
+                        "manual_lock",
+                        backend_name,
+                        self._camera_props_snapshot(cap),
+                        extra=(
+                            f"set_ok(auto={int(set_result.get('auto_set_ok', False))},"
+                            f"exp1={int(set_result.get('exp_set_ok_1', False))},"
+                            f"exp2={int(set_result.get('exp_set_ok_2', False))})"
+                        ),
+                    )
+                if self.debug_level >= 1:
+                    probe_exps = [float(CAMERA_EXPOSURE), -4.0, -5.0, -6.0]
+                    seen = set()
+                    for probe_exp in probe_exps:
+                        if probe_exp in seen:
+                            continue
+                        seen.add(probe_exp)
+                        probe_result = self._apply_manual_exposure(cap, probe_exp, settle_reads=2)
+                        p_probe, g_probe, d_probe = self._measure_camera_stats(
+                            cap, samples=4, warmup=1, with_details=True
+                        )
+                        self._log_camera_probe(
+                            "manual_probe",
+                            backend_name,
+                            self._camera_props_snapshot(cap),
+                            period_ms=p_probe,
+                            gray_mean=g_probe,
+                            details=d_probe,
+                            extra=(
+                                f"requested_exp={probe_exp:.2f} "
+                                f"set_ok(auto={int(probe_result.get('auto_set_ok', False))},"
+                                f"exp1={int(probe_result.get('exp_set_ok_1', False))},"
+                                f"exp2={int(probe_result.get('exp_set_ok_2', False))})"
+                            ),
+                        )
+                    self._apply_manual_exposure(cap, float(CAMERA_EXPOSURE), settle_reads=2)
+            period, gray_mean, details = self._measure_camera_stats(
+                cap, samples=6, warmup=2, with_details=True
+            )
             mode = f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}"
+            if self.debug_level >= 1:
+                self._log_camera_probe(
+                    "baseline",
+                    backend_name,
+                    self._camera_props_snapshot(cap),
+                    period_ms=period,
+                    gray_mean=gray_mean,
+                    details=details,
+                )
+
+            period, gray_mean = self._retune_manual_exposure(cap, period, gray_mean)
 
             # If period is too slow, try a small manual-exposure sweep and keep
             # the fastest setting that is still bright enough for detection.
             # This recovery runs even when auto-exposure is configured, because
             # some webcams drop to ~10 FPS under auto exposure in dim scenes.
-            if period > 45.0:
+            if period > 45.0 and CAMERA_AUTO_EXPOSURE:
                 tuned = []
                 for exp in (-4.0, -5.0, -6.0):
                     try:
@@ -245,7 +474,7 @@ class BallTracker:
             # Keep image-quality-first defaults; only downshift resolution if explicitly enabled.
             if CAMERA_ALLOW_FALLBACK_RESOLUTION and period > 45.0:
                 self._configure_camera_fallback(cap)
-                period_fallback, gray_fallback = self._measure_camera_stats(cap)
+                period_fallback, gray_fallback = self._measure_camera_stats(cap, samples=4)
                 if period_fallback < period:
                     period = period_fallback
                     gray_mean = gray_fallback
@@ -277,9 +506,12 @@ class BallTracker:
                     f"fps={best_cap.get(cv2.CAP_PROP_FPS):.1f} "
                     f"w={best_cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f} "
                     f"h={best_cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f} "
+                    f"auto_exp={best_cap.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f} "
                     f"exp={best_cap.get(cv2.CAP_PROP_EXPOSURE):.3f} "
                     f"gray={getattr(self, 'camera_gray_mean', 0.0):.1f}"
                 )
+                if getattr(self, "camera_gray_mean", 0.0) < 18.0:
+                    print("[CAMERA] warning: startup image is very dark; HSV detection may fail.")
             except Exception:
                 pass
         return best_cap
@@ -573,6 +805,75 @@ class BallTracker:
         warped = None
         mask = None
 
+        def _failure_result(
+            reason: str,
+            *,
+            warped_img=None,
+            mask_img=None,
+            mean_gray_val=0.0,
+            aruco_ids_val=0,
+            homography_ms_val=0.0,
+            aruco_retry_ms_val=0.0,
+            used_cached_h_val=0.0,
+            warp_ms_val=0.0,
+            hsv_ms_val=0.0,
+            contour_ms_val=0.0,
+        ):
+            self.last_status_reason = reason
+            fail_profile = {
+                "capture_fetch": (t1 - t0) * 1000.0,
+                "frame_age": frame_age_ms,
+                "capture_period": self._capture_period_ms,
+                "slow_streak": float(self._slow_capture_streak),
+                "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
+                "runtime_profile_tries": float(self._runtime_profile_attempts),
+                "aruco_detect": 0.0,
+                "aruco_retry": float(aruco_retry_ms_val),
+                "homography": float(homography_ms_val),
+                "warp": float(warp_ms_val),
+                "hsv_mask": float(hsv_ms_val),
+                "contour": float(contour_ms_val),
+                "kinematics": 0.0,
+                "overlay": 0.0,
+                "total": (time.perf_counter() - t0) * 1000.0,
+                "used_cached_h": float(used_cached_h_val),
+            }
+            self.last_profile_ms = {
+                "frame_age": frame_age_ms,
+                "capture_period": self._capture_period_ms,
+                "slow_streak": float(self._slow_capture_streak),
+                "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
+                "runtime_profile_tries": float(self._runtime_profile_attempts),
+            }
+            if not return_debug_frames:
+                return None
+            local_warped = warped_img
+            local_mask = mask_img
+            if local_mask is None:
+                src = local_warped if local_warped is not None else frame
+                hsv_dbg = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)
+                local_mask = cv2.inRange(hsv_dbg, self.hsv_lower, self.hsv_upper)
+            return {
+                "tracking_valid": False,
+                "reason": reason,
+                "frame_ts": float(frame_ts),
+                "profile_ms": fail_profile,
+                "quality": {
+                    "radius_px": 0.0,
+                    "contour_area": 0.0,
+                    "circularity": 0.0,
+                    "fill_ratio": 0.0,
+                    "dt_s": 0.0,
+                    "gray_mean": float(mean_gray_val),
+                    "warp_gray_mean": 0.0,
+                    "vmin_eff": float(self.hsv_lower[2]),
+                    "aruco_ids": float(aruco_ids_val),
+                },
+                "camera_bgr": frame,
+                "warped_bgr": local_warped,
+                "mask_gray": local_mask,
+            }
+
         t_aruco0 = time.perf_counter()
         homography_ms = 0.0
         aruco_retry_ms = 0.0
@@ -613,8 +914,7 @@ class BallTracker:
                     t2 = time.perf_counter()
                     self._aruco_hold_count += 1
                 else:
-                    self.last_status_reason = f"no_aruco_ids(gray={mean_gray:.1f})"
-                    return None
+                    return _failure_result(f"no_aruco_ids(gray={mean_gray:.1f})", mean_gray_val=mean_gray)
             if ids is not None:
                 ids = ids.flatten()
                 aruco_id_count = int(ids.size)
@@ -634,8 +934,11 @@ class BallTracker:
                         H = self._last_H
                         self._aruco_hold_count += 1
                     else:
-                        self.last_status_reason = "insufficient_aruco_points"
-                        return None
+                        return _failure_result(
+                            "insufficient_aruco_points",
+                            mean_gray_val=mean_gray,
+                            aruco_ids_val=aruco_id_count,
+                        )
                 if len(marker_centers_px) == 3:
                     missing_id = list(set(self.CORNER_IDS) - set(marker_centers_px.keys()))[0]
                     order = self.CORNER_IDS
@@ -648,8 +951,11 @@ class BallTracker:
                             H = self._last_H
                             self._aruco_hold_count += 1
                         else:
-                            self.last_status_reason = "aruco_reconstruct_failed"
-                            return None
+                            return _failure_result(
+                                "aruco_reconstruct_failed",
+                                mean_gray_val=mean_gray,
+                                aruco_ids_val=aruco_id_count,
+                            )
                     A = marker_centers_px[prev_id]
                     B = marker_centers_px[opposite_id]
                     C = marker_centers_px[next_id]
@@ -673,8 +979,12 @@ class BallTracker:
                 t_h1 = time.perf_counter()
                 homography_ms = (t_h1 - t_h0) * 1000.0
                 if H is None:
-                    self.last_status_reason = "homography_failed"
-                    return None
+                    return _failure_result(
+                        "homography_failed",
+                        mean_gray_val=mean_gray,
+                        aruco_ids_val=aruco_id_count,
+                        homography_ms_val=homography_ms,
+                    )
                 self._last_H = H
                 self._aruco_hold_count = 0
         t_aruco1 = time.perf_counter()
@@ -705,8 +1015,19 @@ class BallTracker:
             ball = self.find_ball_center(mask)
             vmin_eff = int(lower_eff2[2])
         if ball is None:
-            self.last_status_reason = "ball_contour_invalid"
-            return None
+            return _failure_result(
+                "ball_contour_invalid",
+                warped_img=warped,
+                mask_img=mask,
+                mean_gray_val=mean_gray,
+                aruco_ids_val=aruco_id_count,
+                aruco_retry_ms_val=aruco_retry_ms,
+                homography_ms_val=homography_ms,
+                used_cached_h_val=1.0 if use_cached_h else 0.0,
+                warp_ms_val=(t_w1 - t_w0) * 1000.0,
+                hsv_ms_val=(t_m1 - t_m0) * 1000.0,
+                contour_ms_val=(time.perf_counter() - t_c0) * 1000.0,
+            )
         (bx, by), radius_px, contour_area, circularity, fill_ratio, mask = ball
         t_c1 = time.perf_counter()
 
@@ -733,8 +1054,19 @@ class BallTracker:
                 vy_raw = (y_mm - self.prev_ball_mm[1]) / dt
                 speed_raw = np.hypot(vx_raw, vy_raw)
                 if self.max_speed_mm_s > 0 and speed_raw > self.max_speed_mm_s:
-                    self.last_status_reason = f"velocity_outlier_{speed_raw:.1f}"
-                    return None
+                    return _failure_result(
+                        f"velocity_outlier_{speed_raw:.1f}",
+                        warped_img=warped,
+                        mask_img=mask,
+                        mean_gray_val=mean_gray,
+                        aruco_ids_val=aruco_id_count,
+                        aruco_retry_ms_val=aruco_retry_ms,
+                        homography_ms_val=homography_ms,
+                        used_cached_h_val=1.0 if use_cached_h else 0.0,
+                        warp_ms_val=(t_w1 - t_w0) * 1000.0,
+                        hsv_ms_val=(t_m1 - t_m0) * 1000.0,
+                        contour_ms_val=(t_c1 - t_c0) * 1000.0,
+                    )
                 self.vx_smooth = self.VEL_ALPHA * self.vx_smooth + (1 - self.VEL_ALPHA) * vx_raw
                 self.vy_smooth = self.VEL_ALPHA * self.vy_smooth + (1 - self.VEL_ALPHA) * vy_raw
                 vx = self.vx_smooth

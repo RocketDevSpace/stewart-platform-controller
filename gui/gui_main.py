@@ -63,6 +63,7 @@ class StewartGUIController(StewartGUIView):
 
         self._vision_thread = None
         self._vision_worker = None
+        self._vision_starting = False
         self._pd_autotune_enabled = False
         self._pd_autotune_auto_apply = False
         self._pd_autotune_has_suggestion = False
@@ -497,14 +498,16 @@ class StewartGUIController(StewartGUIView):
             self.enable_vision_mode()
 
     def enable_vision_mode(self):
-        if self.vision_enabled:
+        if self.vision_enabled or self._vision_starting:
             return
         self.vision_enabled = True
+        self._vision_starting = True
         self._vision_counter = 0
         self._last_visualizer_update = 0.0
         self._set_pose_sliders_enabled(False)
         self.cancel_vision_btn.setEnabled(True)
-        self.vision_button.setText("Vision ACTIVE")
+        self.vision_button.setEnabled(False)
+        self.vision_button.setText("Starting Vision...")
         self._set_camera_enabled(True)
         self.monitor_window.showNormal()
         self.monitor_window.raise_()
@@ -541,24 +544,6 @@ class StewartGUIController(StewartGUIView):
             emit_camera_every_n=1,
             command_sender=self.serial.enqueue_command,
         )
-        try:
-            bt = self._vision_worker.ball_tracker
-            self._set_hsv_sliders(
-                int(bt.hsv_lower[0]),
-                int(bt.hsv_upper[0]),
-                int(bt.hsv_lower[1]),
-                int(bt.hsv_upper[1]),
-                int(bt.hsv_lower[2]),
-                int(bt.hsv_upper[2]),
-            )
-            self._log_preview(
-                f"[CAMERA] backend={bt.camera_backend} mode={bt.camera_mode} "
-                f"measured_period={bt.camera_measured_period_ms:.1f}ms "
-                f"(~{(1000.0 / bt.camera_measured_period_ms) if bt.camera_measured_period_ms > 0 else 0:.1f} FPS) "
-                f"gray={getattr(bt, 'camera_gray_mean', 0.0):.1f}"
-            )
-        except Exception:
-            pass
         self._vision_worker.moveToThread(self._vision_thread)
         self._vision_thread.finished.connect(self._on_vision_thread_finished)
         self._vision_thread.started.connect(self._vision_worker.start)
@@ -571,6 +556,7 @@ class StewartGUIController(StewartGUIView):
         self.vision_pd_autotune_enabled.connect(self._vision_worker.set_pd_autotune_enabled)
         self.vision_pd_autotune_auto_apply.connect(self._vision_worker.set_pd_autotune_auto_apply)
         self.vision_pd_autotune_apply.connect(self._vision_worker.apply_pd_autotune_recommendation)
+        self._vision_worker.camera_ready.connect(self._on_vision_camera_ready)
         self.vision_snapshot_consumed.connect(self._vision_worker.mark_snapshot_consumed)
         self._vision_thread.start()
         self.update_pd_gains()
@@ -608,6 +594,10 @@ class StewartGUIController(StewartGUIView):
         except TypeError:
             pass
         try:
+            self._vision_worker.camera_ready.disconnect(self._on_vision_camera_ready)
+        except TypeError:
+            pass
+        try:
             self.vision_snapshot_consumed.disconnect(self._vision_worker.mark_snapshot_consumed)
         except TypeError:
             pass
@@ -624,6 +614,9 @@ class StewartGUIController(StewartGUIView):
             self._vision_thread.deleteLater()
         self._vision_thread = None
         self._vision_worker = None
+        self.vision_enabled = False
+        self._vision_starting = False
+        self.vision_button.setEnabled(True)
         self.vision_button.setText("Enable Vision Mode")
         if not self.preview_mode:
             self._set_pose_sliders_enabled(True)
@@ -631,6 +624,28 @@ class StewartGUIController(StewartGUIView):
 
     def _on_vision_error(self, msg):
         self._log_preview(f"[VISION ERROR] {msg}")
+        if self._vision_starting:
+            self._vision_starting = False
+            self.vision_button.setEnabled(True)
+            self.vision_button.setText("Enable Vision Mode")
+
+    def _on_vision_camera_ready(self, info):
+        try:
+            hmin, smin, vmin = info.get("hsv_lower", [0, 0, 0])
+            hmax, smax, vmax = info.get("hsv_upper", [179, 255, 255])
+            self._set_hsv_sliders(hmin, hmax, smin, smax, vmin, vmax)
+            period = float(info.get("period_ms", 0.0))
+            self._log_preview(
+                f"[CAMERA] backend={info.get('backend', 'unknown')} mode={info.get('mode', '')} "
+                f"measured_period={period:.1f}ms "
+                f"(~{(1000.0 / period) if period > 0 else 0:.1f} FPS) "
+                f"gray={float(info.get('gray', 0.0)):.1f}"
+            )
+        except Exception:
+            pass
+        self._vision_starting = False
+        self.vision_button.setEnabled(True)
+        self.vision_button.setText("Vision ACTIVE")
 
     def _on_control_snapshot(self, snapshot):
         try:
@@ -638,6 +653,7 @@ class StewartGUIController(StewartGUIView):
                 return
 
             if not snapshot.tracking_valid:
+                self._update_camera_views(snapshot)
                 if snapshot.reason == "stale_frame_repeat":
                     self._vision_counter += 1
                     if self._vision_counter % LOG_EVERY_N == 0:

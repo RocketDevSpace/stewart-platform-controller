@@ -12,10 +12,12 @@ from stewart_control.config import (
     AUTO_TRIM_ENABLED,
     AUTO_TRIM_KI_DEG_PER_MM_S,
     AUTO_TRIM_MAX_DEG,
+    AUTO_TRIM_ERROR_LPF_ALPHA,
     AUTO_TRIM_SETTLE_HOLD_S,
     AUTO_TRIM_SETTLE_RADIUS_MM,
     AUTO_TRIM_SETTLE_SPEED_MM_S,
     AUTO_TRIM_STEP_LIMIT_DEG,
+    AUTO_TRIM_TARGET_HOLD_S,
     DEBUG_LEVEL,
     LOG_EVERY_N,
     BALL_TARGET_DEFAULT_X_MM,
@@ -196,6 +198,8 @@ class BallController:
         self.auto_trim_settle_radius_mm = float(AUTO_TRIM_SETTLE_RADIUS_MM)
         self.auto_trim_settle_hold_s = float(AUTO_TRIM_SETTLE_HOLD_S)
         self.auto_trim_step_limit_deg = float(AUTO_TRIM_STEP_LIMIT_DEG)
+        self.auto_trim_target_hold_s = float(AUTO_TRIM_TARGET_HOLD_S)
+        self.auto_trim_error_lpf_alpha = float(AUTO_TRIM_ERROR_LPF_ALPHA)
         self._settled_time_s = 0.0
         self._last_trim_update_time = None
         self._auto_trim_update_count = 0
@@ -204,6 +208,9 @@ class BallController:
         self._prev_cmd_time = None
         self.target_x_mm = float(BALL_TARGET_DEFAULT_X_MM)
         self.target_y_mm = float(BALL_TARGET_DEFAULT_Y_MM)
+        self._target_change_time = None
+        self._trim_err_lp_x = 0.0
+        self._trim_err_lp_y = 0.0
         
         self.pd_autotune_enabled = bool(PD_AUTOTUNE_ENABLED)
         self.pd_autotune_auto_apply = bool(PD_AUTOTUNE_AUTO_APPLY)
@@ -227,6 +234,7 @@ class BallController:
         self._manual_target_y_mm = float(self.target_y_mm)
         self._pd_autotune_center_x_mm = float(self.target_x_mm)
         self._pd_autotune_center_y_mm = float(self.target_y_mm)
+        self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
 
     # ---------------------------
     # Public Interface
@@ -266,6 +274,7 @@ class BallController:
     def set_target(self, x_mm: float, y_mm: float):
         self._manual_target_x_mm = float(x_mm)
         self._manual_target_y_mm = float(y_mm)
+        self._target_change_time = time.perf_counter()
         if self.pd_autotune_enabled:
             # While autotune is running, interpret slider target as test-center.
             self._pd_autotune_center_x_mm = float(x_mm)
@@ -285,11 +294,16 @@ class BallController:
             self._pd_autotune_leg_initialized = False
             self._pd_leg_eval.active = False
             if self.pd_autotune_enabled:
+                self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
+                self.auto_trim_enabled = True
                 self._pd_autotune_center_x_mm = float(self._manual_target_x_mm)
                 self._pd_autotune_center_y_mm = float(self._manual_target_y_mm)
+                self._target_change_time = time.perf_counter()
             else:
+                self.auto_trim_enabled = self._pd_autotune_prev_auto_trim_enabled
                 self.target_x_mm = float(self._manual_target_x_mm)
                 self.target_y_mm = float(self._manual_target_y_mm)
+                self._target_change_time = time.perf_counter()
         if (not self.pd_autotune_enabled) or self.pd_autotune_auto_apply:
             self._pd_autotune_has_suggestion = False
 
@@ -436,6 +450,10 @@ class BallController:
             self._settled_time_s = 0.0
             return
 
+        if self._target_change_time is not None and (now - self._target_change_time) < self.auto_trim_target_hold_s:
+            self._settled_time_s = 0.0
+            return
+
         speed = math.hypot(vx, vy)
         radius = math.hypot(ex, ey)
         settled = (speed <= self.auto_trim_settle_speed_mm_s) and (radius <= self.auto_trim_settle_radius_mm)
@@ -447,9 +465,13 @@ class BallController:
         if self._settled_time_s < self.auto_trim_settle_hold_s:
             return
 
+        alpha = self._clamp(self.auto_trim_error_lpf_alpha, 0.0, 0.999)
+        self._trim_err_lp_x = alpha * self._trim_err_lp_x + (1.0 - alpha) * ex
+        self._trim_err_lp_y = alpha * self._trim_err_lp_y + (1.0 - alpha) * ey
+
         # Very slow integral-style trim to cancel static bias.
-        roll_rate = self.auto_trim_ki * (-ey)
-        pitch_rate = self.auto_trim_ki * ex
+        roll_rate = self.auto_trim_ki * (-self._trim_err_lp_y)
+        pitch_rate = self.auto_trim_ki * self._trim_err_lp_x
         roll_step = self._clamp(roll_rate * dt, -self.auto_trim_step_limit_deg, self.auto_trim_step_limit_deg)
         pitch_step = self._clamp(pitch_rate * dt, -self.auto_trim_step_limit_deg, self.auto_trim_step_limit_deg)
 
@@ -466,6 +488,7 @@ class BallController:
             tx, ty = self._autotune_leg_target(self._pd_autotune_leg_index)
             self.target_x_mm = tx
             self.target_y_mm = ty
+            self._target_change_time = now
             self._pd_leg_eval.start(now, x, y, tx, ty)
             self._pd_autotune_leg_initialized = True
             msg = f"active test started: target=({tx:.1f},{ty:.1f})"
@@ -515,6 +538,7 @@ class BallController:
         next_tx, next_ty = self._autotune_leg_target(self._pd_autotune_leg_index)
         self.target_x_mm = next_tx
         self.target_y_mm = next_ty
+        self._target_change_time = now
         self._pd_leg_eval.start(now, x, y, next_tx, next_ty)
 
         msg = (

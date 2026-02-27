@@ -37,6 +37,7 @@ class ControlSnapshot:
 
 class VisionControlWorker(QtCore.QObject):
     snapshot_ready = QtCore.pyqtSignal(object)
+    camera_ready = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     stopped = QtCore.pyqtSignal()
 
@@ -74,20 +75,43 @@ class VisionControlWorker(QtCore.QObject):
         self._last_tracker_kd = float(kd)
         self._last_target_x = float(BALL_TARGET_DEFAULT_X_MM)
         self._last_target_y = float(BALL_TARGET_DEFAULT_Y_MM)
+        self._camera_index = int(camera_index)
+        self._kp_init = float(kp)
+        self._kd_init = float(kd)
 
         self.ball_controller = BallController(kp=kp, kd=kd, max_tilt_deg=max_tilt_deg)
-        self.ball_tracker = BallTracker(
-            camera_index=camera_index,
-            pd_kp=kp,
-            pd_kd=kd,
-        )
+        self.ball_tracker = None
+        self._pending_hsv = None
         self.ball_controller.set_target(self._last_target_x, self._last_target_y)
-        self.ball_tracker.set_target_mm(self._last_target_x, self._last_target_y)
 
     @QtCore.pyqtSlot()
     def start(self):
         if self._running:
             return
+        if self.ball_tracker is None:
+            try:
+                self.ball_tracker = BallTracker(
+                    camera_index=self._camera_index,
+                    pd_kp=self._kp_init,
+                    pd_kd=self._kd_init,
+                )
+            except Exception as exc:
+                self.error.emit(f"camera init failed: {exc}")
+                self.stopped.emit()
+                return
+            self.ball_tracker.set_target_mm(self._last_target_x, self._last_target_y)
+            if self._pending_hsv is not None:
+                self.ball_tracker.set_hsv_thresholds(*self._pending_hsv)
+            self.camera_ready.emit(
+                {
+                    "backend": getattr(self.ball_tracker, "camera_backend", "unknown"),
+                    "mode": getattr(self.ball_tracker, "camera_mode", ""),
+                    "period_ms": float(getattr(self.ball_tracker, "camera_measured_period_ms", 0.0)),
+                    "gray": float(getattr(self.ball_tracker, "camera_gray_mean", 0.0)),
+                    "hsv_lower": self.ball_tracker.hsv_lower.tolist(),
+                    "hsv_upper": self.ball_tracker.hsv_upper.tolist(),
+                }
+            )
         self._running = True
         self._timer = QtCore.QTimer(self)
         self._timer.setTimerType(QtCore.Qt.PreciseTimer)
@@ -102,9 +126,11 @@ class VisionControlWorker(QtCore.QObject):
             self._timer.deleteLater()
             self._timer = None
         try:
-            self.ball_tracker.release()
+            if self.ball_tracker is not None:
+                self.ball_tracker.release()
         except Exception:
             pass
+        self.ball_tracker = None
         self.stopped.emit()
 
     @QtCore.pyqtSlot()
@@ -114,7 +140,10 @@ class VisionControlWorker(QtCore.QObject):
     @QtCore.pyqtSlot(float, float)
     def set_gains(self, kp, kd):
         self.ball_controller.set_gains(kp, kd)
-        self.ball_tracker.set_pd_gains(kp, kd)
+        if self.ball_tracker is not None:
+            self.ball_tracker.set_pd_gains(kp, kd)
+        self._kp_init = float(kp)
+        self._kd_init = float(kd)
         self._last_tracker_kp = float(kp)
         self._last_tracker_kd = float(kd)
 
@@ -130,24 +159,30 @@ class VisionControlWorker(QtCore.QObject):
     def apply_pd_autotune_recommendation(self):
         applied, kp, kd = self.ball_controller.apply_pd_autotune_recommendation()
         if applied:
-            self.ball_tracker.set_pd_gains(kp, kd)
+            if self.ball_tracker is not None:
+                self.ball_tracker.set_pd_gains(kp, kd)
             self._last_tracker_kp = float(kp)
             self._last_tracker_kd = float(kd)
 
     @QtCore.pyqtSlot(int, int, int, int, int, int)
     def set_hsv(self, hmin, hmax, smin, smax, vmin, vmax):
-        self.ball_tracker.set_hsv_thresholds(hmin, hmax, smin, smax, vmin, vmax)
+        self._pending_hsv = (int(hmin), int(hmax), int(smin), int(smax), int(vmin), int(vmax))
+        if self.ball_tracker is not None:
+            self.ball_tracker.set_hsv_thresholds(*self._pending_hsv)
 
     @QtCore.pyqtSlot(float, float)
     def set_target(self, x_mm, y_mm):
         self._last_target_x = float(x_mm)
         self._last_target_y = float(y_mm)
         self.ball_controller.set_target(self._last_target_x, self._last_target_y)
-        self.ball_tracker.set_target_mm(self._last_target_x, self._last_target_y)
+        if self.ball_tracker is not None:
+            self.ball_tracker.set_target_mm(self._last_target_x, self._last_target_y)
 
     @QtCore.pyqtSlot()
     def _tick(self):
         if not self._running:
+            return
+        if self.ball_tracker is None:
             return
 
         loop_start = time.perf_counter()
@@ -161,8 +196,13 @@ class VisionControlWorker(QtCore.QObject):
                 self._last_snapshot_emit_perf <= 0.0
                 or (now_perf - self._last_snapshot_emit_perf) >= (1.0 / float(self.snapshot_hz))
             )
-            if ball_state_dict is None:
-                reason = self.ball_tracker.last_status_reason or "no_ball_detected"
+            tracking_valid = bool(ball_state_dict is not None and ball_state_dict.get("tracking_valid", True))
+            if not tracking_valid:
+                reason = (
+                    (ball_state_dict or {}).get("reason")
+                    or self.ball_tracker.last_status_reason
+                    or "no_ball_detected"
+                )
                 is_stale = reason == "stale_frame_repeat"
                 if is_stale:
                     self._stale_count += 1
@@ -185,9 +225,19 @@ class VisionControlWorker(QtCore.QObject):
                 timings_ms["trk_slow_streak"] = float(tracker_profile.get("slow_streak", 0.0))
                 timings_ms["trk_runtime_applied"] = float(tracker_profile.get("runtime_profile_applied", 0.0))
                 timings_ms["trk_runtime_tries"] = float(tracker_profile.get("runtime_profile_tries", 0.0))
+                quality = (ball_state_dict or {}).get("quality", {})
+                timings_ms["trk_radius_px"] = float(quality.get("radius_px", 0.0))
+                timings_ms["trk_area"] = float(quality.get("contour_area", 0.0))
+                timings_ms["trk_circularity"] = float(quality.get("circularity", 0.0))
+                timings_ms["trk_fill"] = float(quality.get("fill_ratio", 0.0))
+                timings_ms["trk_dt_s"] = float(quality.get("dt_s", 0.0))
+                timings_ms["trk_gray_mean"] = float(quality.get("gray_mean", 0.0))
+                timings_ms["trk_warp_gray"] = float(quality.get("warp_gray_mean", 0.0))
+                timings_ms["trk_vmin_eff"] = float(quality.get("vmin_eff", 0.0))
+                timings_ms["trk_aruco_ids"] = float(quality.get("aruco_ids", 0.0))
                 snapshot = ControlSnapshot(
                     timestamp=time.time(),
-                    frame_ts=0.0,
+                    frame_ts=float((ball_state_dict or {}).get("frame_ts", 0.0)),
                     worker_emit_perf_ts=time.perf_counter(),
                     ball_state=BallState(0.0, 0.0, 0.0, 0.0),
                     pose={"x": 0.0, "y": 0.0, "z": float(self.z_provider()), "roll": 0.0, "pitch": 0.0, "yaw": 0.0},
@@ -199,9 +249,9 @@ class VisionControlWorker(QtCore.QObject):
                     tracking_valid=False,
                     reason=reason,
                     miss_count=self._miss_count,
-                    camera_bgr=None,
-                    warped_bgr=None,
-                    mask_gray=None,
+                    camera_bgr=(ball_state_dict or {}).get("camera_bgr"),
+                    warped_bgr=(ball_state_dict or {}).get("warped_bgr"),
+                    mask_gray=(ball_state_dict or {}).get("mask_gray"),
                 )
                 if should_emit_snapshot and (not self._snapshot_inflight):
                     self._last_snapshot_emit_perf = now_perf
