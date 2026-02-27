@@ -37,6 +37,10 @@ class StewartGUIController(StewartGUIView):
     serial_line_received = pyqtSignal(str)
     vision_gains_updated = pyqtSignal(float, float)
     vision_hsv_updated = pyqtSignal(int, int, int, int, int, int)
+    vision_target_updated = pyqtSignal(float, float)
+    vision_pd_autotune_enabled = pyqtSignal(bool)
+    vision_pd_autotune_auto_apply = pyqtSignal(bool)
+    vision_pd_autotune_apply = pyqtSignal()
     vision_snapshot_consumed = pyqtSignal()
 
     def __init__(self, ik_solver=None):
@@ -54,9 +58,16 @@ class StewartGUIController(StewartGUIView):
         self._y_zoom = 1.0
         self._valid_streak = 0
         self._last_neutral_send = 0.0
+        self._target_x_mm = float(self.target_x_slider.value())
+        self._target_y_mm = float(self.target_y_slider.value())
 
         self._vision_thread = None
         self._vision_worker = None
+        self._pd_autotune_enabled = False
+        self._pd_autotune_auto_apply = False
+        self._pd_autotune_has_suggestion = False
+        self._pd_autotune_suggested_kp = self.kp_slider.value() / 1000.0
+        self._pd_autotune_suggested_kd = self.kd_slider.value() / 1000.0
 
         self._timing_keys = [
             "ball_update",
@@ -90,6 +101,8 @@ class StewartGUIController(StewartGUIView):
             "trk_fill",
             "trk_dt_s",
             "trk_gray_mean",
+            "trk_warp_gray",
+            "trk_vmin_eff",
             "trk_aruco_ids",
         ]
         self._timing_colors = {
@@ -117,6 +130,7 @@ class StewartGUIController(StewartGUIView):
         self._init_timing_plot_style()
         self._init_signals()
         self._init_routines()
+        self._update_autotune_button_state()
         self._set_camera_enabled(False)
         self.monitor_window.show()
 
@@ -128,6 +142,8 @@ class StewartGUIController(StewartGUIView):
 
         self.kp_slider.valueChanged.connect(self.update_pd_gains)
         self.kd_slider.valueChanged.connect(self.update_pd_gains)
+        self.target_x_slider.valueChanged.connect(self._on_target_slider)
+        self.target_y_slider.valueChanged.connect(self._on_target_slider)
         self.send_button.clicked.connect(self.send_to_arduino)
         self.raw_serial_send_btn.clicked.connect(self.send_raw_serial_command)
         self.demo_list.currentIndexChanged.connect(self.on_routine_changed)
@@ -135,6 +151,9 @@ class StewartGUIController(StewartGUIView):
         self.cancel_vision_btn.clicked.connect(self.disable_vision_mode)
         self.cancel_routine_btn.clicked.connect(self.cancel_routine_preview)
         self.open_monitor_button.clicked.connect(self.monitor_window.showNormal)
+        self.autotune_enable_btn.clicked.connect(self._toggle_pd_autotune)
+        self.autotune_apply_btn.clicked.connect(self._apply_pd_autotune_recommendation)
+        self.autotune_auto_apply_btn.clicked.connect(self._toggle_pd_autotune_auto_apply)
 
         self.timing_canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.timing_canvas.grabGesture(QtCore.Qt.PinchGesture)
@@ -201,9 +220,33 @@ class StewartGUIController(StewartGUIView):
         label.setText(f"{name}: {value}")
         self._emit_hsv_values()
 
+    def _on_target_slider(self, _value):
+        self._target_x_mm = float(self.target_x_slider.value())
+        self._target_y_mm = float(self.target_y_slider.value())
+        self.target_x_label.setText(f"Target X (mm): {int(self._target_x_mm)}")
+        self.target_y_label.setText(f"Target Y (mm): {int(self._target_y_mm)}")
+        self.vision_target_updated.emit(self._target_x_mm, self._target_y_mm)
+
     def _emit_hsv_values(self):
         values = [self.hsv_controls[k][1].value() for k in ["H Min", "H Max", "S Min", "S Max", "V Min", "V Max"]]
         self.vision_hsv_updated.emit(*values)
+
+    def _set_hsv_sliders(self, hmin, hmax, smin, smax, vmin, vmax):
+        vals = {
+            "H Min": int(hmin),
+            "H Max": int(hmax),
+            "S Min": int(smin),
+            "S Max": int(smax),
+            "V Min": int(vmin),
+            "V Max": int(vmax),
+        }
+        for key, val in vals.items():
+            lbl, sld = self.hsv_controls[key]
+            v = max(sld.minimum(), min(sld.maximum(), int(val)))
+            sld.blockSignals(True)
+            sld.setValue(v)
+            sld.blockSignals(False)
+            lbl.setText(f"{key}: {v}")
 
     def _current_pose_from_sliders(self):
         return {
@@ -265,6 +308,114 @@ class StewartGUIController(StewartGUIView):
         self.kp_label.setText(f"Kp: {kp:.3f}")
         self.kd_label.setText(f"Kd: {kd:.3f}")
         self.vision_gains_updated.emit(kp, kd)
+        self._pd_autotune_has_suggestion = False
+        self._update_autotune_button_state()
+
+    def _toggle_pd_autotune(self):
+        if self._pd_autotune_enabled:
+            self._pd_autotune_enabled = False
+            self._pd_autotune_auto_apply = False
+            self._pd_autotune_has_suggestion = False
+            self._log_preview("[PD TUNE] disabled")
+        else:
+            self._pd_autotune_enabled = True
+            self._log_preview("[PD TUNE] enabled")
+        self._update_autotune_button_state()
+        self.vision_pd_autotune_enabled.emit(self._pd_autotune_enabled)
+        self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
+
+    def _toggle_pd_autotune_auto_apply(self):
+        if self._pd_autotune_auto_apply:
+            self._pd_autotune_auto_apply = False
+            self._pd_autotune_enabled = False
+            self._pd_autotune_has_suggestion = False
+            self._log_preview("[PD TUNE] auto-apply stopped")
+        else:
+            self._pd_autotune_enabled = True
+            self._pd_autotune_auto_apply = True
+            self._pd_autotune_has_suggestion = False
+            self._log_preview("[PD TUNE] auto-apply started")
+        self._update_autotune_button_state()
+        self.vision_pd_autotune_enabled.emit(self._pd_autotune_enabled)
+        self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
+
+    def _apply_pd_autotune_recommendation(self):
+        if not self._pd_autotune_has_suggestion:
+            self._log_preview("[PD TUNE] no recommendation available yet")
+            return
+        self.vision_pd_autotune_apply.emit()
+        self._pd_autotune_has_suggestion = False
+        self._update_autotune_button_state()
+
+    def _update_autotune_button_state(self):
+        if self._pd_autotune_enabled:
+            self.autotune_enable_btn.setText("Stop PD AutoTune")
+        else:
+            self.autotune_enable_btn.setText("Enable PD AutoTune")
+        if self._pd_autotune_auto_apply:
+            self.autotune_auto_apply_btn.setText("Stop Auto-Apply AutoTune")
+        else:
+            self.autotune_auto_apply_btn.setText("Start Auto-Apply AutoTune")
+        self.autotune_apply_btn.setEnabled(
+            self._pd_autotune_enabled and (not self._pd_autotune_auto_apply) and self._pd_autotune_has_suggestion
+        )
+
+    def _sync_autotune_from_terms(self, terms):
+        changed = False
+        enabled = bool(terms.get("pd_autotune_enabled", self._pd_autotune_enabled))
+        auto_apply = bool(terms.get("pd_autotune_auto_apply", self._pd_autotune_auto_apply))
+        has_suggestion = bool(terms.get("pd_autotune_has_suggestion", self._pd_autotune_has_suggestion))
+        suggested_kp = float(terms.get("pd_autotune_suggested_kp", self._pd_autotune_suggested_kp))
+        suggested_kd = float(terms.get("pd_autotune_suggested_kd", self._pd_autotune_suggested_kd))
+        if enabled != self._pd_autotune_enabled:
+            self._pd_autotune_enabled = enabled
+            changed = True
+        if auto_apply != self._pd_autotune_auto_apply:
+            self._pd_autotune_auto_apply = auto_apply
+            changed = True
+        if has_suggestion != self._pd_autotune_has_suggestion:
+            self._pd_autotune_has_suggestion = has_suggestion
+            changed = True
+        self._pd_autotune_suggested_kp = suggested_kp
+        self._pd_autotune_suggested_kd = suggested_kd
+        if changed:
+            self._update_autotune_button_state()
+
+    def _sync_gain_sliders_from_terms(self, terms):
+        kp = float(terms.get("kp", self.kp_slider.value() / 1000.0))
+        kd = float(terms.get("kd", self.kd_slider.value() / 1000.0))
+        kp_val = int(round(kp * 1000.0))
+        kd_val = int(round(kd * 1000.0))
+        kp_val = max(self.kp_slider.minimum(), min(self.kp_slider.maximum(), kp_val))
+        kd_val = max(self.kd_slider.minimum(), min(self.kd_slider.maximum(), kd_val))
+        if kp_val != self.kp_slider.value() or kd_val != self.kd_slider.value():
+            self.kp_slider.blockSignals(True)
+            self.kd_slider.blockSignals(True)
+            self.kp_slider.setValue(kp_val)
+            self.kd_slider.setValue(kd_val)
+            self.kp_slider.blockSignals(False)
+            self.kd_slider.blockSignals(False)
+            self.kp_label.setText(f"Kp: {kp_val/1000.0:.3f}")
+            self.kd_label.setText(f"Kd: {kd_val/1000.0:.3f}")
+
+    def _sync_target_from_terms(self, terms):
+        tx = float(terms.get("target_x_mm", self._target_x_mm))
+        ty = float(terms.get("target_y_mm", self._target_y_mm))
+        tx_val = int(round(tx))
+        ty_val = int(round(ty))
+        tx_val = max(self.target_x_slider.minimum(), min(self.target_x_slider.maximum(), tx_val))
+        ty_val = max(self.target_y_slider.minimum(), min(self.target_y_slider.maximum(), ty_val))
+        if tx_val != self.target_x_slider.value() or ty_val != self.target_y_slider.value():
+            self.target_x_slider.blockSignals(True)
+            self.target_y_slider.blockSignals(True)
+            self.target_x_slider.setValue(tx_val)
+            self.target_y_slider.setValue(ty_val)
+            self.target_x_slider.blockSignals(False)
+            self.target_y_slider.blockSignals(False)
+        self._target_x_mm = float(tx_val)
+        self._target_y_mm = float(ty_val)
+        self.target_x_label.setText(f"Target X (mm): {tx_val}")
+        self.target_y_label.setText(f"Target Y (mm): {ty_val}")
 
     def send_raw_serial_command(self):
         cmd = self.raw_serial_input.text().strip()
@@ -392,6 +543,14 @@ class StewartGUIController(StewartGUIView):
         )
         try:
             bt = self._vision_worker.ball_tracker
+            self._set_hsv_sliders(
+                int(bt.hsv_lower[0]),
+                int(bt.hsv_upper[0]),
+                int(bt.hsv_lower[1]),
+                int(bt.hsv_upper[1]),
+                int(bt.hsv_lower[2]),
+                int(bt.hsv_upper[2]),
+            )
             self._log_preview(
                 f"[CAMERA] backend={bt.camera_backend} mode={bt.camera_mode} "
                 f"measured_period={bt.camera_measured_period_ms:.1f}ms "
@@ -408,10 +567,17 @@ class StewartGUIController(StewartGUIView):
         self._vision_worker.stopped.connect(self._on_vision_worker_stopped)
         self.vision_gains_updated.connect(self._vision_worker.set_gains)
         self.vision_hsv_updated.connect(self._vision_worker.set_hsv)
+        self.vision_target_updated.connect(self._vision_worker.set_target)
+        self.vision_pd_autotune_enabled.connect(self._vision_worker.set_pd_autotune_enabled)
+        self.vision_pd_autotune_auto_apply.connect(self._vision_worker.set_pd_autotune_auto_apply)
+        self.vision_pd_autotune_apply.connect(self._vision_worker.apply_pd_autotune_recommendation)
         self.vision_snapshot_consumed.connect(self._vision_worker.mark_snapshot_consumed)
         self._vision_thread.start()
         self.update_pd_gains()
         self._emit_hsv_values()
+        self.vision_target_updated.emit(self._target_x_mm, self._target_y_mm)
+        self.vision_pd_autotune_enabled.emit(self._pd_autotune_enabled)
+        self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
 
     def _stop_vision_worker_async(self):
         if self._vision_worker is None:
@@ -423,6 +589,22 @@ class StewartGUIController(StewartGUIView):
             pass
         try:
             self.vision_hsv_updated.disconnect(self._vision_worker.set_hsv)
+        except TypeError:
+            pass
+        try:
+            self.vision_target_updated.disconnect(self._vision_worker.set_target)
+        except TypeError:
+            pass
+        try:
+            self.vision_pd_autotune_enabled.disconnect(self._vision_worker.set_pd_autotune_enabled)
+        except TypeError:
+            pass
+        try:
+            self.vision_pd_autotune_auto_apply.disconnect(self._vision_worker.set_pd_autotune_auto_apply)
+        except TypeError:
+            pass
+        try:
+            self.vision_pd_autotune_apply.disconnect(self._vision_worker.apply_pd_autotune_recommendation)
         except TypeError:
             pass
         try:
@@ -518,6 +700,9 @@ class StewartGUIController(StewartGUIView):
                 vis_ms = (t_vis1 - t_vis0) * 1000.0
 
             timings = dict(snapshot.timings_ms)
+            self._sync_gain_sliders_from_terms(snapshot.control_terms)
+            self._sync_autotune_from_terms(snapshot.control_terms)
+            self._sync_target_from_terms(snapshot.control_terms)
             timings["serial_enqueue"] = float(timings.get("cmd_enqueue_worker", 0.0))
             timings["visualizer_gui"] = vis_ms
             timings["frame_to_worker_ms"] = float(timings.get("frame_to_worker_ms", 0.0))
@@ -537,6 +722,10 @@ class StewartGUIController(StewartGUIView):
             self._update_timing_diagnostics()
             self._vision_counter += 1
 
+            tune_evt = snapshot.control_terms.get("pd_autotune_event")
+            if tune_evt:
+                self._log_preview(f"[PD TUNE] {tune_evt.get('message', '')}")
+
             if self._vision_counter % LOG_EVERY_N == 0:
                 bs = snapshot.ball_state
                 terms = snapshot.control_terms
@@ -551,6 +740,9 @@ class StewartGUIController(StewartGUIView):
                     f"raw=(r{terms['roll_raw']:.3f},p{terms['pitch_raw']:.3f}) "
                     f"clamp=(r{terms['roll_clamped']:.3f},p{terms['pitch_clamped']:.3f}) "
                     f"cmd=(r{terms['roll_cmd']:.3f},p{terms['pitch_cmd']:.3f},z{snapshot.pose['z']:.2f}) "
+                    f"target=({terms.get('target_x_mm', 0.0):.1f},{terms.get('target_y_mm', 0.0):.1f}) "
+                    f"kp={terms.get('kp', 0.0):.4f} "
+                    f"kd={terms.get('kd', 0.0):.4f} "
                     f"age={snapshot.timings_ms.get('trk_frame_age', 0.0):.1f}ms "
                     f"f2w={timings.get('frame_to_worker_ms', 0.0):.1f}ms "
                     f"cmd_age={timings.get('frame_to_cmd', 0.0):.1f}ms "
@@ -616,6 +808,8 @@ class StewartGUIController(StewartGUIView):
                 f"circ={trk['trk_circularity']:.2f} "
                 f"fill={trk['trk_fill']:.2f} "
                 f"gray={trk['trk_gray_mean']:.1f} "
+                f"wgray={trk['trk_warp_gray']:.1f} "
+                f"vmin_eff={trk['trk_vmin_eff']:.1f} "
                 f"ids={trk['trk_aruco_ids']:.1f} "
                 f"dt={trk['trk_dt_s']*1000.0:.1f}ms"
             )

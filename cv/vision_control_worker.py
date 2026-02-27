@@ -3,7 +3,14 @@ import time
 
 from PyQt5 import QtCore
 
-from stewart_control.config import DEBUG_LEVEL, LOG_EVERY_N
+from stewart_control.config import (
+    BALL_TARGET_DEFAULT_X_MM,
+    BALL_TARGET_DEFAULT_Y_MM,
+    DEBUG_LEVEL,
+    LOG_EVERY_N,
+    PD_DEFAULT_KD,
+    PD_DEFAULT_KP,
+)
 from stewart_control.cv.ball_controller import BallController, BallState
 from stewart_control.cv.ball_tracker import BallTracker
 
@@ -37,8 +44,8 @@ class VisionControlWorker(QtCore.QObject):
         self,
         ik_solver,
         z_provider,
-        kp=0.005,
-        kd=0.010,
+        kp=PD_DEFAULT_KP,
+        kd=PD_DEFAULT_KD,
         max_tilt_deg=8.0,
         camera_index=0,
         loop_hz=50,
@@ -63,6 +70,10 @@ class VisionControlWorker(QtCore.QObject):
         self._stale_count = 0
         self._last_snapshot_emit_perf = 0.0
         self._snapshot_inflight = False
+        self._last_tracker_kp = float(kp)
+        self._last_tracker_kd = float(kd)
+        self._last_target_x = float(BALL_TARGET_DEFAULT_X_MM)
+        self._last_target_y = float(BALL_TARGET_DEFAULT_Y_MM)
 
         self.ball_controller = BallController(kp=kp, kd=kd, max_tilt_deg=max_tilt_deg)
         self.ball_tracker = BallTracker(
@@ -70,6 +81,8 @@ class VisionControlWorker(QtCore.QObject):
             pd_kp=kp,
             pd_kd=kd,
         )
+        self.ball_controller.set_target(self._last_target_x, self._last_target_y)
+        self.ball_tracker.set_target_mm(self._last_target_x, self._last_target_y)
 
     @QtCore.pyqtSlot()
     def start(self):
@@ -102,10 +115,35 @@ class VisionControlWorker(QtCore.QObject):
     def set_gains(self, kp, kd):
         self.ball_controller.set_gains(kp, kd)
         self.ball_tracker.set_pd_gains(kp, kd)
+        self._last_tracker_kp = float(kp)
+        self._last_tracker_kd = float(kd)
+
+    @QtCore.pyqtSlot(bool)
+    def set_pd_autotune_enabled(self, enabled):
+        self.ball_controller.set_pd_autotune(bool(enabled), None)
+
+    @QtCore.pyqtSlot(bool)
+    def set_pd_autotune_auto_apply(self, enabled):
+        self.ball_controller.set_pd_autotune(self.ball_controller.pd_autotune_enabled, bool(enabled))
+
+    @QtCore.pyqtSlot()
+    def apply_pd_autotune_recommendation(self):
+        applied, kp, kd = self.ball_controller.apply_pd_autotune_recommendation()
+        if applied:
+            self.ball_tracker.set_pd_gains(kp, kd)
+            self._last_tracker_kp = float(kp)
+            self._last_tracker_kd = float(kd)
 
     @QtCore.pyqtSlot(int, int, int, int, int, int)
     def set_hsv(self, hmin, hmax, smin, smax, vmin, vmax):
         self.ball_tracker.set_hsv_thresholds(hmin, hmax, smin, smax, vmin, vmax)
+
+    @QtCore.pyqtSlot(float, float)
+    def set_target(self, x_mm, y_mm):
+        self._last_target_x = float(x_mm)
+        self._last_target_y = float(y_mm)
+        self.ball_controller.set_target(self._last_target_x, self._last_target_y)
+        self.ball_tracker.set_target_mm(self._last_target_x, self._last_target_y)
 
     @QtCore.pyqtSlot()
     def _tick(self):
@@ -185,6 +223,18 @@ class VisionControlWorker(QtCore.QObject):
             )
 
             roll_deg, pitch_deg, control_terms = self.ball_controller.compute_with_terms(ball_state)
+            kp_now = float(self.ball_controller.kp)
+            kd_now = float(self.ball_controller.kd)
+            if abs(kp_now - self._last_tracker_kp) > 1e-12 or abs(kd_now - self._last_tracker_kd) > 1e-12:
+                self.ball_tracker.set_pd_gains(kp_now, kd_now)
+                self._last_tracker_kp = kp_now
+                self._last_tracker_kd = kd_now
+            tx = float(control_terms.get("target_x_mm", self._last_target_x))
+            ty = float(control_terms.get("target_y_mm", self._last_target_y))
+            if abs(tx - self._last_target_x) > 1e-12 or abs(ty - self._last_target_y) > 1e-12:
+                self._last_target_x = tx
+                self._last_target_y = ty
+                self.ball_tracker.set_target_mm(tx, ty)
             t2 = time.perf_counter()
 
             pose = {
@@ -251,6 +301,8 @@ class VisionControlWorker(QtCore.QObject):
             timings_ms["trk_fill"] = quality.get("fill_ratio", 0.0)
             timings_ms["trk_dt_s"] = quality.get("dt_s", 0.0)
             timings_ms["trk_gray_mean"] = quality.get("gray_mean", 0.0)
+            timings_ms["trk_warp_gray"] = quality.get("warp_gray_mean", 0.0)
+            timings_ms["trk_vmin_eff"] = quality.get("vmin_eff", 0.0)
             timings_ms["trk_aruco_ids"] = quality.get("aruco_ids", 0.0)
             frame_ts = float(ball_state_dict.get("frame_ts", 0.0))
             if frame_ts > 0:

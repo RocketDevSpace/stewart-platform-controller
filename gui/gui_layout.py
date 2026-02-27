@@ -12,6 +12,18 @@ from PyQt5.QtWidgets import (
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from stewart_control.config import (
+    BALL_TARGET_DEFAULT_X_MM,
+    BALL_TARGET_DEFAULT_Y_MM,
+    PD_DEFAULT_KD,
+    PD_DEFAULT_KP,
+    TRACKER_HSV_H_MAX,
+    TRACKER_HSV_H_MIN,
+    TRACKER_HSV_S_MAX,
+    TRACKER_HSV_S_MIN,
+    TRACKER_HSV_V_MAX,
+    TRACKER_HSV_V_MIN,
+)
 
 
 class VisionMonitorWindow(QWidget):
@@ -103,27 +115,55 @@ class StewartGUIView(QWidget):
 
         pd = QGroupBox("PD Gains")
         pd_layout = QVBoxLayout()
-        self.kp_label = QLabel("Kp: 0.050")
+        self.kp_label = QLabel(f"Kp: {PD_DEFAULT_KP:.3f}")
         self.kp_slider = QSlider(QtCore.Qt.Horizontal)
         self.kp_slider.setMinimum(0)
         self.kp_slider.setMaximum(300)
-        self.kp_slider.setValue(50)
-        self.kd_label = QLabel("Kd: 0.010")
+        self.kp_slider.setValue(int(round(PD_DEFAULT_KP * 1000.0)))
+        self.kd_label = QLabel(f"Kd: {PD_DEFAULT_KD:.3f}")
         self.kd_slider = QSlider(QtCore.Qt.Horizontal)
         self.kd_slider.setMinimum(0)
         self.kd_slider.setMaximum(100)
-        self.kd_slider.setValue(10)
+        self.kd_slider.setValue(int(round(PD_DEFAULT_KD * 1000.0)))
+        self.target_x_label = QLabel(f"Target X (mm): {int(BALL_TARGET_DEFAULT_X_MM)}")
+        self.target_x_slider = QSlider(QtCore.Qt.Horizontal)
+        self.target_x_slider.setMinimum(-120)
+        self.target_x_slider.setMaximum(120)
+        self.target_x_slider.setValue(int(round(BALL_TARGET_DEFAULT_X_MM)))
+        self.target_y_label = QLabel(f"Target Y (mm): {int(BALL_TARGET_DEFAULT_Y_MM)}")
+        self.target_y_slider = QSlider(QtCore.Qt.Horizontal)
+        self.target_y_slider.setMinimum(-120)
+        self.target_y_slider.setMaximum(120)
+        self.target_y_slider.setValue(int(round(BALL_TARGET_DEFAULT_Y_MM)))
         pd_layout.addWidget(self.kp_label)
         pd_layout.addWidget(self.kp_slider)
         pd_layout.addWidget(self.kd_label)
         pd_layout.addWidget(self.kd_slider)
+        pd_layout.addWidget(self.target_x_label)
+        pd_layout.addWidget(self.target_x_slider)
+        pd_layout.addWidget(self.target_y_label)
+        pd_layout.addWidget(self.target_y_slider)
+        self.autotune_enable_btn = QPushButton("Enable PD AutoTune")
+        self.autotune_apply_btn = QPushButton("Apply AutoTune Recommendation")
+        self.autotune_auto_apply_btn = QPushButton("Start Auto-Apply AutoTune")
+        self.autotune_apply_btn.setEnabled(False)
+        pd_layout.addWidget(self.autotune_enable_btn)
+        pd_layout.addWidget(self.autotune_apply_btn)
+        pd_layout.addWidget(self.autotune_auto_apply_btn)
         pd.setLayout(pd_layout)
         layout.addWidget(pd)
 
         hsv = QGroupBox("HSV Thresholds")
         hsv_layout = QVBoxLayout()
         self.hsv_controls = {}
-        defaults = [("H Min", 5, 179), ("H Max", 35, 179), ("S Min", 50, 255), ("S Max", 255, 255), ("V Min", 40, 255), ("V Max", 255, 255)]
+        defaults = [
+            ("H Min", TRACKER_HSV_H_MIN, 179),
+            ("H Max", TRACKER_HSV_H_MAX, 179),
+            ("S Min", TRACKER_HSV_S_MIN, 255),
+            ("S Max", TRACKER_HSV_S_MAX, 255),
+            ("V Min", TRACKER_HSV_V_MIN, 255),
+            ("V Max", TRACKER_HSV_V_MAX, 255),
+        ]
         for name, val, maxv in defaults:
             lbl = QLabel(f"{name}: {val}")
             sld = QSlider(QtCore.Qt.Horizontal)

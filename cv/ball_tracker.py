@@ -4,6 +4,8 @@ import time
 import threading
 
 from stewart_control.config import (
+    BALL_TARGET_DEFAULT_X_MM,
+    BALL_TARGET_DEFAULT_Y_MM,
     CAMERA_ALLOW_FALLBACK_RESOLUTION,
     CAMERA_AUTO_EXPOSURE,
     CAMERA_EXPOSURE,
@@ -25,6 +27,12 @@ from stewart_control.config import (
     TRACKER_MIN_RADIUS_PX,
     TRACKER_MAX_ARUCO_HOLD_FRAMES,
     TRACKER_WARP_SIZE_PX,
+    TRACKER_HSV_H_MAX,
+    TRACKER_HSV_H_MIN,
+    TRACKER_HSV_S_MAX,
+    TRACKER_HSV_S_MIN,
+    TRACKER_HSV_V_MAX,
+    TRACKER_HSV_V_MIN,
 )
 
 
@@ -100,9 +108,12 @@ class BallTracker:
         self._capture_period_ms = 0.0
         self._prev_capture_ts = 0.0
         self._slow_capture_streak = 0
+        self._capture_fail_streak = 0
         self._runtime_speed_profile_applied = False
         self._last_runtime_profile_apply_ts = 0.0
         self._runtime_profile_attempts = 0
+        self._runtime_recovery_disabled = False
+        self._last_runtime_reopen_ts = 0.0
         self.camera_index = int(camera_index)
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
@@ -112,8 +123,10 @@ class BallTracker:
         self.prev_time = None
         self.vx_smooth = 0.0
         self.vy_smooth = 0.0
-        self.hsv_lower = np.array([10, 83, 125], dtype=np.uint8)
-        self.hsv_upper = np.array([28, 255, 255], dtype=np.uint8)
+        self.hsv_lower = np.array([TRACKER_HSV_H_MIN, TRACKER_HSV_S_MIN, TRACKER_HSV_V_MIN], dtype=np.uint8)
+        self.hsv_upper = np.array([TRACKER_HSV_H_MAX, TRACKER_HSV_S_MAX, TRACKER_HSV_V_MAX], dtype=np.uint8)
+        self.target_x_mm = float(BALL_TARGET_DEFAULT_X_MM)
+        self.target_y_mm = float(BALL_TARGET_DEFAULT_Y_MM)
         self.last_status_reason = "init"
         self.last_profile_ms = {
             "frame_age": 0.0,
@@ -275,23 +288,31 @@ class BallTracker:
         while self._capture_running:
             ret, frame = self.cap.read()
             if not ret:
-                self._slow_capture_streak += 1
-                if self._slow_capture_streak >= 12:
-                    self._apply_runtime_speed_profile()
-                    self._slow_capture_streak = 0
+                self._capture_fail_streak += 1
+                self._slow_capture_streak = min(self._slow_capture_streak + 1, 1000)
+                # Only recover on sustained hard failures; avoid period-thrash recovery.
+                if (
+                    (not self._runtime_recovery_disabled)
+                    and self._capture_fail_streak >= 90
+                    and (time.perf_counter() - self._last_runtime_reopen_ts) > 8.0
+                ):
+                    self._last_runtime_reopen_ts = time.perf_counter()
+                    self._reopen_camera_runtime_profile()
+                    self._capture_fail_streak = 0
                 time.sleep(0.001)
                 continue
+            self._capture_fail_streak = 0
             now = time.perf_counter()
             if self._prev_capture_ts > 0:
                 dt_ms = (now - self._prev_capture_ts) * 1000.0
-                slow_now = (dt_ms > 45.0) or (self._capture_period_ms > 45.0 and self._capture_period_ms > 0.0)
+                # Keep slow-streak telemetry, but do not auto-reopen based on period.
+                slow_now = (dt_ms > 90.0) or (
+                    self._capture_period_ms > 90.0 and self._capture_period_ms > 0.0
+                )
                 if slow_now:
                     self._slow_capture_streak += 1
                 else:
                     self._slow_capture_streak = max(0, self._slow_capture_streak - 1)
-                if self._slow_capture_streak >= 10:
-                    self._apply_runtime_speed_profile()
-                    self._slow_capture_streak = 0
             with self._capture_lock:
                 self._latest_frame = frame
                 if self._prev_capture_ts > 0:
@@ -301,42 +322,70 @@ class BallTracker:
 
     def _apply_runtime_speed_profile(self):
         # Force a stable low-latency mode if runtime capture drifts.
+        if self._runtime_recovery_disabled:
+            return
         now = time.perf_counter()
         if (now - self._last_runtime_profile_apply_ts) < 1.5:
             return
         self._last_runtime_profile_apply_ts = now
         self._runtime_profile_attempts += 1
         try:
+            prev_period = float(self._capture_period_ms) if self._capture_period_ms > 0 else 0.0
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            self.cap.set(cv2.CAP_PROP_FPS, max(30, CAMERA_TARGET_FPS))
+            self.cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-            self.cap.set(cv2.CAP_PROP_EXPOSURE, max(float(CAMERA_EXPOSURE), -4.0))
+            # Preserve configured exposure policy; do not force brighter exposure
+            # at runtime because that destabilizes HSV thresholds.
+            if CAMERA_AUTO_EXPOSURE:
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+            else:
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, float(CAMERA_EXPOSURE))
             # Let camera settle before measuring.
             for _ in range(5):
                 self.cap.read()
             p_ms, g_mean = self._measure_camera_stats(self.cap, samples=10)
+            # Revert if runtime profile made capture worse.
+            if prev_period > 0.0 and p_ms > (prev_period + 12.0):
+                self._configure_camera(self.cap)
+                p_ms2, g_mean2 = self._measure_camera_stats(self.cap, samples=8)
+                p_ms, g_mean = p_ms2, g_mean2
             self._runtime_speed_profile_applied = True
             if self.debug_level >= 1:
                 print(
                     "[CAMERA] Runtime speed profile enabled "
-                    f"(fps_target={max(30, CAMERA_TARGET_FPS)}, exp={max(float(CAMERA_EXPOSURE), -4.0):.1f}, "
+                    f"(fps_target={CAMERA_TARGET_FPS}, auto_exp={CAMERA_AUTO_EXPOSURE}, exp={float(CAMERA_EXPOSURE):.1f}, "
                     f"period~{p_ms:.1f}ms, gray={g_mean:.1f}, tries={self._runtime_profile_attempts})"
                 )
-            if p_ms > 50.0:
+            # If runtime profile keeps landing in ~10 FPS territory, stop trying.
+            if p_ms > 90.0 and self._runtime_profile_attempts >= 2:
+                self._runtime_recovery_disabled = True
+                if self.debug_level >= 1:
+                    print("[CAMERA] Runtime recovery disabled (unstable profile); keeping current stream.")
+                return
+            if p_ms > 95.0:
                 self._reopen_camera_runtime_profile()
         except Exception:
             pass
 
     def _reopen_camera_runtime_profile(self):
-        backend_order = []
-        b = str(getattr(self, "camera_backend", "")).upper()
-        if b == "DSHOW":
-            backend_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
-        elif b == "MSMF":
-            backend_order = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+        if self._runtime_recovery_disabled:
+            return
+        forced = str(CAMERA_FORCE_BACKEND).upper()
+        if forced == "DSHOW":
+            backend_order = [cv2.CAP_DSHOW]
+        elif forced == "MSMF":
+            backend_order = [cv2.CAP_MSMF]
+        elif forced == "ANY":
+            backend_order = [cv2.CAP_ANY]
         else:
-            backend_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+            b = str(getattr(self, "camera_backend", "")).upper()
+            if b == "DSHOW":
+                backend_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+            elif b == "MSMF":
+                backend_order = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+            else:
+                backend_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
 
         best_cap = None
         best_period = 1e9
@@ -351,10 +400,13 @@ class BallTracker:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(cv2.CAP_PROP_FPS, max(30, CAMERA_TARGET_FPS))
+            cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
             try:
-                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                cap.set(cv2.CAP_PROP_EXPOSURE, max(float(CAMERA_EXPOSURE), -4.0))
+                if CAMERA_AUTO_EXPOSURE:
+                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+                else:
+                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                    cap.set(cv2.CAP_PROP_EXPOSURE, float(CAMERA_EXPOSURE))
             except Exception:
                 pass
             p_ms, g_mean = self._measure_camera_stats(cap, samples=10)
@@ -369,6 +421,15 @@ class BallTracker:
                 cap.release()
 
         if best_cap is not None:
+            if best_period > 90.0 and self.camera_measured_period_ms > 0 and self.camera_measured_period_ms < 60.0:
+                # Do not swap into a clearly worse mode than the startup-selected stream.
+                best_cap.release()
+                self._runtime_recovery_disabled = True
+                if self.debug_level >= 1:
+                    print(
+                        "[CAMERA] Runtime reopen rejected (would degrade to ~10 FPS); recovery disabled."
+                    )
+                return
             old = self.cap
             self.cap = best_cap
             self.camera_backend = self._backend_name(best_backend)
@@ -393,6 +454,10 @@ class BallTracker:
     def set_hsv_thresholds(self, hmin, hmax, smin, smax, vmin, vmax):
         self.hsv_lower = np.array([int(hmin), int(smin), int(vmin)], dtype=np.uint8)
         self.hsv_upper = np.array([int(hmax), int(smax), int(vmax)], dtype=np.uint8)
+
+    def set_target_mm(self, x_mm, y_mm):
+        self.target_x_mm = float(x_mm)
+        self.target_y_mm = float(y_mm)
 
     def mm_to_warp_px(self, x_mm, y_mm):
         px_per_mm = self.WARP_SIZE_PX / self.PLATFORM_SIZE_MM
@@ -441,16 +506,17 @@ class BallTracker:
 
     def _draw_vectors(self, warped, bx, by, vx, vy, x_mm, y_mm):
         center_px = (self.WARP_SIZE_PX // 2, self.WARP_SIZE_PX // 2)
-        cv2.drawMarker(
-            warped, center_px, (0, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2
-        )
+        target_px_f = self.mm_to_warp_px(self.target_x_mm, self.target_y_mm)
+        target_px = (int(target_px_f[0]), int(target_px_f[1]))
+        cv2.drawMarker(warped, center_px, (110, 110, 110), markerType=cv2.MARKER_CROSS, markerSize=12, thickness=1)
+        cv2.drawMarker(warped, target_px, (0, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2)
         cv2.circle(warped, (bx, by), 5, (0, 0, 255), -1)
 
         vel_end = (int(bx + vx * self.VEL_ARROW_SCALE), int(by - vy * self.VEL_ARROW_SCALE))
         cv2.arrowedLine(warped, (bx, by), vel_end, (255, 0, 0), 2)
 
-        pos_vec_x = -x_mm
-        pos_vec_y = -y_mm
+        pos_vec_x = self.target_x_mm - x_mm
+        pos_vec_y = self.target_y_mm - y_mm
         pos_end = (int(bx + pos_vec_x * self.POS_ARROW_SCALE), int(by - pos_vec_y * self.POS_ARROW_SCALE))
         cv2.arrowedLine(warped, (bx, by), pos_end, (0, 255, 255), 2)
 
@@ -459,9 +525,10 @@ class BallTracker:
         pd_end = (int(bx + pd_x * self.PD_ARROW_SCALE), int(by - pd_y * self.PD_ARROW_SCALE))
         cv2.arrowedLine(warped, (bx, by), pd_end, (0, 255, 0), 2)
 
-        cv2.putText(warped, "Center", (center_px[0] + 8, center_px[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(warped, "Center", (center_px[0] + 8, center_px[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 140, 140), 1, cv2.LINE_AA)
+        cv2.putText(warped, "Target", (target_px[0] + 8, target_px[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(warped, "Vel", (vel_end[0] + 4, vel_end[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1, cv2.LINE_AA)
-        cv2.putText(warped, "Pos->Center", (pos_end[0] + 4, pos_end[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(warped, "Pos->Target", (pos_end[0] + 4, pos_end[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(warped, "PD", (pd_end[0] + 4, pd_end[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
 
     def update(self, return_debug_frames=False):
@@ -615,12 +682,28 @@ class BallTracker:
         t_w0 = time.perf_counter()
         warped = cv2.warpPerspective(frame, H, (self.WARP_SIZE_PX, self.WARP_SIZE_PX), flags=cv2.INTER_LINEAR)
         t_w1 = time.perf_counter()
+        gray_warp_mean = float(np.mean(cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)))
         t_m0 = time.perf_counter()
         hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
+        vmin_base = int(self.hsv_lower[2])
+        if gray_warp_mean < 45.0:
+            relax = min(70, int((45.0 - gray_warp_mean) * 2.0))
+            vmin_eff = max(20, vmin_base - relax)
+        else:
+            vmin_eff = vmin_base
+        lower_eff = self.hsv_lower.copy()
+        lower_eff[2] = vmin_eff
+        mask = cv2.inRange(hsv, lower_eff, self.hsv_upper)
         t_m1 = time.perf_counter()
         t_c0 = time.perf_counter()
         ball = self.find_ball_center(mask)
+        if ball is None and vmin_eff > 20:
+            # One extra relaxed pass helps when camera exposure momentarily dips.
+            lower_eff2 = self.hsv_lower.copy()
+            lower_eff2[2] = max(10, vmin_eff - 20)
+            mask = cv2.inRange(hsv, lower_eff2, self.hsv_upper)
+            ball = self.find_ball_center(mask)
+            vmin_eff = int(lower_eff2[2])
         if ball is None:
             self.last_status_reason = "ball_contour_invalid"
             return None
@@ -702,6 +785,8 @@ class BallTracker:
                 "fill_ratio": fill_ratio,
                 "dt_s": float(dt),
                 "gray_mean": mean_gray,
+                "warp_gray_mean": gray_warp_mean,
+                "vmin_eff": float(vmin_eff),
                 "aruco_ids": float(aruco_id_count),
             },
         }
