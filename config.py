@@ -127,3 +127,29 @@ SERVO_NEUTRAL_DEG = 90.0
 # Optional safety limits
 SERVO_MIN_DEG = 0.0
 SERVO_MAX_DEG = 180.0
+
+
+# =========================
+# RUNTIME / CONTROL CONFIG
+# =========================
+
+# Logging levels:
+# 0 = silent
+# 1 = errors/warnings
+# 2 = periodic diagnostics
+DEBUG_LEVEL = 1
+LOG_EVERY_N = 25
+
+# IO defaults
+SERIAL_PORT = "COM4"
+CAMERA_INDEX = 0
+
+# Loop rates
+VISION_LOOP_HZ = 50
+VISUALIZER_HZ = 25
+
+# GUI buffers
+GUI_LOG_MAX_LINES = 500
+
+# Serial queue behavior
+SERIAL_QUEUE_MAX = 256

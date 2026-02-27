@@ -21,7 +21,7 @@ class StewartVisualizer:
         # initial dummy platform position
         self.platform_pos = {'x':0,'y':0,'z':130,'roll':0,'pitch':0,'yaw':0}
 
-    def update_platform(self, pos_dict):
+    def update_platform(self, pos_dict, ik_result=None):
         """
         pos_dict: dictionary with keys x, y, z, roll, pitch, yaw
         """
@@ -33,8 +33,10 @@ class StewartVisualizer:
         pitch = pos_dict['pitch']
         yaw   = pos_dict['yaw']
 
-        # Solve IK
-        solution = solve_pose(x, y, z, roll, pitch, yaw, prev_arm_points=self.prev_arm_points)
+        # Reuse IK if provided, otherwise solve locally.
+        solution = ik_result
+        if solution is None:
+            solution = solve_pose(x, y, z, roll, pitch, yaw, prev_arm_points=self.prev_arm_points)
 
         # Clear axes
         self.ax.cla()
@@ -91,7 +93,7 @@ class StewartVisualizer:
 
         self.ax.view_init(elev=20, azim=30)  # initial view
         self.ax.legend()
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
     def draw_square_platform(self, center, R):
         half = PLATFORM_SIZE / 2

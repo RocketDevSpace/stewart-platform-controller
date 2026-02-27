@@ -8,6 +8,7 @@ Created on Tue Feb 24 16:13:27 2026
 import math
 import time
 from dataclasses import dataclass
+from stewart_control.config import DEBUG_LEVEL, LOG_EVERY_N
 
 
 @dataclass
@@ -39,13 +40,18 @@ class BallController:
         self,
         kp: float = 0.05,
         kd: float = 0.01,
-        max_tilt_deg: float = 10.0
+        max_tilt_deg: float = 10.0,
+        debug_level: int = DEBUG_LEVEL,
+        log_every_n: int = LOG_EVERY_N,
     ):
         self.kp = kp
         self.kd = kd
         self.max_tilt_deg = max_tilt_deg
 
         self.enabled = True
+        self.debug_level = debug_level
+        self.log_every_n = max(1, int(log_every_n))
+        self._log_counter = 0
         
         self.pitch_offset = 0
         self.roll_offset = 0
@@ -120,7 +126,9 @@ class BallController:
         
         t1 = time.perf_counter()
         
-        print(f"PD compute: {(t1-t0)*1000:.3f} ms")
+        self._log_counter += 1
+        if self.debug_level >= 2 and (self._log_counter % self.log_every_n == 0):
+            print(f"PD compute: {(t1-t0)*1000:.3f} ms")
         
         # print(f"pitch={pitch:.3f}, roll_y={roll:.3f}")
 

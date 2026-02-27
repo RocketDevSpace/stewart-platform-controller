@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import time
 import math
+from stewart_control.config import DEBUG_LEVEL, LOG_EVERY_N
 
 
 class BallTracker:
@@ -16,7 +17,9 @@ class BallTracker:
                  warp_size_px=800,
                  aruco_size_mm=37.5,
                  vel_alpha=0.7,
-                 show_debug=True):
+                 show_debug=True,
+                 debug_level=DEBUG_LEVEL,
+                 log_every_n=LOG_EVERY_N):
 
         self.PLATFORM_SIZE_MM = platform_size_mm
         self.WARP_SIZE_PX = warp_size_px
@@ -24,6 +27,9 @@ class BallTracker:
         self.VEL_ALPHA = vel_alpha
         self.VEL_ARROW_SCALE = 0.15
         self.show_debug = show_debug
+        self.debug_level = debug_level
+        self.log_every_n = max(1, int(log_every_n))
+        self._log_counter = 0
 
         # --- ArUco setup ---
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -266,9 +272,11 @@ class BallTracker:
 
         self._debug_show(frame, warped, mask, bx, by, vx, vy)
         
-        print(f"Capture: {(t1-t0)*1000:.1f} ms")
-        print(f"Aruco: {(t2-t1)*1000:.1f} ms")
-        print(f"Ball: {(t3-t2)*1000:.1f} ms")
+        self._log_counter += 1
+        if self.debug_level >= 2 and (self._log_counter % self.log_every_n == 0):
+            print(f"Capture: {(t1-t0)*1000:.1f} ms")
+            print(f"Aruco: {(t2-t1)*1000:.1f} ms")
+            print(f"Ball: {(t3-t2)*1000:.1f} ms")
 
         return {
             "x_mm": x_mm,
