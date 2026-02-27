@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+import threading
 
 from stewart_control.config import (
     CAMERA_BUFFER_SIZE,
@@ -60,11 +61,20 @@ class BallTracker:
         }
 
         self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FPS, 60)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
         if not self.cap.isOpened():
             raise RuntimeError("Camera failed to open.")
+
+        self._capture_running = True
+        self._capture_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_frame_ts = 0.0
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
 
         self.prev_ball_mm = None
         self.prev_time = None
@@ -72,6 +82,16 @@ class BallTracker:
         self.vy_smooth = 0.0
         self.hsv_lower = np.array([10, 83, 125], dtype=np.uint8)
         self.hsv_upper = np.array([28, 255, 255], dtype=np.uint8)
+
+    def _capture_loop(self):
+        while self._capture_running:
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.001)
+                continue
+            with self._capture_lock:
+                self._latest_frame = frame
+                self._latest_frame_ts = time.perf_counter()
 
     def set_pd_gains(self, kp, kd):
         self.pd_kp = float(kp)
@@ -138,10 +158,11 @@ class BallTracker:
 
     def update(self, return_debug_frames=False):
         t0 = time.perf_counter()
-        ret, frame = self.cap.read()
-        t1 = time.perf_counter()
-        if not ret:
+        with self._capture_lock:
+            frame = self._latest_frame
+        if frame is None:
             return None
+        t1 = time.perf_counter()
 
         self._frame_counter += 1
         frame = cv2.flip(frame, 1)
@@ -149,6 +170,8 @@ class BallTracker:
         warped = None
         mask = None
 
+        t_aruco0 = time.perf_counter()
+        homography_ms = 0.0
         use_cached_h = (self._last_H is not None) and (self._frame_counter % self.aruco_redetect_every_n != 0)
         if use_cached_h:
             H = self._last_H
@@ -204,22 +227,33 @@ class BallTracker:
             src_pts = np.array(src_pts, dtype=np.float32)
             dst_pts = np.array(dst_pts, dtype=np.float32)
 
+            t_h0 = time.perf_counter()
             if len(src_pts) == 4:
                 H = cv2.getPerspectiveTransform(src_pts, dst_pts)
             else:
                 H, _ = cv2.findHomography(src_pts, dst_pts)
+            t_h1 = time.perf_counter()
+            homography_ms = (t_h1 - t_h0) * 1000.0
             if H is None:
                 return None
             self._last_H = H
+        t_aruco1 = time.perf_counter()
 
+        t_w0 = time.perf_counter()
         warped = cv2.warpPerspective(frame, H, (self.WARP_SIZE_PX, self.WARP_SIZE_PX), flags=cv2.INTER_LINEAR)
+        t_w1 = time.perf_counter()
+        t_m0 = time.perf_counter()
         hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
+        t_m1 = time.perf_counter()
+        t_c0 = time.perf_counter()
         ball = self.find_ball_center(mask)
         if ball is None:
             return None
         (bx, by), _, mask = ball
+        t_c1 = time.perf_counter()
 
+        t_k0 = time.perf_counter()
         cx = self.WARP_SIZE_PX // 2
         cy = self.WARP_SIZE_PX // 2
         mm_per_px = self.PLATFORM_SIZE_MM / self.WARP_SIZE_PX
@@ -246,8 +280,11 @@ class BallTracker:
 
         self.prev_ball_mm = (x_mm, y_mm)
         self.prev_time = current_time
+        t_k1 = time.perf_counter()
+        t_o0 = time.perf_counter()
         if return_debug_frames:
             self._draw_vectors(warped, bx, by, vx, vy, x_mm, y_mm)
+        t_o1 = time.perf_counter()
 
         self._log_counter += 1
         if self.debug_level >= 2 and (self._log_counter % self.log_every_n == 0):
@@ -260,6 +297,18 @@ class BallTracker:
             "y_mm": y_mm,
             "vx_mm_s": vx,
             "vy_mm_s": vy,
+            "profile_ms": {
+                "capture_fetch": (t1 - t0) * 1000.0,
+                "aruco_detect": (t_aruco1 - t_aruco0) * 1000.0,
+                "homography": homography_ms,
+                "warp": (t_w1 - t_w0) * 1000.0,
+                "hsv_mask": (t_m1 - t_m0) * 1000.0,
+                "contour": (t_c1 - t_c0) * 1000.0,
+                "kinematics": (t_k1 - t_k0) * 1000.0,
+                "overlay": (t_o1 - t_o0) * 1000.0,
+                "total": (time.perf_counter() - t0) * 1000.0,
+                "used_cached_h": 1.0 if use_cached_h else 0.0,
+            },
         }
         if return_debug_frames:
             result["camera_bgr"] = frame
@@ -268,5 +317,8 @@ class BallTracker:
         return result
 
     def release(self):
+        self._capture_running = False
+        if self._capture_thread and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=0.5)
         if self.cap:
             self.cap.release()

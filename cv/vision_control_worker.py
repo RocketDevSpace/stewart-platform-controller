@@ -38,7 +38,7 @@ class VisionControlWorker(QtCore.QObject):
         camera_index=0,
         loop_hz=50,
         tracker_debug=False,
-        emit_camera_every_n=2,
+        emit_camera_every_n=1,
     ):
         super().__init__()
         self.ik_solver = ik_solver
@@ -138,11 +138,21 @@ class VisionControlWorker(QtCore.QObject):
                 servo_angles = [int(round(a)) for a in ik_result["servo_angles_deg"]]
 
             timings_ms = {
-                "ball_update": (t1 - t0) * 1000.0,
+                "ball_update": ball_state_dict.get("profile_ms", {}).get("total", (t1 - t0) * 1000.0),
                 "pd_compute": (t2 - t1) * 1000.0,
                 "ik_solve": (t3 - t2) * 1000.0,
                 "total": (time.perf_counter() - loop_start) * 1000.0,
             }
+            tracker_profile = ball_state_dict.get("profile_ms", {})
+            timings_ms["trk_capture"] = tracker_profile.get("capture_fetch", 0.0)
+            timings_ms["trk_aruco"] = tracker_profile.get("aruco_detect", 0.0)
+            timings_ms["trk_h"] = tracker_profile.get("homography", 0.0)
+            timings_ms["trk_warp"] = tracker_profile.get("warp", 0.0)
+            timings_ms["trk_hsv"] = tracker_profile.get("hsv_mask", 0.0)
+            timings_ms["trk_contour"] = tracker_profile.get("contour", 0.0)
+            timings_ms["trk_kin"] = tracker_profile.get("kinematics", 0.0)
+            timings_ms["trk_overlay"] = tracker_profile.get("overlay", 0.0)
+            timings_ms["trk_cached_h"] = tracker_profile.get("used_cached_h", 0.0)
 
             self._counter += 1
             if DEBUG_LEVEL >= 2 and (self._counter % LOG_EVERY_N == 0):

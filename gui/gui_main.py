@@ -54,6 +54,7 @@ class StewartGUIController(StewartGUIView):
         self._vision_worker = None
 
         self._timing_keys = ["ball_update", "pd_compute", "ik_solve", "serial_enqueue", "visualizer_gui", "total"]
+        self._tracker_keys = ["trk_capture", "trk_aruco", "trk_h", "trk_warp", "trk_hsv", "trk_contour", "trk_kin", "trk_overlay"]
         self._timing_colors = {
             "ball_update": "#38bdf8",
             "pd_compute": "#34d399",
@@ -345,7 +346,7 @@ class StewartGUIController(StewartGUIView):
             max_tilt_deg=8.0,
             camera_index=CAMERA_INDEX,
             loop_hz=VISION_LOOP_HZ,
-            emit_camera_every_n=max(1, int(VISION_LOOP_HZ / 10)),
+            emit_camera_every_n=1,
         )
         self._vision_worker.moveToThread(self._vision_thread)
         self._vision_thread.finished.connect(self._on_vision_thread_finished)
@@ -424,6 +425,9 @@ class StewartGUIController(StewartGUIView):
         self._timing_timestamps.append(now)
         for key in self._timing_keys:
             self._timing_history[key].append(float(timings.get(key, 0.0)))
+        for key in self._tracker_keys:
+            self._timing_history.setdefault(key, deque(maxlen=self._timing_timestamps.maxlen))
+            self._timing_history[key].append(float(timings.get(key, 0.0)))
         self._trim_timing_history(now)
 
         self._update_camera_views(snapshot)
@@ -435,6 +439,9 @@ class StewartGUIController(StewartGUIView):
             self._timing_timestamps.popleft()
             for key in self._timing_keys:
                 if self._timing_history[key]:
+                    self._timing_history[key].popleft()
+            for key in self._tracker_keys:
+                if key in self._timing_history and self._timing_history[key]:
                     self._timing_history[key].popleft()
 
     def _update_timing_diagnostics(self, force_redraw=False):
@@ -450,6 +457,23 @@ class StewartGUIController(StewartGUIView):
             f"ik={avgs['ik_solve']:.2f}, serQ={avgs['serial_enqueue']:.2f}, "
             f"vis={avgs['visualizer_gui']:.2f}, total={avgs['total']:.2f}, zoom={self._y_zoom:.2f}x"
         )
+
+        if self._vision_counter % LOG_EVERY_N == 0:
+            trk = {}
+            for k in self._tracker_keys:
+                values = self._timing_history.get(k, [])
+                trk[k] = (sum(values) / len(values)) if values else 0.0
+            self._log_preview(
+                "[TRACKER AVG] "
+                f"fetch={trk['trk_capture']:.2f}ms "
+                f"aruco={trk['trk_aruco']:.2f}ms "
+                f"H={trk['trk_h']:.2f}ms "
+                f"warp={trk['trk_warp']:.2f}ms "
+                f"hsv={trk['trk_hsv']:.2f}ms "
+                f"contour={trk['trk_contour']:.2f}ms "
+                f"kin={trk['trk_kin']:.2f}ms "
+                f"overlay={trk['trk_overlay']:.2f}ms"
+            )
 
         if not force_redraw and (self._vision_counter % self._timing_plot_update_every != 0):
             return
