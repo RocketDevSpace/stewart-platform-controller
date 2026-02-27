@@ -1,5 +1,5 @@
 from PyQt5 import QtWidgets
-from stewart_control.gui.gui_layout import StewartGUILayout
+from stewart_control.gui.gui_main import StewartGUILayout
 from stewart_control.kinematics import ik_solver  # or whatever module contains solve_pose
 import sys
 

@@ -15,7 +15,9 @@ class StewartVisualizer:
 
         # Create a figure in the canvas
         self.fig = canvas.figure
+        self.fig.patch.set_facecolor("#0f1726")
         self.ax = self.fig.add_subplot(111, projection="3d")
+        self.ax.set_facecolor("#0f1726")
         self.ax.set_box_aspect([1,1,0.8])
 
         # initial dummy platform position
@@ -83,13 +85,14 @@ class StewartVisualizer:
             print("FAILED IK:", solution["debug"]["failures"])
 
         # --- Axis formatting ---
-        self.ax.set_xlabel("X")
-        self.ax.set_ylabel("Y")
-        self.ax.set_zlabel("Z")
+        self.ax.set_xlabel("X", color="#d6e2ff")
+        self.ax.set_ylabel("Y", color="#d6e2ff")
+        self.ax.set_zlabel("Z", color="#d6e2ff")
+        self.ax.tick_params(colors="#9fb4d9")
         self.ax.set_xlim(-120, 120)
         self.ax.set_ylim(-120, 120)
         self.ax.set_zlim(0, 200)
-        self.ax.set_title("Stewart Platform IK Visualizer")
+        self.ax.set_title("Stewart Platform IK Visualizer", color="#d6e2ff")
 
         self.ax.view_init(elev=20, azim=30)  # initial view
         self.ax.legend()

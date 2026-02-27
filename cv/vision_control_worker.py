@@ -18,6 +18,9 @@ class ControlSnapshot:
     timings_ms: dict
     ik_result: dict
     control_terms: dict
+    camera_bgr: object | None = None
+    warped_bgr: object | None = None
+    mask_bgr: object | None = None
 
 
 class VisionControlWorker(QtCore.QObject):
@@ -35,6 +38,7 @@ class VisionControlWorker(QtCore.QObject):
         camera_index=0,
         loop_hz=50,
         tracker_debug=False,
+        emit_camera_every_n=2,
     ):
         super().__init__()
         self.ik_solver = ik_solver
@@ -44,11 +48,11 @@ class VisionControlWorker(QtCore.QObject):
         self._timer = None
         self._running = False
         self._counter = 0
+        self._emit_camera_every_n = max(1, int(emit_camera_every_n))
 
         self.ball_controller = BallController(kp=kp, kd=kd, max_tilt_deg=max_tilt_deg)
         self.ball_tracker = BallTracker(
             camera_index=camera_index,
-            show_debug=tracker_debug,
             pd_kp=kp,
             pd_kd=kd,
         )
@@ -81,6 +85,10 @@ class VisionControlWorker(QtCore.QObject):
         self.ball_controller.set_gains(kp, kd)
         self.ball_tracker.set_pd_gains(kp, kd)
 
+    @QtCore.pyqtSlot(int, int, int, int, int, int)
+    def set_hsv(self, hmin, hmax, smin, smax, vmin, vmax):
+        self.ball_tracker.set_hsv_thresholds(hmin, hmax, smin, smax, vmin, vmax)
+
     @QtCore.pyqtSlot()
     def _tick(self):
         if not self._running:
@@ -89,7 +97,8 @@ class VisionControlWorker(QtCore.QObject):
         loop_start = time.perf_counter()
         try:
             t0 = time.perf_counter()
-            ball_state_dict = self.ball_tracker.update()
+            emit_frames = (self._counter % self._emit_camera_every_n == 0)
+            ball_state_dict = self.ball_tracker.update(return_debug_frames=emit_frames)
             t1 = time.perf_counter()
             if ball_state_dict is None:
                 return
@@ -154,6 +163,9 @@ class VisionControlWorker(QtCore.QObject):
                 timings_ms=timings_ms,
                 ik_result=ik_result,
                 control_terms=control_terms,
+                camera_bgr=ball_state_dict.get("camera_bgr"),
+                warped_bgr=ball_state_dict.get("warped_bgr"),
+                mask_bgr=ball_state_dict.get("mask_bgr"),
             )
             self.snapshot_ready.emit(snapshot)
         except Exception as exc:
