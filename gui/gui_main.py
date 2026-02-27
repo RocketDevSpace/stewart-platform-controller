@@ -49,6 +49,7 @@ class StewartGUIController(StewartGUIView):
         self._timing_plot_update_every = 5
         self._vision_counter = 0
         self._y_zoom = 1.0
+        self._last_neutral_send = 0.0
 
         self._vision_thread = None
         self._vision_worker = None
@@ -396,6 +397,37 @@ class StewartGUIController(StewartGUIView):
     def _on_control_snapshot(self, snapshot):
         if not self.vision_enabled:
             return
+
+        if not snapshot.tracking_valid:
+            now = time.perf_counter()
+            if now - self._last_neutral_send > 0.2:
+                neutral_pose = {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": float(self._vision_z_setpoint),
+                    "roll": 0.0,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                }
+                ik = self.ik_solver.solve_pose(
+                    neutral_pose["x"],
+                    neutral_pose["y"],
+                    neutral_pose["z"],
+                    neutral_pose["roll"],
+                    neutral_pose["pitch"],
+                    neutral_pose["yaw"],
+                    prev_arm_points=None,
+                )
+                if ik.get("success", False):
+                    safe_angles = [max(0, min(180, int(round(a)))) for a in ik["servo_angles_deg"]]
+                    cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
+                    self.serial.enqueue_command(cmd, policy="latest")
+                    self._last_neutral_send = now
+            self._vision_counter += 1
+            if self._vision_counter % LOG_EVERY_N == 0:
+                self._log_preview("[TRACK] no ball detected -> neutral hold")
+            return
+
         if not snapshot.ik_success:
             self._vision_counter += 1
             if self._vision_counter % LOG_EVERY_N == 0:
@@ -433,6 +465,19 @@ class StewartGUIController(StewartGUIView):
         self._update_camera_views(snapshot)
         self._update_timing_diagnostics()
         self._vision_counter += 1
+
+        if self._vision_counter % LOG_EVERY_N == 0:
+            bs = snapshot.ball_state
+            terms = snapshot.control_terms
+            self._log_preview(
+                "[CONTROL TRACE] "
+                f"ball=({bs.x_mm:.2f},{bs.y_mm:.2f})mm "
+                f"vel=({bs.vx_mm_s:.2f},{bs.vy_mm_s:.2f})mm/s "
+                f"pos_err=({terms['position_vec_mm'][0]:.2f},{terms['position_vec_mm'][1]:.2f}) "
+                f"pd_vec=({terms['pd_vec'][0]:.4f},{terms['pd_vec'][1]:.4f}) "
+                f"pose=(r{snapshot.pose['roll']:.3f},p{snapshot.pose['pitch']:.3f},z{snapshot.pose['z']:.2f}) "
+                f"cmd={safe_angles}"
+            )
 
     def _trim_timing_history(self, now):
         while self._timing_timestamps and (now - self._timing_timestamps[0]) > self._timing_window_s:

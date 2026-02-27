@@ -18,6 +18,8 @@ class ControlSnapshot:
     timings_ms: dict
     ik_result: dict
     control_terms: dict
+    tracking_valid: bool
+    reason: str = ""
     camera_bgr: object | None = None
     warped_bgr: object | None = None
     mask_gray: object | None = None
@@ -49,6 +51,7 @@ class VisionControlWorker(QtCore.QObject):
         self._running = False
         self._counter = 0
         self._emit_camera_every_n = max(1, int(emit_camera_every_n))
+        self._miss_count = 0
 
         self.ball_controller = BallController(kp=kp, kd=kd, max_tilt_deg=max_tilt_deg)
         self.ball_tracker = BallTracker(
@@ -101,7 +104,31 @@ class VisionControlWorker(QtCore.QObject):
             ball_state_dict = self.ball_tracker.update(return_debug_frames=emit_frames)
             t1 = time.perf_counter()
             if ball_state_dict is None:
+                self._miss_count += 1
+                timings_ms = {
+                    "ball_update": (t1 - t0) * 1000.0,
+                    "pd_compute": 0.0,
+                    "ik_solve": 0.0,
+                    "total": (time.perf_counter() - loop_start) * 1000.0,
+                }
+                snapshot = ControlSnapshot(
+                    timestamp=time.time(),
+                    ball_state=BallState(0.0, 0.0, 0.0, 0.0),
+                    pose={"x": 0.0, "y": 0.0, "z": float(self.z_provider()), "roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+                    servo_angles=[],
+                    ik_success=False,
+                    timings_ms=timings_ms,
+                    ik_result={},
+                    control_terms={"position_vec_mm": (0.0, 0.0), "velocity_vec_mm_s": (0.0, 0.0), "pd_vec": (0.0, 0.0)},
+                    tracking_valid=False,
+                    reason="no_ball_detected",
+                    camera_bgr=None,
+                    warped_bgr=None,
+                    mask_gray=None,
+                )
+                self.snapshot_ready.emit(snapshot)
                 return
+            self._miss_count = 0
 
             ball_state = BallState(
                 x_mm=ball_state_dict["x_mm"],
@@ -173,6 +200,8 @@ class VisionControlWorker(QtCore.QObject):
                 timings_ms=timings_ms,
                 ik_result=ik_result,
                 control_terms=control_terms,
+                tracking_valid=True,
+                reason="ok",
                 camera_bgr=ball_state_dict.get("camera_bgr"),
                 warped_bgr=ball_state_dict.get("warped_bgr"),
                 mask_gray=ball_state_dict.get("mask_gray"),
