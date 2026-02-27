@@ -3,7 +3,7 @@ import time
 from collections import deque
 
 import cv2
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QApplication
 
@@ -44,15 +44,14 @@ class StewartGUIController(StewartGUIView):
         self.current_routine_steps = []
         self.current_routine_index = 0
         self.vision_enabled = False
-        self._vision_stopping = False
         self._last_visualizer_update = 0.0
         self._vision_z_setpoint = 0.0
         self._timing_plot_update_every = 5
         self._vision_counter = 0
+        self._y_zoom = 1.0
 
         self._vision_thread = None
         self._vision_worker = None
-        self._routine_send_index = 0
 
         self._timing_keys = ["ball_update", "pd_compute", "ik_solve", "serial_enqueue", "visualizer_gui", "total"]
         self._timing_colors = {
@@ -64,22 +63,24 @@ class StewartGUIController(StewartGUIView):
             "total": "#e2e8f0",
         }
         self._timing_history = {k: deque(maxlen=TIMING_PLOT_POINTS) for k in self._timing_keys}
+        self._timing_timestamps = deque(maxlen=TIMING_PLOT_POINTS)
+        self._timing_window_s = 30.0
 
         self.serial = SerialSender(SERIAL_PORT)
         self.serial_line_received.connect(self.append_serial_line)
         self.serial.connect()
         self.serial.set_receive_callback(lambda line: self.serial_line_received.emit(line))
 
-        self.visualizer = StewartVisualizer(self.canvas)
+        self.visualizer = StewartVisualizer(self.monitor_window.vis_canvas)
         self._init_timing_plot_style()
         self._init_signals()
         self._init_routines()
         self._set_camera_enabled(False)
+        self.monitor_window.show()
 
     def _init_signals(self):
         for axis, (lbl, sld) in self.sliders.items():
             sld.valueChanged.connect(lambda val, a=axis, l=lbl: self._on_pose_slider(a, val, l))
-
         for name, (lbl, sld) in self.hsv_controls.items():
             sld.valueChanged.connect(lambda val, n=name, l=lbl: self._on_hsv_slider(n, val, l))
 
@@ -91,6 +92,31 @@ class StewartGUIController(StewartGUIView):
         self.vision_button.clicked.connect(self.toggle_vision_mode)
         self.cancel_vision_btn.clicked.connect(self.disable_vision_mode)
         self.cancel_routine_btn.clicked.connect(self.cancel_routine_preview)
+        self.open_monitor_button.clicked.connect(self.monitor_window.showNormal)
+
+        self.timing_canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.timing_canvas.grabGesture(QtCore.Qt.PinchGesture)
+        self.timing_canvas.installEventFilter(self)
+        self.timing_canvas.mpl_connect("scroll_event", self._on_timing_scroll)
+
+    def eventFilter(self, obj, event):
+        if obj is self.timing_canvas and event.type() == QtCore.QEvent.Gesture:
+            pinch = event.gesture(QtCore.Qt.PinchGesture)
+            if pinch is not None:
+                self._apply_y_zoom(1.0 / float(pinch.scaleFactor()))
+                return True
+        return super().eventFilter(obj, event)
+
+    def _on_timing_scroll(self, event):
+        if event.button == "up":
+            self._apply_y_zoom(0.9)
+        elif event.button == "down":
+            self._apply_y_zoom(1.1)
+
+    def _apply_y_zoom(self, scale):
+        self._y_zoom *= float(scale)
+        self._y_zoom = max(0.2, min(10.0, self._y_zoom))
+        self._update_timing_diagnostics(force_redraw=True)
 
     def _init_routines(self):
         for name in ROUTINES.keys():
@@ -99,7 +125,7 @@ class StewartGUIController(StewartGUIView):
     def _init_timing_plot_style(self):
         self.timing_figure.patch.set_facecolor("#0f1726")
         self.timing_ax.set_facecolor("#0f1726")
-        self.timing_ax.set_title("Vision Loop Step Timings (ms)", color="#d6e2ff")
+        self.timing_ax.set_title("Vision Loop Step Timings (Last 30s)", color="#d6e2ff")
         self.timing_ax.tick_params(colors="#9fb4d9")
         self.timing_ax.grid(True, alpha=0.2, color="#2a3b59")
 
@@ -152,7 +178,11 @@ class StewartGUIController(StewartGUIView):
             sld.setEnabled(enabled)
 
     def _set_camera_enabled(self, enabled):
-        labels = [self.camera_view_label, self.warped_view_label, self.mask_view_label]
+        labels = [
+            self.monitor_window.camera_view_label,
+            self.monitor_window.warped_view_label,
+            self.monitor_window.mask_view_label,
+        ]
         titles = ["Camera View", "Warped View", "Mask View"]
         for lbl, title in zip(labels, titles):
             if enabled:
@@ -170,13 +200,15 @@ class StewartGUIController(StewartGUIView):
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
-        return QtGui.QPixmap.fromImage(qimg).scaled(target_w, target_h, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        return QtGui.QPixmap.fromImage(qimg).scaled(
+            target_w, target_h, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+        )
 
     def _update_camera_views(self, snapshot):
         for widget, frame in [
-            (self.camera_view_label, snapshot.camera_bgr),
-            (self.warped_view_label, snapshot.warped_bgr),
-            (self.mask_view_label, snapshot.mask_bgr),
+            (self.monitor_window.camera_view_label, snapshot.camera_bgr),
+            (self.monitor_window.warped_view_label, snapshot.warped_bgr),
+            (self.monitor_window.mask_view_label, snapshot.mask_bgr),
         ]:
             pix = self._cv_to_pixmap(frame, widget.width(), widget.height())
             if pix is not None:
@@ -272,15 +304,18 @@ class StewartGUIController(StewartGUIView):
         if self.vision_enabled:
             return
         self.vision_enabled = True
-        self._vision_stopping = False
         self._vision_counter = 0
         self._last_visualizer_update = 0.0
         self._set_pose_sliders_enabled(False)
         self.cancel_vision_btn.setEnabled(True)
         self.vision_button.setText("Vision ACTIVE")
         self._set_camera_enabled(True)
+        self.monitor_window.showNormal()
+        self.monitor_window.raise_()
+        self.monitor_window.activateWindow()
         for key in self._timing_keys:
             self._timing_history[key].clear()
+        self._timing_timestamps.clear()
         self._start_vision_worker()
         self._log_preview("[INFO] Vision mode enabled.")
 
@@ -288,7 +323,6 @@ class StewartGUIController(StewartGUIView):
         if not self.vision_enabled and self._vision_worker is None:
             return
         self.vision_enabled = False
-        self._vision_stopping = True
         self.cancel_vision_btn.setEnabled(False)
         self.vision_button.setText("Stopping Vision...")
         self._set_camera_enabled(False)
@@ -349,7 +383,6 @@ class StewartGUIController(StewartGUIView):
         self.vision_button.setText("Enable Vision Mode")
         if not self.preview_mode:
             self._set_pose_sliders_enabled(True)
-        self._vision_stopping = False
         self._log_preview("[INFO] Vision mode disabled.")
 
     def _on_vision_error(self, msg):
@@ -371,9 +404,9 @@ class StewartGUIController(StewartGUIView):
         t_serial1 = time.perf_counter()
 
         vis_ms = 0.0
-        now = time.perf_counter()
-        if now - self._last_visualizer_update >= (1.0 / max(1, VISUALIZER_HZ)):
-            self._last_visualizer_update = now
+        now_perf = time.perf_counter()
+        if now_perf - self._last_visualizer_update >= (1.0 / max(1, VISUALIZER_HZ)):
+            self._last_visualizer_update = now_perf
             t_vis0 = time.perf_counter()
             self.visualizer.update_platform(snapshot.pose, ik_result=snapshot.ik_result)
             t_vis1 = time.perf_counter()
@@ -382,37 +415,61 @@ class StewartGUIController(StewartGUIView):
         timings = dict(snapshot.timings_ms)
         timings["serial_enqueue"] = (t_serial1 - t_serial0) * 1000.0
         timings["visualizer_gui"] = vis_ms
+
+        now = time.time()
+        self._timing_timestamps.append(now)
         for key in self._timing_keys:
             self._timing_history[key].append(float(timings.get(key, 0.0)))
+        self._trim_timing_history(now)
 
         self._update_camera_views(snapshot)
         self._update_timing_diagnostics()
         self._vision_counter += 1
 
-    def _update_timing_diagnostics(self):
+    def _trim_timing_history(self, now):
+        while self._timing_timestamps and (now - self._timing_timestamps[0]) > self._timing_window_s:
+            self._timing_timestamps.popleft()
+            for key in self._timing_keys:
+                if self._timing_history[key]:
+                    self._timing_history[key].popleft()
+
+    def _update_timing_diagnostics(self, force_redraw=False):
         if not self._timing_history["total"]:
             return
         avgs = {}
-        for k in self._timing_keys:
-            values = self._timing_history[k]
-            avgs[k] = (sum(values) / len(values)) if values else 0.0
+        for key in self._timing_keys:
+            values = self._timing_history[key]
+            avgs[key] = (sum(values) / len(values)) if values else 0.0
         self.timing_summary_label.setText(
             "Vision Timing Avg (ms): "
             f"ball={avgs['ball_update']:.2f}, pd={avgs['pd_compute']:.2f}, "
             f"ik={avgs['ik_solve']:.2f}, serQ={avgs['serial_enqueue']:.2f}, "
-            f"vis={avgs['visualizer_gui']:.2f}, total={avgs['total']:.2f}"
+            f"vis={avgs['visualizer_gui']:.2f}, total={avgs['total']:.2f}, zoom={self._y_zoom:.2f}x"
         )
-        if self._vision_counter % self._timing_plot_update_every != 0:
+
+        if not force_redraw and (self._vision_counter % self._timing_plot_update_every != 0):
             return
+        if not self._timing_timestamps:
+            return
+
+        now = self._timing_timestamps[-1]
+        x = [t - now for t in self._timing_timestamps]
         self.timing_ax.cla()
         self.timing_ax.set_facecolor("#0f1726")
-        self.timing_ax.set_title("Vision Loop Step Timings (ms)", color="#d6e2ff")
+        self.timing_ax.set_title("Vision Loop Step Timings (Last 30s)", color="#d6e2ff")
         self.timing_ax.tick_params(colors="#9fb4d9")
         self.timing_ax.grid(True, alpha=0.2, color="#2a3b59")
+        self.timing_ax.set_xlim(-self._timing_window_s, 0.0)
+        self.timing_ax.set_xlabel("Time (s, rolling)", color="#9fb4d9")
+        self.timing_ax.set_ylabel("ms", color="#9fb4d9")
+
+        y_max = 1.0
         for key in self._timing_keys:
             y = list(self._timing_history[key])
             if y:
-                self.timing_ax.plot(range(len(y)), y, label=key, linewidth=1.4, color=self._timing_colors[key])
+                self.timing_ax.plot(x, y, label=key, linewidth=1.4, color=self._timing_colors[key])
+                y_max = max(y_max, max(y))
+        self.timing_ax.set_ylim(0.0, y_max * self._y_zoom)
         self.timing_ax.legend(loc="upper right", fontsize=7)
         self.timing_canvas.draw_idle()
 
@@ -420,6 +477,7 @@ class StewartGUIController(StewartGUIView):
         self.cancel_routine_preview()
         self.disable_vision_mode()
         self.serial.disconnect()
+        self.monitor_window.close()
         super().closeEvent(event)
 
 
@@ -429,5 +487,5 @@ StewartGUILayout = StewartGUIController
 def run_gui():
     app = QApplication(sys.argv)
     window = StewartGUIController()
-    window.showMaximized()
+    window.show()
     sys.exit(app.exec_())

@@ -2,7 +2,16 @@ import cv2
 import numpy as np
 import time
 
-from stewart_control.config import DEBUG_LEVEL, LOG_EVERY_N
+from stewart_control.config import (
+    CAMERA_BUFFER_SIZE,
+    CAMERA_HEIGHT,
+    CAMERA_WIDTH,
+    DEBUG_LEVEL,
+    LOG_EVERY_N,
+    TRACKER_ARUCO_DETECT_SCALE,
+    TRACKER_ARUCO_REDETECT_EVERY_N,
+    TRACKER_WARP_SIZE_PX,
+)
 
 
 class BallTracker:
@@ -10,10 +19,12 @@ class BallTracker:
         self,
         camera_index=0,
         platform_size_mm=240.0,
-        warp_size_px=800,
+        warp_size_px=TRACKER_WARP_SIZE_PX,
         vel_alpha=0.7,
         pd_kp=0.005,
         pd_kd=0.010,
+        aruco_detect_scale=TRACKER_ARUCO_DETECT_SCALE,
+        aruco_redetect_every_n=TRACKER_ARUCO_REDETECT_EVERY_N,
         debug_level=DEBUG_LEVEL,
         log_every_n=LOG_EVERY_N,
     ):
@@ -27,12 +38,17 @@ class BallTracker:
 
         self.pd_kp = float(pd_kp)
         self.pd_kd = float(pd_kd)
+        self.aruco_detect_scale = float(aruco_detect_scale)
+        self.aruco_redetect_every_n = max(1, int(aruco_redetect_every_n))
         self.debug_level = debug_level
         self.log_every_n = max(1, int(log_every_n))
         self._log_counter = 0
+        self._frame_counter = 0
+        self._last_H = None
 
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
         self.CORNER_IDS = [0, 1, 2, 3]
@@ -43,9 +59,10 @@ class BallTracker:
             3: np.array([60.0, -60.0]),
         }
 
-        self.cap = cv2.VideoCapture(camera_index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
         if not self.cap.isOpened():
             raise RuntimeError("Camera failed to open.")
 
@@ -126,53 +143,73 @@ class BallTracker:
         if not ret:
             return None
 
+        self._frame_counter += 1
         frame = cv2.flip(frame, 1)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = self.detector.detectMarkers(gray)
+        H = None
         warped = None
         mask = None
 
-        if ids is None:
-            return None
-        ids = ids.flatten()
+        use_cached_h = (self._last_H is not None) and (self._frame_counter % self.aruco_redetect_every_n != 0)
+        if use_cached_h:
+            H = self._last_H
+            t2 = t1
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if self.aruco_detect_scale < 0.99:
+                gray_detect = cv2.resize(
+                    gray,
+                    None,
+                    fx=self.aruco_detect_scale,
+                    fy=self.aruco_detect_scale,
+                    interpolation=cv2.INTER_AREA,
+                )
+                scale_inv = 1.0 / self.aruco_detect_scale
+            else:
+                gray_detect = gray
+                scale_inv = 1.0
 
-        marker_centers_px = {}
-        for i, marker_id in enumerate(ids):
-            if marker_id in self.CORNER_IDS:
-                marker_centers_px[marker_id] = self.get_marker_center(corners[i])
-        t2 = time.perf_counter()
-
-        if len(marker_centers_px) < 3:
-            return None
-
-        if len(marker_centers_px) == 3:
-            missing_id = list(set(self.CORNER_IDS) - set(marker_centers_px.keys()))[0]
-            order = self.CORNER_IDS
-            idx = order.index(missing_id)
-            prev_id = order[(idx - 1) % 4]
-            next_id = order[(idx + 1) % 4]
-            opposite_id = order[(idx + 2) % 4]
-            if prev_id not in marker_centers_px or next_id not in marker_centers_px or opposite_id not in marker_centers_px:
+            corners, ids, _ = self.detector.detectMarkers(gray_detect)
+            if ids is None:
                 return None
-            A = marker_centers_px[prev_id]
-            B = marker_centers_px[opposite_id]
-            C = marker_centers_px[next_id]
-            marker_centers_px[missing_id] = A + C - B
+            ids = ids.flatten()
 
-        src_pts = []
-        dst_pts = []
-        for mid in self.CORNER_IDS:
-            src_pts.append(marker_centers_px[mid])
-            x_mm, y_mm = self.aruco_world_mm[mid]
-            dst_pts.append(self.mm_to_warp_px(x_mm, y_mm))
-        src_pts = np.array(src_pts, dtype=np.float32)
-        dst_pts = np.array(dst_pts, dtype=np.float32)
+            marker_centers_px = {}
+            for i, marker_id in enumerate(ids):
+                if marker_id in self.CORNER_IDS:
+                    marker_centers_px[marker_id] = self.get_marker_center(corners[i]) * scale_inv
+            t2 = time.perf_counter()
 
-        H, _ = cv2.findHomography(src_pts, dst_pts)
-        if H is None:
-            return None
+            if len(marker_centers_px) < 3:
+                return None
+            if len(marker_centers_px) == 3:
+                missing_id = list(set(self.CORNER_IDS) - set(marker_centers_px.keys()))[0]
+                order = self.CORNER_IDS
+                idx = order.index(missing_id)
+                prev_id = order[(idx - 1) % 4]
+                next_id = order[(idx + 1) % 4]
+                opposite_id = order[(idx + 2) % 4]
+                if prev_id not in marker_centers_px or next_id not in marker_centers_px or opposite_id not in marker_centers_px:
+                    return None
+                A = marker_centers_px[prev_id]
+                B = marker_centers_px[opposite_id]
+                C = marker_centers_px[next_id]
+                marker_centers_px[missing_id] = A + C - B
 
-        warped = cv2.warpPerspective(frame, H, (self.WARP_SIZE_PX, self.WARP_SIZE_PX))
+            src_pts = []
+            dst_pts = []
+            for mid in self.CORNER_IDS:
+                src_pts.append(marker_centers_px[mid])
+                x_mm, y_mm = self.aruco_world_mm[mid]
+                dst_pts.append(self.mm_to_warp_px(x_mm, y_mm))
+            src_pts = np.array(src_pts, dtype=np.float32)
+            dst_pts = np.array(dst_pts, dtype=np.float32)
+
+            H, _ = cv2.findHomography(src_pts, dst_pts)
+            if H is None:
+                return None
+            self._last_H = H
+
+        warped = cv2.warpPerspective(frame, H, (self.WARP_SIZE_PX, self.WARP_SIZE_PX), flags=cv2.INTER_LINEAR)
         hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
         ball = self.find_ball_center(mask)
