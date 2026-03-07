@@ -178,6 +178,35 @@ class VisionControlWorker(QtCore.QObject):
         if self.ball_tracker is not None:
             self.ball_tracker.set_target_mm(self._last_target_x, self._last_target_y)
 
+    @QtCore.pyqtSlot(float, float)
+    def set_trim(self, roll_offset_deg, pitch_offset_deg):
+        self.ball_controller.set_trim(float(roll_offset_deg), float(pitch_offset_deg))
+
+    @QtCore.pyqtSlot(bool)
+    def set_auto_trim_enabled(self, enabled):
+        self.ball_controller.set_auto_trim_enabled(bool(enabled))
+
+    @QtCore.pyqtSlot()
+    def reset_trim(self):
+        self.ball_controller.reset_trim()
+
+    @QtCore.pyqtSlot()
+    def calibrate_new_home(self):
+        self.set_home_calibration(True)
+
+    @QtCore.pyqtSlot(bool)
+    def set_home_calibration(self, enabled):
+        active = bool(enabled)
+        if active:
+            self.ball_controller.set_pd_autotune(False, None)
+            self.ball_controller.start_home_calibration()
+            self._last_target_x = float(BALL_TARGET_DEFAULT_X_MM)
+            self._last_target_y = float(BALL_TARGET_DEFAULT_Y_MM)
+            if self.ball_tracker is not None:
+                self.ball_tracker.set_target_mm(self._last_target_x, self._last_target_y)
+        else:
+            self.ball_controller.cancel_home_calibration()
+
     @QtCore.pyqtSlot()
     def _tick(self):
         if not self._running:
@@ -235,6 +264,8 @@ class VisionControlWorker(QtCore.QObject):
                 timings_ms["trk_warp_gray"] = float(quality.get("warp_gray_mean", 0.0))
                 timings_ms["trk_vmin_eff"] = float(quality.get("vmin_eff", 0.0))
                 timings_ms["trk_aruco_ids"] = float(quality.get("aruco_ids", 0.0))
+                timings_ms["trk_raw_speed_mm_s"] = float(quality.get("raw_speed_mm_s", 0.0))
+                timings_ms["trk_pos_filter_alpha"] = float(quality.get("pos_filter_alpha", 0.0))
                 snapshot = ControlSnapshot(
                     timestamp=time.time(),
                     frame_ts=float((ball_state_dict or {}).get("frame_ts", 0.0)),
@@ -354,6 +385,8 @@ class VisionControlWorker(QtCore.QObject):
             timings_ms["trk_warp_gray"] = quality.get("warp_gray_mean", 0.0)
             timings_ms["trk_vmin_eff"] = quality.get("vmin_eff", 0.0)
             timings_ms["trk_aruco_ids"] = quality.get("aruco_ids", 0.0)
+            timings_ms["trk_raw_speed_mm_s"] = quality.get("raw_speed_mm_s", 0.0)
+            timings_ms["trk_pos_filter_alpha"] = quality.get("pos_filter_alpha", 0.0)
             frame_ts = float(ball_state_dict.get("frame_ts", 0.0))
             if frame_ts > 0:
                 timings_ms["frame_to_worker_ms"] = max(0.0, (time.perf_counter() - frame_ts) * 1000.0)

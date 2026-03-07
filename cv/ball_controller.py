@@ -14,7 +14,9 @@ from stewart_control.config import (
     AUTO_TRIM_MAX_DEG,
     AUTO_TRIM_ERROR_LPF_ALPHA,
     AUTO_TRIM_SETTLE_HOLD_S,
+    AUTO_TRIM_SETTLE_RADIUS_LPF_ALPHA,
     AUTO_TRIM_SETTLE_RADIUS_MM,
+    AUTO_TRIM_SETTLE_SPEED_LPF_ALPHA,
     AUTO_TRIM_SETTLE_SPEED_MM_S,
     AUTO_TRIM_STEP_LIMIT_DEG,
     AUTO_TRIM_TARGET_HOLD_S,
@@ -200,6 +202,8 @@ class BallController:
         self.auto_trim_step_limit_deg = float(AUTO_TRIM_STEP_LIMIT_DEG)
         self.auto_trim_target_hold_s = float(AUTO_TRIM_TARGET_HOLD_S)
         self.auto_trim_error_lpf_alpha = float(AUTO_TRIM_ERROR_LPF_ALPHA)
+        self.auto_trim_settle_speed_lpf_alpha = float(AUTO_TRIM_SETTLE_SPEED_LPF_ALPHA)
+        self.auto_trim_settle_radius_lpf_alpha = float(AUTO_TRIM_SETTLE_RADIUS_LPF_ALPHA)
         self._settled_time_s = 0.0
         self._last_trim_update_time = None
         self._auto_trim_update_count = 0
@@ -211,6 +215,17 @@ class BallController:
         self._target_change_time = None
         self._trim_err_lp_x = 0.0
         self._trim_err_lp_y = 0.0
+        self._settle_speed_lp = 0.0
+        self._settle_radius_lp = 0.0
+        self._settle_lp_initialized = False
+        self._auto_trim_state = "idle"
+        self._auto_trim_target_hold_remaining_s = 0.0
+        self._auto_trim_last_speed_mm_s = 0.0
+        self._auto_trim_last_radius_mm = 0.0
+        self._auto_trim_last_roll_step_deg = 0.0
+        self._auto_trim_last_pitch_step_deg = 0.0
+        self.home_calibration_active = False
+        self._home_calibration_start_ts = 0.0
         
         self.pd_autotune_enabled = bool(PD_AUTOTUNE_ENABLED)
         self.pd_autotune_auto_apply = bool(PD_AUTOTUNE_AUTO_APPLY)
@@ -263,6 +278,11 @@ class BallController:
         self.pitch_offset = float(MANUAL_PITCH_TRIM_DEG)
         self._settled_time_s = 0.0
         self._auto_trim_update_count = 0
+        self._trim_err_lp_x = 0.0
+        self._trim_err_lp_y = 0.0
+        self._settle_speed_lp = 0.0
+        self._settle_radius_lp = 0.0
+        self._settle_lp_initialized = False
 
     def set_trim(self, roll_offset_deg: float, pitch_offset_deg: float):
         self.roll_offset = float(roll_offset_deg)
@@ -270,10 +290,37 @@ class BallController:
 
     def set_auto_trim_enabled(self, enabled: bool):
         self.auto_trim_enabled = bool(enabled)
+        if not self.auto_trim_enabled:
+            self.home_calibration_active = False
+            self._home_calibration_start_ts = 0.0
+
+    def start_home_calibration(self):
+        self.home_calibration_active = True
+        self.auto_trim_enabled = True
+        self.target_x_mm = float(BALL_TARGET_DEFAULT_X_MM)
+        self.target_y_mm = float(BALL_TARGET_DEFAULT_Y_MM)
+        now = time.perf_counter()
+        self._target_change_time = now
+        self._home_calibration_start_ts = now
+        self._settled_time_s = 0.0
+        self._trim_err_lp_x = 0.0
+        self._trim_err_lp_y = 0.0
+        self._settle_speed_lp = 0.0
+        self._settle_radius_lp = 0.0
+        self._settle_lp_initialized = False
+
+    def cancel_home_calibration(self):
+        self.home_calibration_active = False
+        self._home_calibration_start_ts = 0.0
 
     def set_target(self, x_mm: float, y_mm: float):
         self._manual_target_x_mm = float(x_mm)
         self._manual_target_y_mm = float(y_mm)
+        self._settle_lp_initialized = False
+        if abs(self._manual_target_x_mm - BALL_TARGET_DEFAULT_X_MM) > 1e-9 or abs(
+            self._manual_target_y_mm - BALL_TARGET_DEFAULT_Y_MM
+        ) > 1e-9:
+            self.home_calibration_active = False
         self._target_change_time = time.perf_counter()
         if self.pd_autotune_enabled:
             # While autotune is running, interpret slider target as test-center.
@@ -288,6 +335,9 @@ class BallController:
     def set_pd_autotune(self, enabled: bool, auto_apply: bool | None = None):
         prev_enabled = self.pd_autotune_enabled
         self.pd_autotune_enabled = bool(enabled)
+        if self.pd_autotune_enabled:
+            self.home_calibration_active = False
+            self._home_calibration_start_ts = 0.0
         if auto_apply is not None:
             self.pd_autotune_auto_apply = bool(auto_apply)
         if prev_enabled != self.pd_autotune_enabled:
@@ -421,6 +471,23 @@ class BallController:
             "trim_settled_s": self._settled_time_s,
             "trim_updates": self._auto_trim_update_count,
             "auto_trim_enabled": self.auto_trim_enabled,
+            "auto_trim_state": self._auto_trim_state,
+            "auto_trim_target_hold_remaining_s": self._auto_trim_target_hold_remaining_s,
+            "auto_trim_speed_mm_s": self._auto_trim_last_speed_mm_s,
+            "auto_trim_radius_mm": self._auto_trim_last_radius_mm,
+            "auto_trim_speed_lpf_mm_s": self._settle_speed_lp,
+            "auto_trim_radius_lpf_mm": self._settle_radius_lp,
+            "auto_trim_speed_thresh_mm_s": self.auto_trim_settle_speed_mm_s,
+            "auto_trim_radius_thresh_mm": self.auto_trim_settle_radius_mm,
+            "auto_trim_hold_s": self.auto_trim_settle_hold_s,
+            "auto_trim_roll_step_deg": self._auto_trim_last_roll_step_deg,
+            "auto_trim_pitch_step_deg": self._auto_trim_last_pitch_step_deg,
+            "home_calibration_active": self.home_calibration_active,
+            "home_calibration_elapsed_s": (
+                max(0.0, time.perf_counter() - self._home_calibration_start_ts)
+                if self.home_calibration_active and self._home_calibration_start_ts > 0.0
+                else 0.0
+            ),
             "kp": self.kp,
             "kd": self.kd,
             "pd_autotune_enabled": self.pd_autotune_enabled,
@@ -439,8 +506,15 @@ class BallController:
 
     def _update_auto_trim(self, ex, ey, vx, vy):
         now = time.perf_counter()
+        self._auto_trim_last_roll_step_deg = 0.0
+        self._auto_trim_last_pitch_step_deg = 0.0
+        self._auto_trim_target_hold_remaining_s = 0.0
+        self._auto_trim_last_speed_mm_s = float(math.hypot(vx, vy))
+        self._auto_trim_last_radius_mm = float(math.hypot(ex, ey))
+
         if self._last_trim_update_time is None:
             self._last_trim_update_time = now
+            self._auto_trim_state = "init"
             return
 
         dt = max(1e-4, now - self._last_trim_update_time)
@@ -448,21 +522,46 @@ class BallController:
 
         if (not self.auto_trim_enabled) or (not self.enabled):
             self._settled_time_s = 0.0
+            self._settle_lp_initialized = False
+            self._auto_trim_state = "disabled"
             return
 
-        if self._target_change_time is not None and (now - self._target_change_time) < self.auto_trim_target_hold_s:
+        if self._target_change_time is not None:
+            hold_remaining = self.auto_trim_target_hold_s - (now - self._target_change_time)
+            self._auto_trim_target_hold_remaining_s = max(0.0, hold_remaining)
+        if self._auto_trim_target_hold_remaining_s > 0.0:
             self._settled_time_s = 0.0
+            self._settle_lp_initialized = False
+            self._auto_trim_state = "target_hold"
             return
 
         speed = math.hypot(vx, vy)
         radius = math.hypot(ex, ey)
-        settled = (speed <= self.auto_trim_settle_speed_mm_s) and (radius <= self.auto_trim_settle_radius_mm)
+        self._auto_trim_last_speed_mm_s = float(speed)
+        self._auto_trim_last_radius_mm = float(radius)
+
+        if not self._settle_lp_initialized:
+            self._settle_speed_lp = float(speed)
+            self._settle_radius_lp = float(radius)
+            self._settle_lp_initialized = True
+        else:
+            a_speed = self._clamp(self.auto_trim_settle_speed_lpf_alpha, 0.0, 0.999)
+            a_radius = self._clamp(self.auto_trim_settle_radius_lpf_alpha, 0.0, 0.999)
+            self._settle_speed_lp = a_speed * self._settle_speed_lp + (1.0 - a_speed) * speed
+            self._settle_radius_lp = a_radius * self._settle_radius_lp + (1.0 - a_radius) * radius
+
+        settled = (
+            self._settle_speed_lp <= self.auto_trim_settle_speed_mm_s
+            and self._settle_radius_lp <= self.auto_trim_settle_radius_mm
+        )
         if not settled:
             self._settled_time_s = 0.0
+            self._auto_trim_state = "waiting_settle"
             return
 
         self._settled_time_s += dt
         if self._settled_time_s < self.auto_trim_settle_hold_s:
+            self._auto_trim_state = "holding_settle"
             return
 
         alpha = self._clamp(self.auto_trim_error_lpf_alpha, 0.0, 0.999)
@@ -477,7 +576,10 @@ class BallController:
 
         self.roll_offset = self._clamp(self.roll_offset + roll_step, -self.auto_trim_max_deg, self.auto_trim_max_deg)
         self.pitch_offset = self._clamp(self.pitch_offset + pitch_step, -self.auto_trim_max_deg, self.auto_trim_max_deg)
+        self._auto_trim_last_roll_step_deg = float(roll_step)
+        self._auto_trim_last_pitch_step_deg = float(pitch_step)
         self._auto_trim_update_count += 1
+        self._auto_trim_state = "updating"
 
     def _update_pd_autotune(self, x, y, vx, vy):
         if (not self.pd_autotune_enabled) or (not self.enabled):

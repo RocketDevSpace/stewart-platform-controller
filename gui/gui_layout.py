@@ -13,8 +13,11 @@ from PyQt5.QtWidgets import (
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from stewart_control.config import (
+    AUTO_TRIM_ENABLED,
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
+    MANUAL_PITCH_TRIM_DEG,
+    MANUAL_ROLL_TRIM_DEG,
     PD_DEFAULT_KD,
     PD_DEFAULT_KP,
     TRACKER_HSV_H_MAX,
@@ -135,6 +138,16 @@ class StewartGUIView(QWidget):
         self.target_y_slider.setMinimum(-120)
         self.target_y_slider.setMaximum(120)
         self.target_y_slider.setValue(int(round(BALL_TARGET_DEFAULT_Y_MM)))
+        self.trim_roll_label = QLabel(f"Roll Trim (deg): {MANUAL_ROLL_TRIM_DEG:.2f}")
+        self.trim_roll_slider = QSlider(QtCore.Qt.Horizontal)
+        self.trim_roll_slider.setMinimum(-1000)
+        self.trim_roll_slider.setMaximum(1000)
+        self.trim_roll_slider.setValue(int(round(MANUAL_ROLL_TRIM_DEG * 100.0)))
+        self.trim_pitch_label = QLabel(f"Pitch Trim (deg): {MANUAL_PITCH_TRIM_DEG:.2f}")
+        self.trim_pitch_slider = QSlider(QtCore.Qt.Horizontal)
+        self.trim_pitch_slider.setMinimum(-1000)
+        self.trim_pitch_slider.setMaximum(1000)
+        self.trim_pitch_slider.setValue(int(round(MANUAL_PITCH_TRIM_DEG * 100.0)))
         pd_layout.addWidget(self.kp_label)
         pd_layout.addWidget(self.kp_slider)
         pd_layout.addWidget(self.kd_label)
@@ -143,10 +156,22 @@ class StewartGUIView(QWidget):
         pd_layout.addWidget(self.target_x_slider)
         pd_layout.addWidget(self.target_y_label)
         pd_layout.addWidget(self.target_y_slider)
+        pd_layout.addWidget(self.trim_roll_label)
+        pd_layout.addWidget(self.trim_roll_slider)
+        pd_layout.addWidget(self.trim_pitch_label)
+        pd_layout.addWidget(self.trim_pitch_slider)
+        self.auto_trim_btn = QPushButton(
+            "Disable Auto-Home Trim" if AUTO_TRIM_ENABLED else "Enable Auto-Home Trim"
+        )
+        self.calibrate_home_btn = QPushButton("Calibrate New Home")
+        self.reset_trim_btn = QPushButton("Reset Trim To Config")
         self.autotune_enable_btn = QPushButton("Enable PD AutoTune")
         self.autotune_apply_btn = QPushButton("Apply AutoTune Recommendation")
         self.autotune_auto_apply_btn = QPushButton("Start Auto-Apply AutoTune")
         self.autotune_apply_btn.setEnabled(False)
+        pd_layout.addWidget(self.auto_trim_btn)
+        pd_layout.addWidget(self.calibrate_home_btn)
+        pd_layout.addWidget(self.reset_trim_btn)
         pd_layout.addWidget(self.autotune_enable_btn)
         pd_layout.addWidget(self.autotune_apply_btn)
         pd_layout.addWidget(self.autotune_auto_apply_btn)

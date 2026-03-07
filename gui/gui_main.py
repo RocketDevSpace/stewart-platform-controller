@@ -9,6 +9,9 @@ from PyQt5.QtWidgets import QApplication
 
 from stewart_control.comms.serial_sender import SerialSender
 from stewart_control.config import (
+    AUTO_TRIM_ENABLED,
+    BALL_TARGET_DEFAULT_X_MM,
+    BALL_TARGET_DEFAULT_Y_MM,
     CAMERA_INDEX,
     GUI_LOG_MAX_LINES,
     LOG_EVERY_N,
@@ -38,6 +41,10 @@ class StewartGUIController(StewartGUIView):
     vision_gains_updated = pyqtSignal(float, float)
     vision_hsv_updated = pyqtSignal(int, int, int, int, int, int)
     vision_target_updated = pyqtSignal(float, float)
+    vision_trim_updated = pyqtSignal(float, float)
+    vision_auto_trim_enabled = pyqtSignal(bool)
+    vision_trim_reset_requested = pyqtSignal()
+    vision_calibrate_home_set = pyqtSignal(bool)
     vision_pd_autotune_enabled = pyqtSignal(bool)
     vision_pd_autotune_auto_apply = pyqtSignal(bool)
     vision_pd_autotune_apply = pyqtSignal()
@@ -60,6 +67,11 @@ class StewartGUIController(StewartGUIView):
         self._last_neutral_send = 0.0
         self._target_x_mm = float(self.target_x_slider.value())
         self._target_y_mm = float(self.target_y_slider.value())
+        self._trim_roll_deg = self.trim_roll_slider.value() / 100.0
+        self._trim_pitch_deg = self.trim_pitch_slider.value() / 100.0
+        self._auto_trim_enabled = bool(AUTO_TRIM_ENABLED)
+        self._home_calibration_active = False
+        self._last_home_calib_diag_ts = 0.0
 
         self._vision_thread = None
         self._vision_worker = None
@@ -105,6 +117,8 @@ class StewartGUIController(StewartGUIView):
             "trk_warp_gray",
             "trk_vmin_eff",
             "trk_aruco_ids",
+            "trk_raw_speed_mm_s",
+            "trk_pos_filter_alpha",
         ]
         self._timing_colors = {
             "ball_update": "#38bdf8",
@@ -132,6 +146,8 @@ class StewartGUIController(StewartGUIView):
         self._init_signals()
         self._init_routines()
         self._update_autotune_button_state()
+        self._update_auto_trim_button_state()
+        self._update_home_calibrate_button_state()
         self._set_camera_enabled(False)
         self.monitor_window.show()
 
@@ -145,6 +161,8 @@ class StewartGUIController(StewartGUIView):
         self.kd_slider.valueChanged.connect(self.update_pd_gains)
         self.target_x_slider.valueChanged.connect(self._on_target_slider)
         self.target_y_slider.valueChanged.connect(self._on_target_slider)
+        self.trim_roll_slider.valueChanged.connect(self._on_trim_slider)
+        self.trim_pitch_slider.valueChanged.connect(self._on_trim_slider)
         self.send_button.clicked.connect(self.send_to_arduino)
         self.raw_serial_send_btn.clicked.connect(self.send_raw_serial_command)
         self.demo_list.currentIndexChanged.connect(self.on_routine_changed)
@@ -152,6 +170,9 @@ class StewartGUIController(StewartGUIView):
         self.cancel_vision_btn.clicked.connect(self.disable_vision_mode)
         self.cancel_routine_btn.clicked.connect(self.cancel_routine_preview)
         self.open_monitor_button.clicked.connect(self.monitor_window.showNormal)
+        self.auto_trim_btn.clicked.connect(self._toggle_auto_trim)
+        self.calibrate_home_btn.clicked.connect(self._calibrate_new_home)
+        self.reset_trim_btn.clicked.connect(self._reset_trim_to_config)
         self.autotune_enable_btn.clicked.connect(self._toggle_pd_autotune)
         self.autotune_apply_btn.clicked.connect(self._apply_pd_autotune_recommendation)
         self.autotune_auto_apply_btn.clicked.connect(self._toggle_pd_autotune_auto_apply)
@@ -224,9 +245,24 @@ class StewartGUIController(StewartGUIView):
     def _on_target_slider(self, _value):
         self._target_x_mm = float(self.target_x_slider.value())
         self._target_y_mm = float(self.target_y_slider.value())
+        if self._home_calibration_active and (
+            abs(self._target_x_mm - BALL_TARGET_DEFAULT_X_MM) > 1e-9
+            or abs(self._target_y_mm - BALL_TARGET_DEFAULT_Y_MM) > 1e-9
+        ):
+            self._home_calibration_active = False
+            self._update_home_calibrate_button_state()
+            self.vision_calibrate_home_set.emit(False)
+            self._log_preview("[AUTO HOME] calibration cancelled (target moved)")
         self.target_x_label.setText(f"Target X (mm): {int(self._target_x_mm)}")
         self.target_y_label.setText(f"Target Y (mm): {int(self._target_y_mm)}")
         self.vision_target_updated.emit(self._target_x_mm, self._target_y_mm)
+
+    def _on_trim_slider(self, _value):
+        self._trim_roll_deg = self.trim_roll_slider.value() / 100.0
+        self._trim_pitch_deg = self.trim_pitch_slider.value() / 100.0
+        self.trim_roll_label.setText(f"Roll Trim (deg): {self._trim_roll_deg:.2f}")
+        self.trim_pitch_label.setText(f"Pitch Trim (deg): {self._trim_pitch_deg:.2f}")
+        self.vision_trim_updated.emit(self._trim_roll_deg, self._trim_pitch_deg)
 
     def _emit_hsv_values(self):
         values = [self.hsv_controls[k][1].value() for k in ["H Min", "H Max", "S Min", "S Max", "V Min", "V Max"]]
@@ -311,6 +347,64 @@ class StewartGUIController(StewartGUIView):
         self.vision_gains_updated.emit(kp, kd)
         self._pd_autotune_has_suggestion = False
         self._update_autotune_button_state()
+
+    def _update_auto_trim_button_state(self):
+        if self._auto_trim_enabled:
+            self.auto_trim_btn.setText("Disable Auto-Home Trim")
+        else:
+            self.auto_trim_btn.setText("Enable Auto-Home Trim")
+
+    def _update_home_calibrate_button_state(self):
+        if self._home_calibration_active:
+            self.calibrate_home_btn.setText("Calibrating... Click To Cancel")
+        else:
+            self.calibrate_home_btn.setText("Calibrate New Home")
+
+    def _toggle_auto_trim(self):
+        self._auto_trim_enabled = not self._auto_trim_enabled
+        self._update_auto_trim_button_state()
+        self.vision_auto_trim_enabled.emit(self._auto_trim_enabled)
+        self._log_preview(f"[AUTO HOME] auto-trim {'enabled' if self._auto_trim_enabled else 'disabled'}")
+
+    def _reset_trim_to_config(self):
+        self.vision_trim_reset_requested.emit()
+        self._log_preview("[AUTO HOME] trim reset requested (config defaults)")
+
+    def _calibrate_new_home(self):
+        if (not self.vision_enabled) or (self._vision_worker is None):
+            self._log_preview("[AUTO HOME] start vision mode first")
+            return
+
+        if self._home_calibration_active:
+            self._home_calibration_active = False
+            self._update_home_calibrate_button_state()
+            self.vision_calibrate_home_set.emit(False)
+            self._log_preview("[AUTO HOME] calibration cancelled")
+            return
+
+        self._pd_autotune_enabled = False
+        self._pd_autotune_auto_apply = False
+        self._pd_autotune_has_suggestion = False
+        self._update_autotune_button_state()
+        self.vision_pd_autotune_enabled.emit(False)
+        self.vision_pd_autotune_auto_apply.emit(False)
+
+        self._auto_trim_enabled = True
+        self._update_auto_trim_button_state()
+        self.vision_auto_trim_enabled.emit(True)
+
+        tx = int(round(BALL_TARGET_DEFAULT_X_MM))
+        ty = int(round(BALL_TARGET_DEFAULT_Y_MM))
+        if tx != self.target_x_slider.value():
+            self.target_x_slider.setValue(tx)
+        if ty != self.target_y_slider.value():
+            self.target_y_slider.setValue(ty)
+
+        self._home_calibration_active = True
+        self._last_home_calib_diag_ts = 0.0
+        self._update_home_calibrate_button_state()
+        self.vision_calibrate_home_set.emit(True)
+        self._log_preview("[AUTO HOME] calibration started at center target (0,0)")
 
     def _toggle_pd_autotune(self):
         if self._pd_autotune_enabled:
@@ -418,6 +512,39 @@ class StewartGUIController(StewartGUIView):
         self.target_x_label.setText(f"Target X (mm): {tx_val}")
         self.target_y_label.setText(f"Target Y (mm): {ty_val}")
 
+    def _sync_trim_from_terms(self, terms):
+        roll_deg = float(terms.get("roll_offset", self._trim_roll_deg))
+        pitch_deg = float(terms.get("pitch_offset", self._trim_pitch_deg))
+        roll_val = int(round(roll_deg * 100.0))
+        pitch_val = int(round(pitch_deg * 100.0))
+        roll_val = max(self.trim_roll_slider.minimum(), min(self.trim_roll_slider.maximum(), roll_val))
+        pitch_val = max(self.trim_pitch_slider.minimum(), min(self.trim_pitch_slider.maximum(), pitch_val))
+
+        if roll_val != self.trim_roll_slider.value() or pitch_val != self.trim_pitch_slider.value():
+            self.trim_roll_slider.blockSignals(True)
+            self.trim_pitch_slider.blockSignals(True)
+            self.trim_roll_slider.setValue(roll_val)
+            self.trim_pitch_slider.setValue(pitch_val)
+            self.trim_roll_slider.blockSignals(False)
+            self.trim_pitch_slider.blockSignals(False)
+
+        self._trim_roll_deg = roll_val / 100.0
+        self._trim_pitch_deg = pitch_val / 100.0
+        self.trim_roll_label.setText(f"Roll Trim (deg): {self._trim_roll_deg:.2f}")
+        self.trim_pitch_label.setText(f"Pitch Trim (deg): {self._trim_pitch_deg:.2f}")
+
+    def _sync_auto_trim_from_terms(self, terms):
+        enabled = bool(terms.get("auto_trim_enabled", self._auto_trim_enabled))
+        if enabled != self._auto_trim_enabled:
+            self._auto_trim_enabled = enabled
+            self._update_auto_trim_button_state()
+
+    def _sync_home_calibration_from_terms(self, terms):
+        active = bool(terms.get("home_calibration_active", self._home_calibration_active))
+        if active != self._home_calibration_active:
+            self._home_calibration_active = active
+            self._update_home_calibrate_button_state()
+
     def send_raw_serial_command(self):
         cmd = self.raw_serial_input.text().strip()
         if not cmd:
@@ -522,6 +649,8 @@ class StewartGUIController(StewartGUIView):
         if not self.vision_enabled and self._vision_worker is None:
             return
         self.vision_enabled = False
+        self._home_calibration_active = False
+        self._update_home_calibrate_button_state()
         self.cancel_vision_btn.setEnabled(False)
         self.vision_button.setText("Stopping Vision...")
         self._set_camera_enabled(False)
@@ -553,6 +682,10 @@ class StewartGUIController(StewartGUIView):
         self.vision_gains_updated.connect(self._vision_worker.set_gains)
         self.vision_hsv_updated.connect(self._vision_worker.set_hsv)
         self.vision_target_updated.connect(self._vision_worker.set_target)
+        self.vision_trim_updated.connect(self._vision_worker.set_trim)
+        self.vision_auto_trim_enabled.connect(self._vision_worker.set_auto_trim_enabled)
+        self.vision_trim_reset_requested.connect(self._vision_worker.reset_trim)
+        self.vision_calibrate_home_set.connect(self._vision_worker.set_home_calibration)
         self.vision_pd_autotune_enabled.connect(self._vision_worker.set_pd_autotune_enabled)
         self.vision_pd_autotune_auto_apply.connect(self._vision_worker.set_pd_autotune_auto_apply)
         self.vision_pd_autotune_apply.connect(self._vision_worker.apply_pd_autotune_recommendation)
@@ -562,6 +695,9 @@ class StewartGUIController(StewartGUIView):
         self.update_pd_gains()
         self._emit_hsv_values()
         self.vision_target_updated.emit(self._target_x_mm, self._target_y_mm)
+        self.vision_trim_updated.emit(self._trim_roll_deg, self._trim_pitch_deg)
+        self.vision_auto_trim_enabled.emit(self._auto_trim_enabled)
+        self.vision_calibrate_home_set.emit(self._home_calibration_active)
         self.vision_pd_autotune_enabled.emit(self._pd_autotune_enabled)
         self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
 
@@ -579,6 +715,22 @@ class StewartGUIController(StewartGUIView):
             pass
         try:
             self.vision_target_updated.disconnect(self._vision_worker.set_target)
+        except TypeError:
+            pass
+        try:
+            self.vision_trim_updated.disconnect(self._vision_worker.set_trim)
+        except TypeError:
+            pass
+        try:
+            self.vision_auto_trim_enabled.disconnect(self._vision_worker.set_auto_trim_enabled)
+        except TypeError:
+            pass
+        try:
+            self.vision_trim_reset_requested.disconnect(self._vision_worker.reset_trim)
+        except TypeError:
+            pass
+        try:
+            self.vision_calibrate_home_set.disconnect(self._vision_worker.set_home_calibration)
         except TypeError:
             pass
         try:
@@ -618,6 +770,8 @@ class StewartGUIController(StewartGUIView):
         self._vision_starting = False
         self.vision_button.setEnabled(True)
         self.vision_button.setText("Enable Vision Mode")
+        self._home_calibration_active = False
+        self._update_home_calibrate_button_state()
         if not self.preview_mode:
             self._set_pose_sliders_enabled(True)
         self._log_preview("[INFO] Vision mode disabled.")
@@ -690,6 +844,8 @@ class StewartGUIController(StewartGUIView):
                 self._vision_counter += 1
                 if self._vision_counter % LOG_EVERY_N == 0:
                     self._log_preview(f"[TRACK] no ball detected (miss={snapshot.miss_count}) reason={snapshot.reason}")
+                    if self._home_calibration_active:
+                        self._log_preview("[AUTO HOME] paused: tracking invalid, waiting for stable ball detection")
                 return
 
             self._valid_streak += 1
@@ -719,6 +875,9 @@ class StewartGUIController(StewartGUIView):
             self._sync_gain_sliders_from_terms(snapshot.control_terms)
             self._sync_autotune_from_terms(snapshot.control_terms)
             self._sync_target_from_terms(snapshot.control_terms)
+            self._sync_trim_from_terms(snapshot.control_terms)
+            self._sync_auto_trim_from_terms(snapshot.control_terms)
+            self._sync_home_calibration_from_terms(snapshot.control_terms)
             timings["serial_enqueue"] = float(timings.get("cmd_enqueue_worker", 0.0))
             timings["visualizer_gui"] = vis_ms
             timings["frame_to_worker_ms"] = float(timings.get("frame_to_worker_ms", 0.0))
@@ -742,6 +901,28 @@ class StewartGUIController(StewartGUIView):
             if tune_evt:
                 self._log_preview(f"[PD TUNE] {tune_evt.get('message', '')}")
 
+            if self._home_calibration_active:
+                now_diag = time.perf_counter()
+                if (now_diag - self._last_home_calib_diag_ts) >= 0.5:
+                    self._last_home_calib_diag_ts = now_diag
+                    terms = snapshot.control_terms
+                    self._log_preview(
+                        "[AUTO HOME] "
+                        f"state={terms.get('auto_trim_state', 'n/a')} "
+                        f"elapsed={terms.get('home_calibration_elapsed_s', 0.0):.1f}s "
+                        f"target_hold={terms.get('auto_trim_target_hold_remaining_s', 0.0):.2f}s "
+                        f"settled={terms.get('trim_settled_s', 0.0):.2f}/{terms.get('auto_trim_hold_s', 0.0):.2f}s "
+                        f"speed_lp={terms.get('auto_trim_speed_lpf_mm_s', 0.0):.2f}/"
+                        f"{terms.get('auto_trim_speed_thresh_mm_s', 0.0):.2f} "
+                        f"radius_lp={terms.get('auto_trim_radius_lpf_mm', 0.0):.2f}/"
+                        f"{terms.get('auto_trim_radius_thresh_mm', 0.0):.2f} "
+                        f"step=(r{terms.get('auto_trim_roll_step_deg', 0.0):+.4f},"
+                        f"p{terms.get('auto_trim_pitch_step_deg', 0.0):+.4f}) "
+                        f"trim=(r{terms.get('roll_offset', 0.0):+.3f},p{terms.get('pitch_offset', 0.0):+.3f}) "
+                        f"trk_raw_speed={timings.get('trk_raw_speed_mm_s', 0.0):.2f} "
+                        f"trk_pos_alpha={timings.get('trk_pos_filter_alpha', 0.0):.3f}"
+                    )
+
             if self._vision_counter % LOG_EVERY_N == 0:
                 bs = snapshot.ball_state
                 terms = snapshot.control_terms
@@ -764,6 +945,7 @@ class StewartGUIController(StewartGUIView):
                     f"cmd_age={timings.get('frame_to_cmd', 0.0):.1f}ms "
                     f"w2g={timings.get('worker_to_gui_ms', 0.0):.1f}ms "
                     f"trim=(r{terms.get('roll_offset', 0.0):.3f},p{terms.get('pitch_offset', 0.0):.3f}) "
+                    f"trim_state={terms.get('auto_trim_state', 'n/a')} "
                     f"settled={terms.get('trim_settled_s', 0.0):.2f}s "
                     f"rad={snapshot.timings_ms.get('trk_radius_px', 0.0):.1f}px "
                     f"area={snapshot.timings_ms.get('trk_area', 0.0):.0f} "
@@ -827,6 +1009,8 @@ class StewartGUIController(StewartGUIView):
                 f"wgray={trk['trk_warp_gray']:.1f} "
                 f"vmin_eff={trk['trk_vmin_eff']:.1f} "
                 f"ids={trk['trk_aruco_ids']:.1f} "
+                f"raw_speed={trk['trk_raw_speed_mm_s']:.2f} "
+                f"pos_alpha={trk['trk_pos_filter_alpha']:.3f} "
                 f"dt={trk['trk_dt_s']*1000.0:.1f}ms"
             )
 

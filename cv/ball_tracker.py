@@ -9,13 +9,19 @@ from stewart_control.config import (
     CAMERA_ALLOW_FALLBACK_RESOLUTION,
     CAMERA_AUTO_EXPOSURE,
     CAMERA_EXPOSURE,
-    CAMERA_EXPOSURE_TUNE_ENABLED,
     CAMERA_FALLBACK_HEIGHT,
     CAMERA_FALLBACK_WIDTH,
     CAMERA_FORCE_BACKEND,
     CAMERA_GAIN,
     CAMERA_BUFFER_SIZE,
     CAMERA_HEIGHT,
+    CAMERA_RUNTIME_ADAPTIVE,
+    CAMERA_RUNTIME_CHECK_S,
+    CAMERA_RUNTIME_MAX_PERIOD_MS,
+    CAMERA_RUNTIME_MIN_GRAY,
+    CAMERA_RUNTIME_SOFT_GAIN_MAX,
+    CAMERA_RUNTIME_TARGET_GRAY,
+    CAMERA_RUNTIME_WARMUP_S,
     CAMERA_TARGET_FPS,
     CAMERA_WIDTH,
     DEBUG_LEVEL,
@@ -23,10 +29,15 @@ from stewart_control.config import (
     TRACKER_ARUCO_DETECT_SCALE,
     TRACKER_ARUCO_REDETECT_EVERY_N,
     TRACKER_MAX_SPEED_MM_S,
+    TRACKER_POS_FILTER_ALPHA_FAST,
+    TRACKER_POS_FILTER_ALPHA_SLOW,
+    TRACKER_POS_FILTER_ENABLED,
+    TRACKER_POS_FILTER_SPEED_MM_S,
     TRACKER_MIN_CIRCULARITY,
     TRACKER_MIN_CONTOUR_AREA,
     TRACKER_MIN_FILL_RATIO,
     TRACKER_MIN_RADIUS_PX,
+    TRACKER_ARUCO_CENTER_FILTER_ALPHA,
     TRACKER_MAX_ARUCO_HOLD_FRAMES,
     TRACKER_WARP_SIZE_PX,
     TRACKER_HSV_H_MAX,
@@ -54,6 +65,11 @@ class BallTracker:
         max_speed_mm_s=TRACKER_MAX_SPEED_MM_S,
         min_circularity=TRACKER_MIN_CIRCULARITY,
         min_fill_ratio=TRACKER_MIN_FILL_RATIO,
+        aruco_center_filter_alpha=TRACKER_ARUCO_CENTER_FILTER_ALPHA,
+        pos_filter_enabled=TRACKER_POS_FILTER_ENABLED,
+        pos_filter_alpha_slow=TRACKER_POS_FILTER_ALPHA_SLOW,
+        pos_filter_alpha_fast=TRACKER_POS_FILTER_ALPHA_FAST,
+        pos_filter_speed_mm_s=TRACKER_POS_FILTER_SPEED_MM_S,
         debug_level=DEBUG_LEVEL,
         log_every_n=LOG_EVERY_N,
     ):
@@ -74,6 +90,11 @@ class BallTracker:
         self.min_fill_ratio = float(min_fill_ratio)
         self.aruco_detect_scale = float(aruco_detect_scale)
         self.aruco_redetect_every_n = max(1, int(aruco_redetect_every_n))
+        self.aruco_center_filter_alpha = float(np.clip(aruco_center_filter_alpha, 0.0, 0.98))
+        self.pos_filter_enabled = bool(pos_filter_enabled)
+        self.pos_filter_alpha_slow = float(np.clip(pos_filter_alpha_slow, 0.0, 0.98))
+        self.pos_filter_alpha_fast = float(np.clip(pos_filter_alpha_fast, 0.0, 0.98))
+        self.pos_filter_speed_mm_s = max(1.0, float(pos_filter_speed_mm_s))
         self.debug_level = debug_level
         self.log_every_n = max(1, int(log_every_n))
         self._log_counter = 0
@@ -81,6 +102,7 @@ class BallTracker:
         self._last_H = None
         self._aruco_hold_count = 0
         self._aruco_fail_streak = 0
+        self._marker_centers_lp = {}
 
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
@@ -108,6 +130,7 @@ class BallTracker:
         self._latest_frame = None
         self._latest_frame_ts = 0.0
         self._capture_period_ms = 0.0
+        self._capture_gray_mean = 0.0
         self._prev_capture_ts = 0.0
         self._slow_capture_streak = 0
         self._capture_fail_streak = 0
@@ -116,15 +139,23 @@ class BallTracker:
         self._runtime_profile_attempts = 0
         self._runtime_recovery_disabled = False
         self._last_runtime_reopen_ts = 0.0
+        self._capture_start_ts = time.perf_counter()
+        self._last_runtime_policy_ts = 0.0
+        self._last_runtime_mode_change_ts = 0.0
+        self._runtime_policy_state = "bootstrap_auto"
+        self._runtime_manual_exp = None
+        self._software_brightness_gain = 1.0
         self.camera_index = int(camera_index)
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
         self._last_processed_frame_ts = 0.0
 
         self.prev_ball_mm = None
+        self.prev_ball_raw_mm = None
         self.prev_time = None
         self.vx_smooth = 0.0
         self.vy_smooth = 0.0
+        self._last_pos_filter_alpha = self.pos_filter_alpha_fast
         self.hsv_lower = np.array([TRACKER_HSV_H_MIN, TRACKER_HSV_S_MIN, TRACKER_HSV_V_MIN], dtype=np.uint8)
         self.hsv_upper = np.array([TRACKER_HSV_H_MAX, TRACKER_HSV_S_MAX, TRACKER_HSV_V_MAX], dtype=np.uint8)
         self.target_x_mm = float(BALL_TARGET_DEFAULT_X_MM)
@@ -133,6 +164,8 @@ class BallTracker:
         self.last_profile_ms = {
             "frame_age": 0.0,
             "capture_period": 0.0,
+            "capture_gray": 0.0,
+            "sw_gain": 1.0,
         }
 
     @staticmethod
@@ -201,17 +234,18 @@ class BallTracker:
             msg += f" {extra}"
         print(msg)
 
-    def _configure_camera(self, cap):
+    def _configure_camera(self, cap, force_auto=False):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
+        use_auto = bool(CAMERA_AUTO_EXPOSURE) or bool(force_auto)
         try:
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if CAMERA_AUTO_EXPOSURE else 0.25)
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if use_auto else 0.25)
         except Exception:
             pass
-        if not CAMERA_AUTO_EXPOSURE:
+        if not use_auto:
             self._apply_manual_exposure(cap, float(CAMERA_EXPOSURE), settle_reads=2)
         try:
             cap.set(cv2.CAP_PROP_GAIN, float(CAMERA_GAIN))
@@ -297,54 +331,6 @@ class BallTracker:
             return period_ms, gray_mean, details
         return period_ms, gray_mean
 
-    def _retune_manual_exposure(self, cap, base_period, base_gray):
-        # Some webcams ignore requested manual exposure exactly. If startup is too dark,
-        # probe nearby values and pick the brightest mode that keeps cadence acceptable.
-        if CAMERA_AUTO_EXPOSURE:
-            return base_period, base_gray
-        if not CAMERA_EXPOSURE_TUNE_ENABLED:
-            return base_period, base_gray
-        if base_gray >= 22.0:
-            return base_period, base_gray
-
-        base_exp = float(CAMERA_EXPOSURE)
-        candidates = [base_exp, base_exp - 1.0, base_exp - 2.0, base_exp + 1.0, base_exp + 2.0]
-        seen = set()
-        probes = []
-        for exp in candidates:
-            if exp in seen:
-                continue
-            seen.add(exp)
-            try:
-                self._apply_manual_exposure(cap, exp, settle_reads=2)
-            except Exception:
-                pass
-            p_try, g_try = self._measure_camera_stats(cap, samples=4, warmup=1)
-            probes.append((p_try, g_try, exp))
-        if not probes:
-            return base_period, base_gray
-
-        # Speed-first selection: choose fastest cadence, then brightest among near-fastest.
-        fastest = min(t[0] for t in probes)
-        near_fast = [t for t in probes if t[0] <= (fastest + 12.0)]
-        p_best, g_best, exp_best = max(near_fast, key=lambda t: t[1])
-
-        # If everything is still very dark, try auto exposure but only accept if cadence stays reasonable.
-        if g_best < 20.0:
-            p_auto, g_auto = base_period, base_gray
-            try:
-                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-                p_auto, g_auto = self._measure_camera_stats(cap, samples=4, warmup=2)
-            except Exception:
-                pass
-            if p_auto <= max(55.0, p_best + 10.0) and g_auto >= g_best + 8.0:
-                return p_auto, g_auto
-        try:
-            self._apply_manual_exposure(cap, exp_best, settle_reads=2)
-        except Exception:
-            pass
-        return p_best, g_best
-
     def _open_best_camera(self, camera_index):
         if CAMERA_FORCE_BACKEND.upper() == "DSHOW":
             backends = [cv2.CAP_DSHOW]
@@ -365,8 +351,16 @@ class BallTracker:
                 "[CAMERA] startup config "
                 f"target={CAMERA_WIDTH}x{CAMERA_HEIGHT}@{CAMERA_TARGET_FPS} "
                 f"forced_backend={CAMERA_FORCE_BACKEND} "
-                f"manual={'no' if CAMERA_AUTO_EXPOSURE else 'yes'} "
-                f"exp={float(CAMERA_EXPOSURE):.2f} gain={float(CAMERA_GAIN):.2f}"
+                f"bootstrap_auto=yes steady_pref_auto={'yes' if CAMERA_AUTO_EXPOSURE else 'no'} "
+                f"manual_exp={float(CAMERA_EXPOSURE):.2f} gain={float(CAMERA_GAIN):.2f}"
+            )
+            print(
+                "[CAMERA] runtime adapt "
+                f"enabled={'yes' if CAMERA_RUNTIME_ADAPTIVE else 'no'} "
+                f"warmup={float(CAMERA_RUNTIME_WARMUP_S):.1f}s "
+                f"check={float(CAMERA_RUNTIME_CHECK_S):.1f}s "
+                f"max_period={float(CAMERA_RUNTIME_MAX_PERIOD_MS):.1f}ms "
+                f"min_gray={float(CAMERA_RUNTIME_MIN_GRAY):.1f}"
             )
 
         for backend in backends:
@@ -381,55 +375,16 @@ class BallTracker:
                     backend_name,
                     self._camera_props_snapshot(cap),
                 )
-            self._configure_camera(cap)
+            # Always bootstrap with auto-exposure first for robust startup.
+            self._configure_camera(cap, force_auto=True)
             if self.debug_level >= 1:
                 self._log_camera_probe(
                     "configured",
                     backend_name,
                     self._camera_props_snapshot(cap),
                 )
-            if not CAMERA_AUTO_EXPOSURE and not CAMERA_EXPOSURE_TUNE_ENABLED:
-                # Hard-lock configured manual exposure before measuring.
-                set_result = self._apply_manual_exposure(cap, float(CAMERA_EXPOSURE), settle_reads=4)
-                if self.debug_level >= 1:
-                    self._log_camera_probe(
-                        "manual_lock",
-                        backend_name,
-                        self._camera_props_snapshot(cap),
-                        extra=(
-                            f"set_ok(auto={int(set_result.get('auto_set_ok', False))},"
-                            f"exp1={int(set_result.get('exp_set_ok_1', False))},"
-                            f"exp2={int(set_result.get('exp_set_ok_2', False))})"
-                        ),
-                    )
-                if self.debug_level >= 1:
-                    probe_exps = [float(CAMERA_EXPOSURE), -4.0, -5.0, -6.0]
-                    seen = set()
-                    for probe_exp in probe_exps:
-                        if probe_exp in seen:
-                            continue
-                        seen.add(probe_exp)
-                        probe_result = self._apply_manual_exposure(cap, probe_exp, settle_reads=2)
-                        p_probe, g_probe, d_probe = self._measure_camera_stats(
-                            cap, samples=4, warmup=1, with_details=True
-                        )
-                        self._log_camera_probe(
-                            "manual_probe",
-                            backend_name,
-                            self._camera_props_snapshot(cap),
-                            period_ms=p_probe,
-                            gray_mean=g_probe,
-                            details=d_probe,
-                            extra=(
-                                f"requested_exp={probe_exp:.2f} "
-                                f"set_ok(auto={int(probe_result.get('auto_set_ok', False))},"
-                                f"exp1={int(probe_result.get('exp_set_ok_1', False))},"
-                                f"exp2={int(probe_result.get('exp_set_ok_2', False))})"
-                            ),
-                        )
-                    self._apply_manual_exposure(cap, float(CAMERA_EXPOSURE), settle_reads=2)
             period, gray_mean, details = self._measure_camera_stats(
-                cap, samples=6, warmup=2, with_details=True
+                cap, samples=8, warmup=2, with_details=True
             )
             mode = f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}"
             if self.debug_level >= 1:
@@ -442,39 +397,10 @@ class BallTracker:
                     details=details,
                 )
 
-            period, gray_mean = self._retune_manual_exposure(cap, period, gray_mean)
-
-            # If period is too slow, try a small manual-exposure sweep and keep
-            # the fastest setting that is still bright enough for detection.
-            # This recovery runs even when auto-exposure is configured, because
-            # some webcams drop to ~10 FPS under auto exposure in dim scenes.
-            if period > 45.0 and CAMERA_AUTO_EXPOSURE:
-                tuned = []
-                for exp in (-4.0, -5.0, -6.0):
-                    try:
-                        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                        cap.set(cv2.CAP_PROP_EXPOSURE, exp)
-                    except Exception:
-                        pass
-                    p_try, g_try = self._measure_camera_stats(cap, samples=10)
-                    tuned.append((p_try, g_try, exp))
-                if tuned:
-                    bright_candidates = [t for t in tuned if t[1] >= 25.0]
-                    if bright_candidates:
-                        p_best, g_best, exp_best = min(bright_candidates, key=lambda t: t[0])
-                    else:
-                        p_best, g_best, exp_best = min(tuned, key=lambda t: t[0])
-                    period, gray_mean = p_best, g_best
-                    try:
-                        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                        cap.set(cv2.CAP_PROP_EXPOSURE, exp_best)
-                    except Exception:
-                        pass
-
             # Keep image-quality-first defaults; only downshift resolution if explicitly enabled.
             if CAMERA_ALLOW_FALLBACK_RESOLUTION and period > 45.0:
                 self._configure_camera_fallback(cap)
-                period_fallback, gray_fallback = self._measure_camera_stats(cap, samples=4)
+                period_fallback, gray_fallback = self._measure_camera_stats(cap, samples=4, warmup=1)
                 if period_fallback < period:
                     period = period_fallback
                     gray_mean = gray_fallback
@@ -495,6 +421,10 @@ class BallTracker:
             self.camera_measured_period_ms = float(best_period)
             self.camera_mode = best_mode
             self.camera_gray_mean = float(best_gray)
+            self._runtime_policy_state = "bootstrap_auto"
+            self._runtime_manual_exp = None
+            self._software_brightness_gain = 1.0
+            self._last_runtime_mode_change_ts = time.perf_counter()
         if best_cap is not None and self.debug_level >= 1:
             print(
                 f"[CAMERA] Selected backend={self.camera_backend} "
@@ -522,10 +452,9 @@ class BallTracker:
             if not ret:
                 self._capture_fail_streak += 1
                 self._slow_capture_streak = min(self._slow_capture_streak + 1, 1000)
-                # Only recover on sustained hard failures; avoid period-thrash recovery.
                 if (
                     (not self._runtime_recovery_disabled)
-                    and self._capture_fail_streak >= 90
+                    and self._capture_fail_streak >= 120
                     and (time.perf_counter() - self._last_runtime_reopen_ts) > 8.0
                 ):
                     self._last_runtime_reopen_ts = time.perf_counter()
@@ -535,149 +464,208 @@ class BallTracker:
                 continue
             self._capture_fail_streak = 0
             now = time.perf_counter()
+            dt_ms = 0.0
             if self._prev_capture_ts > 0:
                 dt_ms = (now - self._prev_capture_ts) * 1000.0
-                # Keep slow-streak telemetry, but do not auto-reopen based on period.
-                slow_now = (dt_ms > 90.0) or (
-                    self._capture_period_ms > 90.0 and self._capture_period_ms > 0.0
-                )
+                slow_now = dt_ms > (CAMERA_RUNTIME_MAX_PERIOD_MS * 2.0)
                 if slow_now:
                     self._slow_capture_streak += 1
                 else:
                     self._slow_capture_streak = max(0, self._slow_capture_streak - 1)
+            gray_sample = float(np.mean(frame[:, :, 1]))
             with self._capture_lock:
                 self._latest_frame = frame
                 if self._prev_capture_ts > 0:
                     self._capture_period_ms = 0.9 * self._capture_period_ms + 0.1 * dt_ms if self._capture_period_ms > 0 else dt_ms
+                self._capture_gray_mean = (
+                    0.92 * self._capture_gray_mean + 0.08 * gray_sample
+                    if self._capture_gray_mean > 0
+                    else gray_sample
+                )
                 self._prev_capture_ts = now
                 self._latest_frame_ts = now
+            self._evaluate_runtime_camera_policy(now)
 
-    def _apply_runtime_speed_profile(self):
-        # Force a stable low-latency mode if runtime capture drifts.
-        if self._runtime_recovery_disabled:
-            return
-        now = time.perf_counter()
-        if (now - self._last_runtime_profile_apply_ts) < 1.5:
-            return
-        self._last_runtime_profile_apply_ts = now
-        self._runtime_profile_attempts += 1
+    def _set_auto_exposure_mode(self):
         try:
-            prev_period = float(self._capture_period_ms) if self._capture_period_ms > 0 else 0.0
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            self.cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
-            # Preserve configured exposure policy; do not force brighter exposure
-            # at runtime because that destabilizes HSV thresholds.
-            if CAMERA_AUTO_EXPOSURE:
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-            else:
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                self.cap.set(cv2.CAP_PROP_EXPOSURE, float(CAMERA_EXPOSURE))
-            # Let camera settle before measuring.
-            for _ in range(5):
-                self.cap.read()
-            p_ms, g_mean = self._measure_camera_stats(self.cap, samples=10)
-            # Revert if runtime profile made capture worse.
-            if prev_period > 0.0 and p_ms > (prev_period + 12.0):
-                self._configure_camera(self.cap)
-                p_ms2, g_mean2 = self._measure_camera_stats(self.cap, samples=8)
-                p_ms, g_mean = p_ms2, g_mean2
-            self._runtime_speed_profile_applied = True
-            if self.debug_level >= 1:
-                print(
-                    "[CAMERA] Runtime speed profile enabled "
-                    f"(fps_target={CAMERA_TARGET_FPS}, auto_exp={CAMERA_AUTO_EXPOSURE}, exp={float(CAMERA_EXPOSURE):.1f}, "
-                    f"period~{p_ms:.1f}ms, gray={g_mean:.1f}, tries={self._runtime_profile_attempts})"
-                )
-            # If runtime profile keeps landing in ~10 FPS territory, stop trying.
-            if p_ms > 90.0 and self._runtime_profile_attempts >= 2:
-                self._runtime_recovery_disabled = True
-                if self.debug_level >= 1:
-                    print("[CAMERA] Runtime recovery disabled (unstable profile); keeping current stream.")
-                return
-            if p_ms > 95.0:
-                self._reopen_camera_runtime_profile()
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
         except Exception:
             pass
+        try:
+            self.cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
+        except Exception:
+            pass
+        p_ms, g_mean = self._measure_camera_stats(self.cap, samples=4, warmup=1)
+        self._runtime_policy_state = "auto"
+        self._runtime_manual_exp = None
+        self._last_runtime_mode_change_ts = time.perf_counter()
+        return p_ms, g_mean
+
+    def _set_manual_exposure_mode(self, exposure_value):
+        set_result = self._apply_manual_exposure(self.cap, float(exposure_value), settle_reads=2)
+        p_ms, g_mean = self._measure_camera_stats(self.cap, samples=4, warmup=1)
+        self._runtime_policy_state = "manual"
+        self._runtime_manual_exp = float(exposure_value)
+        self._last_runtime_mode_change_ts = time.perf_counter()
+        return p_ms, g_mean, set_result
+
+    def _probe_manual_exposure_candidates(self, candidates):
+        probe_results = []
+        for exp in candidates:
+            p_ms, g_mean, set_result = self._set_manual_exposure_mode(exp)
+            probe_results.append((float(p_ms), float(g_mean), float(exp), set_result))
+            if self.debug_level >= 1:
+                self._log_camera_probe(
+                    "runtime_probe",
+                    getattr(self, "camera_backend", "unknown"),
+                    self._camera_props_snapshot(self.cap),
+                    period_ms=p_ms,
+                    gray_mean=g_mean,
+                    extra=(
+                        f"requested_exp={float(exp):.2f} "
+                        f"set_ok(auto={int(set_result.get('auto_set_ok', False))},"
+                        f"exp1={int(set_result.get('exp_set_ok_1', False))},"
+                        f"exp2={int(set_result.get('exp_set_ok_2', False))})"
+                    ),
+                )
+        if not probe_results:
+            return None
+
+        max_period = float(CAMERA_RUNTIME_MAX_PERIOD_MS)
+        min_gray = float(CAMERA_RUNTIME_MIN_GRAY)
+        acceptable = [r for r in probe_results if r[0] <= (max_period + 2.0) and r[1] >= min_gray]
+        if acceptable:
+            fastest = min(r[0] for r in acceptable)
+            near_fast = [r for r in acceptable if r[0] <= (fastest + 6.0)]
+            best = max(near_fast, key=lambda r: r[1])
+        else:
+            bright_enough = [r for r in probe_results if r[1] >= max(15.0, min_gray - 10.0)]
+            if bright_enough:
+                best = min(bright_enough, key=lambda r: r[0])
+            else:
+                best = min(probe_results, key=lambda r: r[0])
+
+        self._set_manual_exposure_mode(best[2])
+        return best
+
+    def _update_software_gain(self, gray_level):
+        target_gray = float(CAMERA_RUNTIME_TARGET_GRAY)
+        max_gain = float(CAMERA_RUNTIME_SOFT_GAIN_MAX)
+        if gray_level <= 0.5:
+            desired_gain = max_gain
+        elif gray_level < target_gray:
+            desired_gain = min(max_gain, max(1.0, target_gray / gray_level))
+        else:
+            desired_gain = 1.0
+        self._software_brightness_gain = 0.85 * self._software_brightness_gain + 0.15 * desired_gain
+
+    def _evaluate_runtime_camera_policy(self, now):
+        if not CAMERA_RUNTIME_ADAPTIVE or self._runtime_recovery_disabled:
+            return
+        if (now - self._capture_start_ts) < float(CAMERA_RUNTIME_WARMUP_S):
+            return
+        if (now - self._last_runtime_policy_ts) < float(CAMERA_RUNTIME_CHECK_S):
+            return
+        self._last_runtime_policy_ts = now
+        self._runtime_profile_attempts += 1
+
+        period_ms = float(self._capture_period_ms) if self._capture_period_ms > 0 else float(self.camera_measured_period_ms)
+        gray_mean = float(self._capture_gray_mean) if self._capture_gray_mean > 0 else float(getattr(self, "camera_gray_mean", 0.0))
+        max_period = float(CAMERA_RUNTIME_MAX_PERIOD_MS)
+        min_gray = float(CAMERA_RUNTIME_MIN_GRAY)
+
+        if self.debug_level >= 1:
+            print(
+                "[CAMERA] runtime policy "
+                f"state={self._runtime_policy_state} period={period_ms:.1f}ms gray={gray_mean:.1f} "
+                f"sw_gain={self._software_brightness_gain:.2f} attempts={self._runtime_profile_attempts}"
+            )
+
+        changed = False
+        if period_ms > max_period + 2.0 and (now - self._last_runtime_mode_change_ts) > 2.5:
+            candidates = [float(CAMERA_EXPOSURE), -4.0, -5.0, -6.0]
+            if self._runtime_manual_exp is not None:
+                candidates = [self._runtime_manual_exp] + candidates
+            seen = set()
+            ordered = []
+            for c in candidates:
+                if c in seen:
+                    continue
+                seen.add(c)
+                ordered.append(c)
+            best = self._probe_manual_exposure_candidates(ordered)
+            if best is not None and self.debug_level >= 1:
+                print(
+                    "[CAMERA] runtime policy selected manual "
+                    f"exp={best[2]:.2f} period~{best[0]:.1f}ms gray={best[1]:.1f}"
+                )
+                changed = True
+        elif gray_mean < min_gray and (now - self._last_runtime_mode_change_ts) > 2.5:
+            # If cadence is acceptable but image is dark, prefer brighter manual exposure first.
+            if self._runtime_policy_state != "manual":
+                base = float(CAMERA_EXPOSURE)
+                bright_candidates = [base, -4.0, -3.0, -5.0]
+                seen = set()
+                ordered = []
+                for c in bright_candidates:
+                    if c in seen:
+                        continue
+                    seen.add(c)
+                    ordered.append(c)
+                best = self._probe_manual_exposure_candidates(ordered)
+                if best is not None and self.debug_level >= 1:
+                    print(
+                        "[CAMERA] runtime policy brightened manual "
+                        f"exp={best[2]:.2f} period~{best[0]:.1f}ms gray={best[1]:.1f}"
+                    )
+                    changed = True
+
+        self._update_software_gain(gray_mean)
+        if changed:
+            self._runtime_speed_profile_applied = True
+            self.camera_gray_mean = gray_mean
 
     def _reopen_camera_runtime_profile(self):
         if self._runtime_recovery_disabled:
             return
         forced = str(CAMERA_FORCE_BACKEND).upper()
         if forced == "DSHOW":
-            backend_order = [cv2.CAP_DSHOW]
+            backend = cv2.CAP_DSHOW
         elif forced == "MSMF":
-            backend_order = [cv2.CAP_MSMF]
+            backend = cv2.CAP_MSMF
         elif forced == "ANY":
-            backend_order = [cv2.CAP_ANY]
+            backend = cv2.CAP_ANY
         else:
             b = str(getattr(self, "camera_backend", "")).upper()
-            if b == "DSHOW":
-                backend_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
-            elif b == "MSMF":
-                backend_order = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
-            else:
-                backend_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+            backend = cv2.CAP_DSHOW if b == "DSHOW" else cv2.CAP_ANY
 
-        best_cap = None
-        best_period = 1e9
-        best_backend = None
-        best_gray = 0.0
-        for backend in backend_order:
-            cap = cv2.VideoCapture(self.camera_index, backend)
-            if not cap.isOpened():
-                cap.release()
-                continue
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
-            try:
-                if CAMERA_AUTO_EXPOSURE:
-                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-                else:
-                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                    cap.set(cv2.CAP_PROP_EXPOSURE, float(CAMERA_EXPOSURE))
-            except Exception:
-                pass
-            p_ms, g_mean = self._measure_camera_stats(cap, samples=10)
-            if p_ms < best_period:
-                if best_cap is not None:
-                    best_cap.release()
-                best_cap = cap
-                best_period = p_ms
-                best_backend = backend
-                best_gray = g_mean
-            else:
-                cap.release()
-
-        if best_cap is not None:
-            if best_period > 90.0 and self.camera_measured_period_ms > 0 and self.camera_measured_period_ms < 60.0:
-                # Do not swap into a clearly worse mode than the startup-selected stream.
-                best_cap.release()
-                self._runtime_recovery_disabled = True
-                if self.debug_level >= 1:
-                    print(
-                        "[CAMERA] Runtime reopen rejected (would degrade to ~10 FPS); recovery disabled."
-                    )
-                return
-            old = self.cap
-            self.cap = best_cap
-            self.camera_backend = self._backend_name(best_backend)
-            self.camera_measured_period_ms = float(best_period)
-            self.camera_gray_mean = float(best_gray)
-            self._capture_period_ms = best_period
-            self._prev_capture_ts = 0.0
-            try:
-                old.release()
-            except Exception:
-                pass
-            if self.debug_level >= 1:
-                print(
-                    "[CAMERA] Runtime reopen selected "
-                    f"backend={self.camera_backend} period~{best_period:.1f}ms gray={best_gray:.1f}"
-                )
+        cap = cv2.VideoCapture(self.camera_index, backend)
+        if not cap.isOpened():
+            cap.release()
+            return
+        self._configure_camera(cap, force_auto=True)
+        p_ms, g_mean = self._measure_camera_stats(cap, samples=6, warmup=1)
+        old = self.cap
+        self.cap = cap
+        self.camera_backend = self._backend_name(backend)
+        self.camera_measured_period_ms = float(p_ms)
+        self.camera_gray_mean = float(g_mean)
+        self._capture_period_ms = p_ms
+        self._capture_gray_mean = g_mean
+        self._prev_capture_ts = 0.0
+        self._runtime_policy_state = "bootstrap_auto"
+        self._runtime_manual_exp = None
+        self._last_runtime_mode_change_ts = time.perf_counter()
+        try:
+            old.release()
+        except Exception:
+            pass
+        if self.debug_level >= 1:
+            print(
+                "[CAMERA] Runtime reopen selected "
+                f"backend={self.camera_backend} period~{p_ms:.1f}ms gray={g_mean:.1f}"
+            )
 
     def set_pd_gains(self, kp, kd):
         self.pd_kp = float(kp)
@@ -732,9 +720,35 @@ class BallTracker:
 
     def reset_motion_state(self):
         self.prev_ball_mm = None
+        self.prev_ball_raw_mm = None
         self.prev_time = None
         self.vx_smooth = 0.0
         self.vy_smooth = 0.0
+        self._last_pos_filter_alpha = self.pos_filter_alpha_fast
+
+    def _filter_marker_center(self, marker_id, center_px):
+        current = np.asarray(center_px, dtype=np.float32)
+        prev = self._marker_centers_lp.get(int(marker_id))
+        if prev is None:
+            filt = current
+        else:
+            if float(np.hypot(*(current - prev))) > 40.0:
+                # Sudden jump (camera reopen/reposition): avoid dragging stale history.
+                filt = current
+            else:
+                alpha = self.aruco_center_filter_alpha
+                filt = alpha * prev + (1.0 - alpha) * current
+        self._marker_centers_lp[int(marker_id)] = filt
+        return filt
+
+    def _apply_software_brightness(self, frame):
+        gain = float(self._software_brightness_gain)
+        if gain <= 1.02:
+            return frame
+        try:
+            return cv2.convertScaleAbs(frame, alpha=gain, beta=0)
+        except Exception:
+            return frame
 
     def _draw_vectors(self, warped, bx, by, vx, vy, x_mm, y_mm):
         center_px = (self.WARP_SIZE_PX // 2, self.WARP_SIZE_PX // 2)
@@ -773,6 +787,8 @@ class BallTracker:
             self.last_profile_ms = {
                 "frame_age": 0.0,
                 "capture_period": self._capture_period_ms,
+                "capture_gray": self._capture_gray_mean,
+                "sw_gain": float(self._software_brightness_gain),
                 "slow_streak": float(self._slow_capture_streak),
                 "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
                 "runtime_profile_tries": float(self._runtime_profile_attempts),
@@ -783,6 +799,8 @@ class BallTracker:
             self.last_profile_ms = {
                 "frame_age": 0.0,
                 "capture_period": self._capture_period_ms,
+                "capture_gray": self._capture_gray_mean,
+                "sw_gain": float(self._software_brightness_gain),
                 "slow_streak": float(self._slow_capture_streak),
                 "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
                 "runtime_profile_tries": float(self._runtime_profile_attempts),
@@ -794,6 +812,8 @@ class BallTracker:
         self.last_profile_ms = {
             "frame_age": frame_age_ms,
             "capture_period": self._capture_period_ms,
+            "capture_gray": self._capture_gray_mean,
+            "sw_gain": float(self._software_brightness_gain),
             "slow_streak": float(self._slow_capture_streak),
             "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
             "runtime_profile_tries": float(self._runtime_profile_attempts),
@@ -801,6 +821,7 @@ class BallTracker:
 
         self._frame_counter += 1
         frame = cv2.flip(frame, 1)
+        frame = self._apply_software_brightness(frame)
         H = None
         warped = None
         mask = None
@@ -824,6 +845,8 @@ class BallTracker:
                 "capture_fetch": (t1 - t0) * 1000.0,
                 "frame_age": frame_age_ms,
                 "capture_period": self._capture_period_ms,
+                "capture_gray": self._capture_gray_mean,
+                "sw_gain": float(self._software_brightness_gain),
                 "slow_streak": float(self._slow_capture_streak),
                 "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
                 "runtime_profile_tries": float(self._runtime_profile_attempts),
@@ -841,6 +864,8 @@ class BallTracker:
             self.last_profile_ms = {
                 "frame_age": frame_age_ms,
                 "capture_period": self._capture_period_ms,
+                "capture_gray": self._capture_gray_mean,
+                "sw_gain": float(self._software_brightness_gain),
                 "slow_streak": float(self._slow_capture_streak),
                 "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
                 "runtime_profile_tries": float(self._runtime_profile_attempts),
@@ -925,7 +950,8 @@ class BallTracker:
             marker_centers_px = {}
             for i, marker_id in enumerate(ids):
                 if marker_id in self.CORNER_IDS:
-                    marker_centers_px[marker_id] = self.get_marker_center(corners[i]) * scale_inv
+                    center_px = self.get_marker_center(corners[i]) * scale_inv
+                    marker_centers_px[marker_id] = self._filter_marker_center(marker_id, center_px)
             t2 = time.perf_counter()
 
             if ids.size > 0:
@@ -1035,10 +1061,31 @@ class BallTracker:
         cx = self.WARP_SIZE_PX // 2
         cy = self.WARP_SIZE_PX // 2
         mm_per_px = self.PLATFORM_SIZE_MM / self.WARP_SIZE_PX
-        x_mm = (bx - cx) * mm_per_px
-        y_mm = (cy - by) * mm_per_px
+        x_mm_raw = (bx - cx) * mm_per_px
+        y_mm_raw = (cy - by) * mm_per_px
         current_time = frame_ts if frame_ts > 0 else time.perf_counter()
         t3 = time.perf_counter()
+
+        dt = 0.0
+        raw_speed_mm_s = 0.0
+        filter_alpha = self.pos_filter_alpha_fast
+        if self.prev_time is not None:
+            dt = current_time - self.prev_time
+        if self.prev_ball_raw_mm is not None and dt > 0:
+            raw_dx = x_mm_raw - self.prev_ball_raw_mm[0]
+            raw_dy = y_mm_raw - self.prev_ball_raw_mm[1]
+            raw_speed_mm_s = float(np.hypot(raw_dx / dt, raw_dy / dt))
+        if self.pos_filter_enabled and self.prev_ball_mm is not None:
+            speed_ratio = min(1.0, raw_speed_mm_s / self.pos_filter_speed_mm_s)
+            filter_alpha = self.pos_filter_alpha_slow + (
+                self.pos_filter_alpha_fast - self.pos_filter_alpha_slow
+            ) * speed_ratio
+            x_mm = filter_alpha * self.prev_ball_mm[0] + (1.0 - filter_alpha) * x_mm_raw
+            y_mm = filter_alpha * self.prev_ball_mm[1] + (1.0 - filter_alpha) * y_mm_raw
+        else:
+            x_mm = x_mm_raw
+            y_mm = y_mm_raw
+        self._last_pos_filter_alpha = float(filter_alpha)
 
         if self.prev_ball_mm is None or self.prev_time is None:
             vx = 0.0
@@ -1072,6 +1119,7 @@ class BallTracker:
                 vx = self.vx_smooth
                 vy = self.vy_smooth
 
+        self.prev_ball_raw_mm = (x_mm_raw, y_mm_raw)
         self.prev_ball_mm = (x_mm, y_mm)
         self.prev_time = current_time
         t_k1 = time.perf_counter()
@@ -1096,6 +1144,8 @@ class BallTracker:
                 "capture_fetch": (t1 - t0) * 1000.0,
                 "frame_age": frame_age_ms,
                 "capture_period": self._capture_period_ms,
+                "capture_gray": self._capture_gray_mean,
+                "sw_gain": float(self._software_brightness_gain),
                 "slow_streak": float(self._slow_capture_streak),
                 "runtime_profile_applied": 1.0 if self._runtime_speed_profile_applied else 0.0,
                 "runtime_profile_tries": float(self._runtime_profile_attempts),
@@ -1116,10 +1166,15 @@ class BallTracker:
                 "circularity": circularity,
                 "fill_ratio": fill_ratio,
                 "dt_s": float(dt),
+                "x_raw_mm": float(x_mm_raw),
+                "y_raw_mm": float(y_mm_raw),
+                "raw_speed_mm_s": float(raw_speed_mm_s),
+                "pos_filter_alpha": float(self._last_pos_filter_alpha),
                 "gray_mean": mean_gray,
                 "warp_gray_mean": gray_warp_mean,
                 "vmin_eff": float(vmin_eff),
                 "aruco_ids": float(aruco_id_count),
+                "sw_gain": float(self._software_brightness_gain),
             },
         }
         if frame_ts > 0:
