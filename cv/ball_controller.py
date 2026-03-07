@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from stewart_control.config import (
     AUTO_TRIM_ENABLED,
     AUTO_TRIM_KI_DEG_PER_MM_S,
+    AUTO_TRIM_HOME_CAL_MAX_DEG,
     AUTO_TRIM_MAX_DEG,
     AUTO_TRIM_ERROR_LPF_ALPHA,
     AUTO_TRIM_SETTLE_HOLD_S,
@@ -196,6 +197,7 @@ class BallController:
         self.auto_trim_enabled = bool(AUTO_TRIM_ENABLED)
         self.auto_trim_ki = float(AUTO_TRIM_KI_DEG_PER_MM_S)
         self.auto_trim_max_deg = float(AUTO_TRIM_MAX_DEG)
+        self.auto_trim_home_cal_max_deg = float(AUTO_TRIM_HOME_CAL_MAX_DEG)
         self.auto_trim_settle_speed_mm_s = float(AUTO_TRIM_SETTLE_SPEED_MM_S)
         self.auto_trim_settle_radius_mm = float(AUTO_TRIM_SETTLE_RADIUS_MM)
         self.auto_trim_settle_hold_s = float(AUTO_TRIM_SETTLE_HOLD_S)
@@ -224,6 +226,7 @@ class BallController:
         self._auto_trim_last_radius_mm = 0.0
         self._auto_trim_last_roll_step_deg = 0.0
         self._auto_trim_last_pitch_step_deg = 0.0
+        self._auto_trim_limit_deg_active = self.auto_trim_max_deg
         self._auto_trim_gate_speed_ok = False
         self._auto_trim_gate_radius_ok = False
         self._auto_trim_gate_radius_bypassed = False
@@ -487,8 +490,11 @@ class BallController:
             "auto_trim_hold_s": self.auto_trim_settle_hold_s,
             "auto_trim_roll_step_deg": self._auto_trim_last_roll_step_deg,
             "auto_trim_pitch_step_deg": self._auto_trim_last_pitch_step_deg,
-            "auto_trim_roll_sat": 1.0 if abs(self.roll_offset) >= (self.auto_trim_max_deg - 1e-6) else 0.0,
-            "auto_trim_pitch_sat": 1.0 if abs(self.pitch_offset) >= (self.auto_trim_max_deg - 1e-6) else 0.0,
+            "auto_trim_limit_deg_active": self._auto_trim_limit_deg_active,
+            "auto_trim_limit_deg_normal": self.auto_trim_max_deg,
+            "auto_trim_limit_deg_home_cal": self.auto_trim_home_cal_max_deg,
+            "auto_trim_roll_sat": 1.0 if abs(self.roll_offset) >= (self._auto_trim_limit_deg_active - 1e-6) else 0.0,
+            "auto_trim_pitch_sat": 1.0 if abs(self.pitch_offset) >= (self._auto_trim_limit_deg_active - 1e-6) else 0.0,
             "auto_trim_gate_speed_ok": 1.0 if self._auto_trim_gate_speed_ok else 0.0,
             "auto_trim_gate_radius_ok": 1.0 if self._auto_trim_gate_radius_ok else 0.0,
             "auto_trim_gate_radius_bypassed": 1.0 if self._auto_trim_gate_radius_bypassed else 0.0,
@@ -523,6 +529,9 @@ class BallController:
         self._auto_trim_target_hold_remaining_s = 0.0
         self._auto_trim_last_speed_mm_s = float(math.hypot(vx, vy))
         self._auto_trim_last_radius_mm = float(math.hypot(ex, ey))
+        self._auto_trim_limit_deg_active = (
+            self.auto_trim_home_cal_max_deg if self.home_calibration_active else self.auto_trim_max_deg
+        )
         self._auto_trim_gate_speed_ok = False
         self._auto_trim_gate_radius_ok = False
         self._auto_trim_gate_radius_bypassed = False
@@ -606,8 +615,9 @@ class BallController:
         roll_step = self._clamp(roll_rate * dt, -self.auto_trim_step_limit_deg, self.auto_trim_step_limit_deg)
         pitch_step = self._clamp(pitch_rate * dt, -self.auto_trim_step_limit_deg, self.auto_trim_step_limit_deg)
 
-        self.roll_offset = self._clamp(self.roll_offset + roll_step, -self.auto_trim_max_deg, self.auto_trim_max_deg)
-        self.pitch_offset = self._clamp(self.pitch_offset + pitch_step, -self.auto_trim_max_deg, self.auto_trim_max_deg)
+        trim_limit = max(0.1, float(self._auto_trim_limit_deg_active))
+        self.roll_offset = self._clamp(self.roll_offset + roll_step, -trim_limit, trim_limit)
+        self.pitch_offset = self._clamp(self.pitch_offset + pitch_step, -trim_limit, trim_limit)
         self._auto_trim_last_roll_step_deg = float(roll_step)
         self._auto_trim_last_pitch_step_deg = float(pitch_step)
         self._auto_trim_update_count += 1

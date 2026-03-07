@@ -91,8 +91,8 @@ class StewartGUIView(QWidget):
         root.addWidget(comms_panel, 0, 2)
 
         root.setColumnStretch(0, 2)
-        root.setColumnStretch(1, 2)
-        root.setColumnStretch(2, 2)
+        root.setColumnStretch(1, 3)
+        root.setColumnStretch(2, 3)
         self.setLayout(root)
         self.setWindowTitle("Stewart Platform Mission Console")
         self.resize(1600, 920)
@@ -100,10 +100,12 @@ class StewartGUIView(QWidget):
     def _build_controls_panel(self):
         box = QGroupBox("Control Blocks")
         layout = QVBoxLayout()
+        layout.setSpacing(6)
 
         self.sliders = {}
         pose = QGroupBox("Pose Command")
         pose_layout = QVBoxLayout()
+        pose_layout.setSpacing(4)
         for ax in ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]:
             lbl = QLabel(f"{ax}: 0")
             sld = QSlider(QtCore.Qt.Horizontal)
@@ -118,6 +120,7 @@ class StewartGUIView(QWidget):
 
         pd = QGroupBox("PD Gains")
         pd_layout = QVBoxLayout()
+        pd_layout.setSpacing(4)
         self.kp_label = QLabel(f"Kp: {PD_DEFAULT_KP:.3f}")
         self.kp_slider = QSlider(QtCore.Qt.Horizontal)
         self.kp_slider.setMinimum(0)
@@ -180,6 +183,7 @@ class StewartGUIView(QWidget):
 
         hsv = QGroupBox("HSV Thresholds")
         hsv_layout = QVBoxLayout()
+        hsv_layout.setSpacing(4)
         self.hsv_controls = {}
         defaults = [
             ("H Min", TRACKER_HSV_H_MIN, 179),
@@ -238,18 +242,23 @@ class StewartGUIView(QWidget):
         layout.addWidget(QLabel("Demo Routines:"))
         layout.addWidget(self.demo_list)
 
-        btn_row = QHBoxLayout()
+        cmd_grid = QGridLayout()
+        cmd_grid.setHorizontalSpacing(8)
+        cmd_grid.setVerticalSpacing(6)
         self.send_button = QPushButton("SEND TO ARDUINO")
         self.vision_button = QPushButton("Enable Vision Mode")
         self.cancel_vision_btn = QPushButton("Cancel Vision Mode")
         self.cancel_routine_btn = QPushButton("Cancel Routine")
+        for btn in [self.send_button, self.vision_button, self.cancel_vision_btn, self.cancel_routine_btn]:
+            btn.setMinimumHeight(34)
+            btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.cancel_vision_btn.setEnabled(False)
         self.cancel_routine_btn.setEnabled(False)
-        btn_row.addWidget(self.send_button)
-        btn_row.addWidget(self.vision_button)
-        btn_row.addWidget(self.cancel_vision_btn)
-        btn_row.addWidget(self.cancel_routine_btn)
-        layout.addLayout(btn_row)
+        cmd_grid.addWidget(self.send_button, 0, 0)
+        cmd_grid.addWidget(self.vision_button, 0, 1)
+        cmd_grid.addWidget(self.cancel_vision_btn, 1, 0)
+        cmd_grid.addWidget(self.cancel_routine_btn, 1, 1)
+        layout.addLayout(cmd_grid)
 
         self.raw_serial_input = QtWidgets.QLineEdit()
         self.raw_serial_input.setPlaceholderText("Type raw serial command, e.g. S,90,90,90,90,90,90")
