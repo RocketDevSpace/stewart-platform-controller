@@ -265,7 +265,11 @@ class VisionControlWorker(QtCore.QObject):
                 timings_ms["trk_vmin_eff"] = float(quality.get("vmin_eff", 0.0))
                 timings_ms["trk_aruco_ids"] = float(quality.get("aruco_ids", 0.0))
                 timings_ms["trk_raw_speed_mm_s"] = float(quality.get("raw_speed_mm_s", 0.0))
+                timings_ms["trk_raw_vx_mm_s"] = float(quality.get("raw_vx_mm_s", 0.0))
+                timings_ms["trk_raw_vy_mm_s"] = float(quality.get("raw_vy_mm_s", 0.0))
                 timings_ms["trk_pos_filter_alpha"] = float(quality.get("pos_filter_alpha", 0.0))
+                timings_ms["trk_pos_lag_mm"] = float(quality.get("pos_filter_lag_mm", 0.0))
+                timings_ms["trk_pos_filter_enabled"] = float(quality.get("pos_filter_enabled", 0.0))
                 snapshot = ControlSnapshot(
                     timestamp=time.time(),
                     frame_ts=float((ball_state_dict or {}).get("frame_ts", 0.0)),
@@ -386,7 +390,11 @@ class VisionControlWorker(QtCore.QObject):
             timings_ms["trk_vmin_eff"] = quality.get("vmin_eff", 0.0)
             timings_ms["trk_aruco_ids"] = quality.get("aruco_ids", 0.0)
             timings_ms["trk_raw_speed_mm_s"] = quality.get("raw_speed_mm_s", 0.0)
+            timings_ms["trk_raw_vx_mm_s"] = quality.get("raw_vx_mm_s", 0.0)
+            timings_ms["trk_raw_vy_mm_s"] = quality.get("raw_vy_mm_s", 0.0)
             timings_ms["trk_pos_filter_alpha"] = quality.get("pos_filter_alpha", 0.0)
+            timings_ms["trk_pos_lag_mm"] = quality.get("pos_filter_lag_mm", 0.0)
+            timings_ms["trk_pos_filter_enabled"] = quality.get("pos_filter_enabled", 0.0)
             frame_ts = float(ball_state_dict.get("frame_ts", 0.0))
             if frame_ts > 0:
                 timings_ms["frame_to_worker_ms"] = max(0.0, (time.perf_counter() - frame_ts) * 1000.0)

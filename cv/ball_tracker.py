@@ -32,6 +32,7 @@ from stewart_control.config import (
     TRACKER_POS_FILTER_ALPHA_FAST,
     TRACKER_POS_FILTER_ALPHA_SLOW,
     TRACKER_POS_FILTER_ENABLED,
+    TRACKER_POS_FILTER_MAX_LAG_MM,
     TRACKER_POS_FILTER_SPEED_MM_S,
     TRACKER_MIN_CIRCULARITY,
     TRACKER_MIN_CONTOUR_AREA,
@@ -70,6 +71,7 @@ class BallTracker:
         pos_filter_alpha_slow=TRACKER_POS_FILTER_ALPHA_SLOW,
         pos_filter_alpha_fast=TRACKER_POS_FILTER_ALPHA_FAST,
         pos_filter_speed_mm_s=TRACKER_POS_FILTER_SPEED_MM_S,
+        pos_filter_max_lag_mm=TRACKER_POS_FILTER_MAX_LAG_MM,
         debug_level=DEBUG_LEVEL,
         log_every_n=LOG_EVERY_N,
     ):
@@ -95,6 +97,7 @@ class BallTracker:
         self.pos_filter_alpha_slow = float(np.clip(pos_filter_alpha_slow, 0.0, 0.98))
         self.pos_filter_alpha_fast = float(np.clip(pos_filter_alpha_fast, 0.0, 0.98))
         self.pos_filter_speed_mm_s = max(1.0, float(pos_filter_speed_mm_s))
+        self.pos_filter_max_lag_mm = max(0.1, float(pos_filter_max_lag_mm))
         self.debug_level = debug_level
         self.log_every_n = max(1, int(log_every_n))
         self._log_counter = 0
@@ -1069,12 +1072,16 @@ class BallTracker:
         dt = 0.0
         raw_speed_mm_s = 0.0
         filter_alpha = self.pos_filter_alpha_fast
+        vx_raw_meas = 0.0
+        vy_raw_meas = 0.0
         if self.prev_time is not None:
             dt = current_time - self.prev_time
         if self.prev_ball_raw_mm is not None and dt > 0:
             raw_dx = x_mm_raw - self.prev_ball_raw_mm[0]
             raw_dy = y_mm_raw - self.prev_ball_raw_mm[1]
-            raw_speed_mm_s = float(np.hypot(raw_dx / dt, raw_dy / dt))
+            vx_raw_meas = float(raw_dx / dt)
+            vy_raw_meas = float(raw_dy / dt)
+            raw_speed_mm_s = float(np.hypot(vx_raw_meas, vy_raw_meas))
         if self.pos_filter_enabled and self.prev_ball_mm is not None:
             speed_ratio = min(1.0, raw_speed_mm_s / self.pos_filter_speed_mm_s)
             filter_alpha = self.pos_filter_alpha_slow + (
@@ -1086,6 +1093,17 @@ class BallTracker:
             x_mm = x_mm_raw
             y_mm = y_mm_raw
         self._last_pos_filter_alpha = float(filter_alpha)
+        lag_dx = float(x_mm_raw - x_mm)
+        lag_dy = float(y_mm_raw - y_mm)
+        lag_mm = float(np.hypot(lag_dx, lag_dy))
+        if lag_mm > self.pos_filter_max_lag_mm:
+            # Bound filter-induced phase lag so damping authority is not lost.
+            scale = self.pos_filter_max_lag_mm / max(lag_mm, 1e-6)
+            x_mm = x_mm_raw - lag_dx * scale
+            y_mm = y_mm_raw - lag_dy * scale
+            lag_dx = float(x_mm_raw - x_mm)
+            lag_dy = float(y_mm_raw - y_mm)
+            lag_mm = float(np.hypot(lag_dx, lag_dy))
 
         if self.prev_ball_mm is None or self.prev_time is None:
             vx = 0.0
@@ -1097,9 +1115,7 @@ class BallTracker:
                 vx = 0.0
                 vy = 0.0
             else:
-                vx_raw = (x_mm - self.prev_ball_mm[0]) / dt
-                vy_raw = (y_mm - self.prev_ball_mm[1]) / dt
-                speed_raw = np.hypot(vx_raw, vy_raw)
+                speed_raw = np.hypot(vx_raw_meas, vy_raw_meas)
                 if self.max_speed_mm_s > 0 and speed_raw > self.max_speed_mm_s:
                     return _failure_result(
                         f"velocity_outlier_{speed_raw:.1f}",
@@ -1114,8 +1130,8 @@ class BallTracker:
                         hsv_ms_val=(t_m1 - t_m0) * 1000.0,
                         contour_ms_val=(t_c1 - t_c0) * 1000.0,
                     )
-                self.vx_smooth = self.VEL_ALPHA * self.vx_smooth + (1 - self.VEL_ALPHA) * vx_raw
-                self.vy_smooth = self.VEL_ALPHA * self.vy_smooth + (1 - self.VEL_ALPHA) * vy_raw
+                self.vx_smooth = self.VEL_ALPHA * self.vx_smooth + (1 - self.VEL_ALPHA) * vx_raw_meas
+                self.vy_smooth = self.VEL_ALPHA * self.vy_smooth + (1 - self.VEL_ALPHA) * vy_raw_meas
                 vx = self.vx_smooth
                 vy = self.vy_smooth
 
@@ -1169,7 +1185,11 @@ class BallTracker:
                 "x_raw_mm": float(x_mm_raw),
                 "y_raw_mm": float(y_mm_raw),
                 "raw_speed_mm_s": float(raw_speed_mm_s),
+                "raw_vx_mm_s": float(vx_raw_meas),
+                "raw_vy_mm_s": float(vy_raw_meas),
                 "pos_filter_alpha": float(self._last_pos_filter_alpha),
+                "pos_filter_lag_mm": float(lag_mm),
+                "pos_filter_enabled": 1.0 if self.pos_filter_enabled else 0.0,
                 "gray_mean": mean_gray,
                 "warp_gray_mean": gray_warp_mean,
                 "vmin_eff": float(vmin_eff),

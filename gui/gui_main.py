@@ -118,7 +118,11 @@ class StewartGUIController(StewartGUIView):
             "trk_vmin_eff",
             "trk_aruco_ids",
             "trk_raw_speed_mm_s",
+            "trk_raw_vx_mm_s",
+            "trk_raw_vy_mm_s",
             "trk_pos_filter_alpha",
+            "trk_pos_lag_mm",
+            "trk_pos_filter_enabled",
         ]
         self._timing_colors = {
             "ball_update": "#38bdf8",
@@ -909,6 +913,10 @@ class StewartGUIController(StewartGUIView):
                     self._log_preview(
                         "[AUTO HOME] "
                         f"state={terms.get('auto_trim_state', 'n/a')} "
+                        f"gate={terms.get('auto_trim_gate_reason', 'n/a')} "
+                        f"s_ok={int(round(terms.get('auto_trim_gate_speed_ok', 0.0)))} "
+                        f"r_ok={int(round(terms.get('auto_trim_gate_radius_ok', 0.0)))} "
+                        f"r_bypass={int(round(terms.get('auto_trim_gate_radius_bypassed', 0.0)))} "
                         f"elapsed={terms.get('home_calibration_elapsed_s', 0.0):.1f}s "
                         f"target_hold={terms.get('auto_trim_target_hold_remaining_s', 0.0):.2f}s "
                         f"settled={terms.get('trim_settled_s', 0.0):.2f}/{terms.get('auto_trim_hold_s', 0.0):.2f}s "
@@ -918,9 +926,15 @@ class StewartGUIController(StewartGUIView):
                         f"{terms.get('auto_trim_radius_thresh_mm', 0.0):.2f} "
                         f"step=(r{terms.get('auto_trim_roll_step_deg', 0.0):+.4f},"
                         f"p{terms.get('auto_trim_pitch_step_deg', 0.0):+.4f}) "
+                        f"sat=(r{int(round(terms.get('auto_trim_roll_sat', 0.0)))},"
+                        f"p{int(round(terms.get('auto_trim_pitch_sat', 0.0)))}) "
                         f"trim=(r{terms.get('roll_offset', 0.0):+.3f},p{terms.get('pitch_offset', 0.0):+.3f}) "
                         f"trk_raw_speed={timings.get('trk_raw_speed_mm_s', 0.0):.2f} "
-                        f"trk_pos_alpha={timings.get('trk_pos_filter_alpha', 0.0):.3f}"
+                        f"trk_raw_v=({timings.get('trk_raw_vx_mm_s', 0.0):+.2f},"
+                        f"{timings.get('trk_raw_vy_mm_s', 0.0):+.2f}) "
+                        f"trk_pos_on={int(round(timings.get('trk_pos_filter_enabled', 0.0)))} "
+                        f"trk_pos_alpha={timings.get('trk_pos_filter_alpha', 0.0):.3f} "
+                        f"trk_pos_lag={timings.get('trk_pos_lag_mm', 0.0):.3f}mm"
                     )
 
             if self._vision_counter % LOG_EVERY_N == 0:
@@ -946,7 +960,13 @@ class StewartGUIController(StewartGUIView):
                     f"w2g={timings.get('worker_to_gui_ms', 0.0):.1f}ms "
                     f"trim=(r{terms.get('roll_offset', 0.0):.3f},p{terms.get('pitch_offset', 0.0):.3f}) "
                     f"trim_state={terms.get('auto_trim_state', 'n/a')} "
+                    f"trim_gate={terms.get('auto_trim_gate_reason', 'n/a')} "
                     f"settled={terms.get('trim_settled_s', 0.0):.2f}s "
+                    f"trk_raw_v=({timings.get('trk_raw_vx_mm_s', 0.0):+.2f},"
+                    f"{timings.get('trk_raw_vy_mm_s', 0.0):+.2f}) "
+                    f"trk_pos_on={int(round(timings.get('trk_pos_filter_enabled', 0.0)))} "
+                    f"trk_pos_a={timings.get('trk_pos_filter_alpha', 0.0):.3f} "
+                    f"trk_lag={timings.get('trk_pos_lag_mm', 0.0):.3f}mm "
                     f"rad={snapshot.timings_ms.get('trk_radius_px', 0.0):.1f}px "
                     f"area={snapshot.timings_ms.get('trk_area', 0.0):.0f} "
                     f"cmd={safe_angles}"
@@ -1010,7 +1030,10 @@ class StewartGUIController(StewartGUIView):
                 f"vmin_eff={trk['trk_vmin_eff']:.1f} "
                 f"ids={trk['trk_aruco_ids']:.1f} "
                 f"raw_speed={trk['trk_raw_speed_mm_s']:.2f} "
+                f"raw_v=({trk['trk_raw_vx_mm_s']:+.2f},{trk['trk_raw_vy_mm_s']:+.2f}) "
+                f"pos_on={int(round(trk['trk_pos_filter_enabled']))} "
                 f"pos_alpha={trk['trk_pos_filter_alpha']:.3f} "
+                f"pos_lag={trk['trk_pos_lag_mm']:.3f} "
                 f"dt={trk['trk_dt_s']*1000.0:.1f}ms"
             )
 
