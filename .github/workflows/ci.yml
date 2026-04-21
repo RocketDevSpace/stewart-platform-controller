@@ -26,14 +26,14 @@ jobs:
       - name: Lint with flake8
         run: |
           # Only lint new clean modules. Expand as each milestone is refactored.
-          flake8 core/ settings.py tests/
+          flake8 core/ hardware/ settings.py tests/
 
       - name: Type check with mypy
         run: |
           # --explicit-package-bases tells mypy to treat the cwd as the package
           # root, which avoids the "not a valid package name" error from the
           # repo directory name containing hyphens.
-          mypy core/ settings.py \
+          mypy core/ hardware/ settings.py \
             --ignore-missing-imports \
             --explicit-package-bases
 
