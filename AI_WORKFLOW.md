@@ -36,6 +36,7 @@ Executes approved implementation plans only. Operates within the boundaries defi
 - Write tests before marking work complete
 - Flag blockers or ambiguities to the PM before proceeding, not after
 - One PR per milestone, not one PR per step
+- Respond to PM review comments by replying to the specific comment thread with the commit hash where the fix was made
 
 **How to invoke:** Paste the milestone brief from the PM into Claude Code. Include the Architecture section as context. Do not start a new milestone until the previous one is merged.
 
@@ -82,7 +83,7 @@ Tests are written by the Dev before the PR is opened. Test gates are tiered:
 - **Manual verification** — acceptable only for pure UI changes. Must be noted explicitly.
 
 ### Phase 6: Review
-Ping the PM in the Claude Project. The PM reads the PR via GitHub connector and posts a review comment. If approved, merge manually. If changes requested, hand back to Claude Code.
+Ping the PM in the Claude Project. The PM reads the PR via GitHub connector and posts a review comment. If changes are requested, Claude Code must reply to each specific comment thread with the commit hash of the fix. If approved, merge manually.
 
 ### Phase 7: Merge
 - Merge the PR manually on GitHub
@@ -139,6 +140,8 @@ stewart_control/
 
 Completed so far:
 - core/platform_state.py (M1 Step 1)
+- settings.py (M1 Step 2)
+- core/safety.py + tests/test_safety.py (M1 Step 3)
 
 Module responsibilities:
 - config.py: physical geometry. Does NOT own runtime settings.
@@ -177,6 +180,8 @@ Known constraints:
 - Do not put control logic or IK calls in any gui/ file.
 - Hardware tests requiring Arduino must be marked [HARDWARE].
 - Qt timer callbacks must stay fast (<5ms). Offload blocking work to threads.
+- Import paths use repo-root-relative imports (e.g. `from settings import ...`
+  not `from stewart_control.settings import ...`).
 
 Decisions already made:
 - PyQt5: already in use, not changing.
@@ -209,6 +214,7 @@ GIT RULES
 1. Before touching any file, run `git status`. If the tree is dirty, stop and report.
 2. Create ONE feature branch for this entire milestone:
    git checkout -b milestone/[N]-[short-name]
+   Do NOT reuse an existing branch. Do NOT continue on a branch from a previous milestone.
 3. Commit after each numbered step using the format:
    [MN] Step X: description of what was done
 4. Commit messages must be specific. Never use "update", "fix", "changes".
@@ -218,6 +224,9 @@ GIT RULES
    Body: list each step, what was created/changed, confirm test results,
          note any deviations from the plan.
 7. Do not open multiple PRs. One PR per milestone.
+8. When the PM posts review comments on the PR, reply to each comment thread
+   individually with: the commit hash of the fix + one line describing what changed.
+   Format: "Fixed in abc1234 — [description]"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 APPROVED PLAN — Milestone [N]: [Name]
@@ -239,7 +248,10 @@ RULES
    schema in core/platform_state.py is defined before writing code that uses it.
 10. Respect layer boundaries. GUI files do not call IK or build serial commands.
     IK goes through ik_engine.py. Serial commands go through servo_driver.py.
-11. Git discipline. One branch per milestone. Commit per step. One PR at the end.
+11. Git discipline. One fresh branch per milestone. Commit per step. One PR at the end.
+    Reply to PM review comments with commit hash of each fix.
+12. Import paths. Use repo-root-relative imports: `from settings import ...`,
+    `from core.safety import ...`. Never use `stewart_control.*` prefixes.
 ```
 
 ---
@@ -256,7 +268,9 @@ RULES
 8. **No inline config.** Everything goes in settings.py.
 9. **Data contracts first.** Dataclass defined before code that uses it.
 10. **Respect layer boundaries.** GUI never calls IK or builds serial commands.
-11. **Git discipline.** One branch, commit per step, one PR per milestone.
+11. **Git discipline.** One fresh branch per milestone. Commit per step. One PR at the end.
+12. **Import paths.** Repo-root-relative. Never `stewart_control.*` prefixes.
+13. **Review reply.** Reply to each PM comment thread with `Fixed in <hash> — <description>`.
 
 ---
 
@@ -275,6 +289,20 @@ RULES
 | **Inline config** | Port or limit appears as a literal in a logic file | Reject. Move to settings.py. |
 | **Layer violation** | GUI file calls IK or builds a serial command string | Reject. Route through correct module. |
 | **PR per step** | Dev opens a PR after every single step | Reject. One PR per milestone. |
+| **Branch reuse** | Dev continues on a previous milestone's branch | Reject. Always create a fresh branch. |
+| **Silent fix** | Dev pushes fix without replying to review comment | Reject. Always reply with commit hash. |
+
+---
+
+## CI
+
+Every push and PR runs the following automatically via `.github/workflows/ci.yml`:
+- **pytest** — all tests in `tests/`
+- **flake8** — linting (config in `setup.cfg`, scoped to clean modules only)
+- **mypy** — type checking on `core/` and `settings.py`
+
+A PR should not be merged if CI is failing. Hardware-dependent tests are excluded from CI
+and marked `[HARDWARE]` — run those manually before merging milestones that touch serial.
 
 ---
 
