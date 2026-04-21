@@ -1,0 +1,161 @@
+"""
+Unit tests for core/safety.py — clip_servo_angles()
+
+Rules under test:
+- Servos 0, 2, 4: max capped at 170 (odd_servo_max)
+- Servos 1, 3, 5: min capped at 10  (even_servo_min)
+"""
+
+import pytest
+from stewart_control.core.safety import clip_servo_angles
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _all_within_bounds():
+    """Six angles that need no clipping."""
+    # servos 0,2,4 at 170 (exactly at limit), servos 1,3,5 at 10 (exactly at limit)
+    return [170.0, 10.0, 170.0, 10.0, 170.0, 10.0]
+
+
+# ---------------------------------------------------------------------------
+# No clipping needed
+# ---------------------------------------------------------------------------
+
+class TestNoClipping:
+    def test_all_within_bounds_returns_unchanged(self):
+        angles = [90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result == angles
+        assert clips == []
+
+    def test_returns_a_copy_not_the_same_list(self):
+        angles = [90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+        result, _ = clip_servo_angles(angles)
+        assert result is not angles
+
+    def test_boundary_exactly_170_not_clipped(self):
+        """Servo 0 at exactly 170 should pass through unchanged."""
+        angles = [170.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[0] == 170.0
+        assert clips == []
+
+    def test_boundary_exactly_10_not_clipped(self):
+        """Servo 1 at exactly 10 should pass through unchanged."""
+        angles = [90.0, 10.0, 90.0, 90.0, 90.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[1] == 10.0
+        assert clips == []
+
+    def test_all_boundary_values_not_clipped(self):
+        angles = _all_within_bounds()
+        result, clips = clip_servo_angles(angles)
+        assert result == angles
+        assert clips == []
+
+
+# ---------------------------------------------------------------------------
+# Single servo clipped — odd servos (0, 2, 4) max 170
+# ---------------------------------------------------------------------------
+
+class TestOddServoMaxClip:
+    def test_servo_0_above_max(self):
+        angles = [180.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[0] == 170.0
+        assert (0, 180.0, 170.0) in clips
+
+    def test_servo_2_above_max(self):
+        angles = [90.0, 90.0, 175.0, 90.0, 90.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[2] == 170.0
+        assert (2, 175.0, 170.0) in clips
+
+    def test_servo_4_above_max(self):
+        angles = [90.0, 90.0, 90.0, 90.0, 200.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[4] == 170.0
+        assert (4, 200.0, 170.0) in clips
+
+    def test_odd_servo_below_max_not_clipped(self):
+        """Odd servos have no lower-bound rule — low values pass through."""
+        angles = [0.0, 90.0, 0.0, 90.0, 0.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[0] == 0.0
+        assert result[2] == 0.0
+        assert result[4] == 0.0
+        assert clips == []
+
+
+# ---------------------------------------------------------------------------
+# Single servo clipped — even servos (1, 3, 5) min 10
+# ---------------------------------------------------------------------------
+
+class TestEvenServoMinClip:
+    def test_servo_1_below_min(self):
+        angles = [90.0, 5.0, 90.0, 90.0, 90.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[1] == 10.0
+        assert (1, 5.0, 10.0) in clips
+
+    def test_servo_3_below_min(self):
+        angles = [90.0, 90.0, 90.0, 0.0, 90.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[3] == 10.0
+        assert (3, 0.0, 10.0) in clips
+
+    def test_servo_5_below_min(self):
+        angles = [90.0, 90.0, 90.0, 90.0, 90.0, -5.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[5] == 10.0
+        assert (5, -5.0, 10.0) in clips
+
+    def test_even_servo_above_min_not_clipped(self):
+        """Even servos have no upper-bound rule — high values pass through."""
+        angles = [90.0, 180.0, 90.0, 180.0, 90.0, 180.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[1] == 180.0
+        assert result[3] == 180.0
+        assert result[5] == 180.0
+        assert clips == []
+
+
+# ---------------------------------------------------------------------------
+# Multiple clips in one call
+# ---------------------------------------------------------------------------
+
+class TestMultipleClips:
+    def test_all_six_servos_need_clipping(self):
+        angles = [180.0, 0.0, 180.0, 0.0, 180.0, 0.0]
+        result, clips = clip_servo_angles(angles)
+        assert result == [170.0, 10.0, 170.0, 10.0, 170.0, 10.0]
+        assert len(clips) == 6
+
+    def test_two_clips_reported_in_index_order(self):
+        angles = [180.0, 5.0, 90.0, 90.0, 90.0, 90.0]
+        result, clips = clip_servo_angles(angles)
+        assert result[0] == 170.0
+        assert result[1] == 10.0
+        assert clips[0][0] == 0   # index 0 reported first
+        assert clips[1][0] == 1   # index 1 reported second
+
+    def test_clip_info_tuple_structure(self):
+        """Each clip entry must be (index, original, clipped_value)."""
+        angles = [171.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+        _, clips = clip_servo_angles(angles)
+        assert len(clips) == 1
+        idx, original, clipped = clips[0]
+        assert idx == 0
+        assert original == 171.0
+        assert clipped == 170.0
+
+    def test_unaffected_servos_unchanged_during_multi_clip(self):
+        angles = [180.0, 0.0, 90.0, 90.0, 90.0, 90.0]
+        result, _ = clip_servo_angles(angles)
+        assert result[2] == 90.0
+        assert result[3] == 90.0
+        assert result[4] == 90.0
+        assert result[5] == 90.0
