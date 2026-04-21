@@ -30,8 +30,12 @@ jobs:
 
       - name: Type check with mypy
         run: |
-          # Only type-check new clean modules.
-          mypy core/ settings.py --ignore-missing-imports
+          # --explicit-package-bases tells mypy to treat the cwd as the package
+          # root, which avoids the "not a valid package name" error from the
+          # repo directory name containing hyphens.
+          mypy core/ settings.py \
+            --ignore-missing-imports \
+            --explicit-package-bases
 
       - name: Run tests
         run: |
