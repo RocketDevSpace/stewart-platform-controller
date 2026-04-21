@@ -14,14 +14,14 @@ class Pose:
 
 @dataclass
 class ServoAngles:
-    angles: list = field(default_factory=lambda: [0.0] * 6)
+    angles: list[float] = field(default_factory=lambda: [0.0] * 6)
 
 
 @dataclass
 class BallState:
-    x_mm: float = 0.0
-    y_mm: float = 0.0
+    x_mm: float
+    y_mm: float
+    vx_mm_s: float
+    vy_mm_s: float
     z_mm: Optional[float] = None
-    vx_mm_s: float = 0.0
-    vy_mm_s: float = 0.0
     vz_mm_s: Optional[float] = None
