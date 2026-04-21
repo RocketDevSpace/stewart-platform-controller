@@ -108,9 +108,12 @@ class SerialManager:
         """Background thread: read bytes, buffer, and emit complete lines."""
         buffer = ""
 
-        while self._running and self._ser is not None:
+        while self._running:
+            ser = self._ser
+            if ser is None:
+                break
             try:
-                raw = self._ser.read(128)
+                raw = ser.read(128)
                 data = raw.decode("utf-8", errors="ignore")
 
                 if data:

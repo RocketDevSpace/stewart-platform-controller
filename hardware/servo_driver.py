@@ -26,6 +26,9 @@ class ServoDriver:
         Angles are rounded to int but NOT clipped here; call send_angles()
         if you want safety clipping applied.
 
+        WARNING: does not apply safety clipping. Use send_angles() for
+        hardware output.
+
         Format: "S,<a0>,<a1>,<a2>,<a3>,<a4>,<a5>,0\\n"
         """
         ints = [int(round(a)) for a in angles]
