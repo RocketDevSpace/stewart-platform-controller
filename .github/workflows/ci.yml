@@ -21,19 +21,19 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest flake8 mypy numpy
+          pip install pytest flake8 mypy numpy types-pyserial
 
       - name: Lint with flake8
         run: |
-          # Only lint new clean modules. Expand as each milestone is refactored.
-          flake8 core/ settings.py tests/
+          # Runs on the whole repo. Legacy modules are excluded via setup.cfg.
+          # New refactored modules are covered automatically — no config change needed.
+          flake8 .
 
       - name: Type check with mypy
         run: |
-          # --explicit-package-bases tells mypy to treat the cwd as the package
-          # root, which avoids the "not a valid package name" error from the
-          # repo directory name containing hyphens.
-          mypy core/ settings.py \
+          # Runs on the whole repo. Legacy modules are excluded via setup.cfg [mypy] exclude.
+          # --explicit-package-bases avoids "not a valid package name" error from hyphens.
+          mypy . \
             --ignore-missing-imports \
             --explicit-package-bases
 
