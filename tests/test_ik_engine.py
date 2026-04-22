@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 
 from core.ik_engine import IKEngine, solve_ik
@@ -17,24 +19,24 @@ NEUTRAL = Pose(x=0.0, y=0.0, z=0.0, roll=0.0, pitch=0.0, yaw=0.0)
 
 
 class TestIKEngineSolve:
-    def test_neutral_pose_succeeds(self):
+    def test_neutral_pose_succeeds(self) -> None:
         result = IKEngine().solve(NEUTRAL)
         assert result["success"] is True
 
-    def test_result_has_all_expected_keys(self):
+    def test_result_has_all_expected_keys(self) -> None:
         result = IKEngine().solve(NEUTRAL)
         assert EXPECTED_KEYS == set(result.keys())
 
-    def test_servo_angles_has_six_elements(self):
+    def test_servo_angles_has_six_elements(self) -> None:
         result = IKEngine().solve(NEUTRAL)
         assert len(result["servo_angles_deg"]) == 6
 
-    def test_servo_angles_in_range(self):
+    def test_servo_angles_in_range(self) -> None:
         result = IKEngine().solve(NEUTRAL)
         angles = result["servo_angles_deg"]
         assert all(0 <= a <= 180 for a in angles)
 
-    def test_same_input_returns_consistent_output(self):
+    def test_same_input_returns_consistent_output(self) -> None:
         pose = Pose(x=5.0, y=-3.0, z=10.0, roll=2.0, pitch=-1.5, yaw=0.5)
         r1 = IKEngine().solve(pose)
         r2 = IKEngine().solve(pose)
@@ -42,17 +44,16 @@ class TestIKEngineSolve:
         np.testing.assert_array_equal(r1["servo_angles_deg"], r2["servo_angles_deg"])
         np.testing.assert_array_equal(r1["platform_points"], r2["platform_points"])
 
-    def test_prev_arm_points_none_does_not_raise(self):
+    def test_prev_arm_points_none_does_not_raise(self) -> None:
         result = IKEngine().solve(NEUTRAL, prev_arm_points=None)
         assert "success" in result
 
-    def test_exception_returns_failure_dict(self):
+    def test_exception_returns_failure_dict(self) -> None:
         engine = IKEngine()
-        # Pass a pose whose solve_pose will be intercepted by monkeypatching
         import kinematics.ik_solver as ik_mod
         original = ik_mod.solve_pose
 
-        def exploding(*args, **kwargs):
+        def exploding(*args: Any, **kwargs: Any) -> None:
             raise RuntimeError("boom")
 
         ik_mod.solve_pose = exploding
@@ -67,11 +68,11 @@ class TestIKEngineSolve:
 
 
 class TestSolveIkConvenienceFunction:
-    def test_neutral_pose_succeeds(self):
+    def test_neutral_pose_succeeds(self) -> None:
         result = solve_ik(NEUTRAL)
         assert result["success"] is True
 
-    def test_matches_engine_solve(self):
+    def test_matches_engine_solve(self) -> None:
         pose = Pose(x=2.0, y=1.0, z=5.0, roll=0.0, pitch=0.0, yaw=0.0)
         r_fn = solve_ik(pose)
         r_engine = IKEngine().solve(pose)

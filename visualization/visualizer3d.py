@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 from matplotlib.figure import Figure  # noqa: F401
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -16,7 +18,7 @@ class StewartVisualizer:
         self._ik = IKEngine()
 
         self.fig = canvas.figure
-        self.ax = self.fig.add_subplot(111, projection="3d")
+        self.ax: Any = self.fig.add_subplot(111, projection="3d")
         self.ax.set_box_aspect([1, 1, 0.8])
 
         self.platform_pos = {'x': 0, 'y': 0, 'z': 130, 'roll': 0, 'pitch': 0, 'yaw': 0}
