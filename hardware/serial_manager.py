@@ -14,7 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 try:
-    import serial  # type: ignore[import]
+    import serial
 except ImportError:  # pragma: no cover
     serial = None  # type: ignore[assignment]
 

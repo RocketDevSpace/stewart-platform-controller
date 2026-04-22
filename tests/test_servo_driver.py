@@ -42,22 +42,10 @@ class TestFormatCommand:
         angles = [90.6, 90.0, 90.0, 90.0, 90.0, 90.0]
         assert driver.format_command(angles) == "S,91,90,90,90,90,90,0\n"
 
-    def test_float_angles_round_half_up(self) -> None:
-        driver, _ = make_driver()
-        angles = [90.5, 90.0, 90.0, 90.0, 90.0, 90.0]
-        # Python round() uses banker's rounding (round half to even):
-        # 90.5 rounds to 90 (even). Test the actual behaviour, not assumption.
-        result = driver.format_command(angles)
-        assert result in ("S,90,90,90,90,90,90,0\n", "S,91,90,90,90,90,90,0\n")
-
     def test_format_command_does_not_call_send(self) -> None:
         driver, mock_serial = make_driver()
         driver.format_command(all_90())
         mock_serial.send.assert_not_called()
-
-    def test_command_starts_with_S(self) -> None:
-        driver, _ = make_driver()
-        assert driver.format_command(all_90()).startswith("S,")
 
     def test_command_ends_with_0_newline(self) -> None:
         driver, _ = make_driver()

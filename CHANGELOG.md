@@ -1,42 +1,53 @@
 # Changelog
 
-## Milestone 1 — Foundation
+All notable changes to this project will be documented in this file.
 
-### Step 1 — core/platform_state.py
-- Added `Pose`, `ServoAngles`, `BallState` dataclasses
-- Establishes typed data contracts for use across all modules
-
-### Step 2 — settings.py
-- Runtime config extracted from hardcoded values in existing codebase
-- Single source of truth for port, baud, intervals, safety limits
-
-### Step 3 — core/safety.py + tests/test_safety.py
-- Servo clipping logic extracted and unit tested (17 tests, all passing)
-- Exact behavioral match to `safety_clip_servos()` in `gui/gui_layout.py`
-
-### Step 4 — CHANGELOG.md
-- Project changelog created
-
-## Milestone 2 — Hardware Layer
-
-### Step 1 — hardware/serial_manager.py
-- Clean refactor of comms/serial_sender.py
-- No hardcoded config — port/baud injected by caller (sourced from settings.py)
-
-### Step 2 — hardware/servo_driver.py
-- Single command formatting and dispatch call site
-- Replaces 4 inline "S,..." string builds in gui/gui_layout.py (switchover in M5)
-
-### Step 3 — tests/test_servo_driver.py
-- Unit tests for format_command and send_angles (15 tests via mock SerialManager)
-- Hardware test marked [HARDWARE] and skipped in CI
-
-### Step 4 — CI scope + CHANGELOG
-- hardware/ added to flake8 and mypy in .github/workflows/ci.yml
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-### PM additions (post-merge)
-- AI_WORKFLOW.md and SPEC.md pushed to main
-- CI workflow added (.github/workflows/ci.yml)
-- Import paths corrected in core/safety.py and tests/
+## [Unreleased]
+
+---
+
+## [Milestone-2] - 2026-04-22
+
+### Added
+- `hardware/__init__.py`, `hardware/serial_manager.py` — Serial connection
+  lifecycle and background read loop; clean refactor of `comms/serial_sender.py`
+  with no hardcoded config (port/baud injected by caller)
+- `hardware/servo_driver.py` — Single call site for `"S,..."` command formatting
+  and dispatch; replaces 4 inline builds in `gui/gui_layout.py` (switchover in M5)
+- `tests/test_servo_driver.py` — Unit tests for `format_command` and `send_angles`
+  via mock `SerialManager`; hardware test marked `[HARDWARE]` and skipped in CI
+
+### Changed
+- `.github/workflows/ci.yml` — Switched flake8 and mypy from explicit include
+  list to exclude list in `setup.cfg`; added `types-pyserial` to CI dependencies
+- `setup.cfg` — Added exclude lists for legacy modules so new clean modules are
+  covered automatically without CI config changes
+
+---
+
+## [Milestone-1] - 2026-04-21
+
+### Added
+- `core/platform_state.py` — `Pose`, `ServoAngles`, `BallState` dataclasses;
+  typed data contracts for all modules
+- `settings.py` — Runtime config extracted from hardcoded values in existing
+  codebase; single source of truth for port, baud, intervals, safety limits
+- `core/safety.py` — Servo angle clipping logic extracted from
+  `gui/gui_layout.py`; exact behavioural match verified by unit tests
+- `tests/test_safety.py` — 17 unit tests for `clip_servo_angles`
+- `CHANGELOG.md` — Project changelog
+- `AI_WORKFLOW.md` — Development process, role definitions, phase gates,
+  templates, and standing rules
+- `SPEC.md` — Feature specs and acceptance criteria; source of truth for
+  what gets built
+- `.github/workflows/ci.yml` — CI pipeline (pytest, flake8, mypy) on every
+  push and PR
+- `.gitignore`, `setup.cfg`, `conftest.py` — Project tooling config
+
+### Fixed
+- Import paths in `core/safety.py` and `tests/` corrected to
+  repo-root-relative (`from settings import ...` not `from stewart_control...`)
