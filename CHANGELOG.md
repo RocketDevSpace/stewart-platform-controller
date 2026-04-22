@@ -10,6 +10,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Milestone-3] - 2026-04-22
+
+### Added
+- `core/ik_engine.py` — single IK call site; `IKEngine.solve()` wraps
+  `kinematics/ik_solver.py`; module-level `solve_ik()` convenience function
+- `tests/test_ik_engine.py` — unit tests for `IKEngine.solve()` and `solve_ik()`
+  covering neutral pose, key dict shape, servo angle range, determinism, and
+  exception-to-failure mapping
+
+### Changed
+- `visualization/visualizer3d.py` — refactored to accept a pre-solved
+  `ik_result` dict; uses `IKEngine` as fallback; no longer imports
+  `ik_solver` directly
+- `setup.cfg` — removed `visualization/` from flake8 exclude list and mypy
+  exclude regex; it is now covered by CI automatically
+- `conftest.py` — added parent directory to `sys.path` so that legacy
+  `from stewart_control.config import ...` paths resolve under pytest
+
+---
+
 ## [Milestone-2] - 2026-04-22
 
 ### Added
