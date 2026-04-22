@@ -15,20 +15,21 @@ Purpose: GUI-driven Stewart platform controller with IK solving, serial comms to
          demo routines, and closed-loop ball balancing via computer vision.
 Stack: Python 3.11+, PyQt5, matplotlib, numpy, pyserial, opencv-contrib-python
 
-Directory structure (target — in progress):
-├── main.py                    # Entry point only
+Directory structure (current state on main):
+├── main.py                    # Entry point only. Legacy — do not modify.
 ├── config.py                  # Geometry constants only. Do not add runtime config here.
 ├── settings.py                # Runtime config: port, baud, intervals, safety limits.
 ├── conftest.py                # Pytest path shim. Do not modify.
+├── setup.cfg                  # flake8 + mypy config. Exclude list shrinks each milestone.
 │
 ├── core/
-│   ├── platform_state.py      # Dataclasses: Pose, ServoAngles, BallState. No logic.
+│   ├── platform_state.py      # Dataclasses: Pose, ServoAngles, BallState. No logic. ✅
 │   ├── ik_engine.py           # Single IK call site. Nothing else calls ik_solver directly.
-│   └── safety.py              # All servo clipping and validation. One place.
+│   └── safety.py              # All servo clipping and validation. One place. ✅
 │
 ├── hardware/
-│   ├── serial_manager.py      # Connection lifecycle, read loop, callbacks.
-│   └── servo_driver.py        # Formats commands, calls serial_manager.
+│   ├── serial_manager.py      # Connection lifecycle, read loop, callbacks. ✅
+│   └── servo_driver.py        # Formats commands, calls serial_manager. ✅
 │
 ├── control/
 │   ├── routine_runner.py      # Routine playback state machine. No Qt dependencies.
@@ -44,11 +45,14 @@ Directory structure (target — in progress):
 │   └── visualizer3d.py        # Draws pre-solved geometry. Does NOT call IK.
 │
 ├── gui/
-│   ├── main_window.py         # Top-level QWidget. Wires all modules.
-│   ├── control_panel.py       # Sliders, buttons, routine selector.
-│   └── serial_monitor.py      # Serial output display widget.
+│   ├── gui_layout.py          # Legacy monolith — will be split in M5.
+│   ├── main_window.py         # Top-level QWidget. Wires all modules. (target)
+│   ├── control_panel.py       # Sliders, buttons, routine selector. (target)
+│   └── serial_monitor.py      # Serial output display widget. (target)
 │
-└── tests/                     # Unit tests. One file per module.
+└── tests/
+    ├── test_safety.py         # ✅
+    └── test_servo_driver.py   # ✅
 ```
 
 **Module responsibilities — what each owns / does NOT own:**
@@ -62,7 +66,7 @@ Directory structure (target — in progress):
 - `control/routine_runner.py` — playback state machine. No Qt imports. Accepts tick() from GUI.
 - `control/ball_controller.py` — PD math only.
 - `cv/ball_tracker.py` — vision pipeline. Returns BallState.
-- `visualization/visualizer3d.py` — drawing only. Accepts pre-solved geometry.
+- `visualization/visualizer3d.py` — drawing only. Accepts pre-solved geometry. Does NOT call IK.
 - `gui/*` — view and wiring only. No control logic, no IK calls, no serial command building.
 
 **Shared data contracts:**
@@ -93,6 +97,7 @@ These are non-negotiable. Violating any of these is grounds for the PM to reject
 8. Hardware tests that require a physical Arduino must be marked `[HARDWARE]` and skipped in CI
    with `pytest.mark.skip(reason="requires hardware")`.
 9. Qt timer callbacks must stay fast (<5ms). Offload blocking work to threads.
+10. `visualization/visualizer3d.py` must NOT call IK. It receives pre-solved geometry as input.
 
 ---
 
@@ -111,7 +116,7 @@ These are non-negotiable. Violating any of these is grounds for the PM to reject
    - Title: `[MN] Milestone name`
    - Body: list each step completed, files created/modified, test results, any deviations
 6. One PR per milestone. Never open multiple PRs for a single milestone.
-7. When the PM posts review comments, reply to each comment thread individually:
+7. When the PM or any reviewer posts review comments, reply to each comment thread individually:
    `Fixed in <commit-hash> — <one line description of what changed>`
    Do not push silently. Do not reply with a general "done" message.
 
@@ -137,14 +142,18 @@ These are non-negotiable. Violating any of these is grounds for the PM to reject
 
 Every push and PR triggers `.github/workflows/ci.yml` which runs:
 - **pytest** — all tests in `tests/`
-- **flake8** — linting (scoped to clean/refactored modules only)
-- **mypy** — type checking (scoped to clean/refactored modules only)
+- **flake8** — whole repo, legacy modules excluded via `setup.cfg` exclude list
+- **mypy** — whole repo, legacy modules excluded via `setup.cfg` exclude regex
+- **types-pyserial** is installed as a dev dep — no `# type: ignore[import]` needed for serial
 
-Do not open a PR if CI is failing. Fix CI failures before opening the PR.
-Each milestone brief specifies which modules to add to the CI scope in that milestone.
+When a module is refactored in a milestone, remove it from the exclude lists in `setup.cfg`.
+Do not open a PR if CI is failing.
 
 ---
 
 ## Completed Milestones
 
 - **M1 — Foundation**: `core/platform_state.py`, `settings.py`, `core/safety.py`, `tests/test_safety.py`
+- **M2 — Hardware Layer**: `hardware/serial_manager.py`, `hardware/servo_driver.py`, `tests/test_servo_driver.py`
+  - CI flipped to exclude-list pattern per reviewer feedback
+  - CHANGELOG reformatted to keepachangelog standard
