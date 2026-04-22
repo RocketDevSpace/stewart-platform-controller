@@ -24,7 +24,7 @@ Directory structure (current state on main):
 │
 ├── core/
 │   ├── platform_state.py      # Dataclasses: Pose, ServoAngles, BallState. No logic. ✅
-│   ├── ik_engine.py           # Single IK call site. Nothing else calls ik_solver directly.
+│   ├── ik_engine.py           # Single IK call site. Nothing else calls ik_solver directly. ✅
 │   └── safety.py              # All servo clipping and validation. One place. ✅
 │
 ├── hardware/
@@ -32,6 +32,7 @@ Directory structure (current state on main):
 │   └── servo_driver.py        # Formats commands, calls serial_manager. ✅
 │
 ├── control/
+│   ├── __init__.py
 │   ├── routine_runner.py      # Routine playback state machine. No Qt dependencies.
 │   └── ball_controller.py     # PD controller. Pure math. No Qt dependencies.
 │
@@ -42,7 +43,7 @@ Directory structure (current state on main):
 │   └── routines.py            # Pure pose-list generators. No dependencies.
 │
 ├── visualization/
-│   └── visualizer3d.py        # Draws pre-solved geometry. Does NOT call IK.
+│   └── visualizer3d.py        # Draws pre-solved geometry. Does NOT call IK. ✅
 │
 ├── gui/
 │   ├── gui_layout.py          # Legacy monolith — will be split in M5.
@@ -52,7 +53,8 @@ Directory structure (current state on main):
 │
 └── tests/
     ├── test_safety.py         # ✅
-    └── test_servo_driver.py   # ✅
+    ├── test_servo_driver.py   # ✅
+    └── test_ik_engine.py      # ✅
 ```
 
 **Module responsibilities — what each owns / does NOT own:**
@@ -97,7 +99,8 @@ These are non-negotiable. Violating any of these is grounds for the PM to reject
 8. Hardware tests that require a physical Arduino must be marked `[HARDWARE]` and skipped in CI
    with `pytest.mark.skip(reason="requires hardware")`.
 9. Qt timer callbacks must stay fast (<5ms). Offload blocking work to threads.
-10. `visualization/visualizer3d.py` must NOT call IK. It receives pre-solved geometry as input.
+10. `visualization/visualizer3d.py` must NOT call IK directly. It uses IKEngine as a fallback only.
+11. `control/routine_runner.py` must have NO Qt imports. It accepts a tick() call from the GUI timer.
 
 ---
 
@@ -116,9 +119,17 @@ These are non-negotiable. Violating any of these is grounds for the PM to reject
    - Title: `[MN] Milestone name`
    - Body: list each step completed, files created/modified, test results, any deviations
 6. One PR per milestone. Never open multiple PRs for a single milestone.
-7. When the PM or any reviewer posts review comments, reply to each comment thread individually:
-   `Fixed in <commit-hash> — <one line description of what changed>`
-   Do not push silently. Do not reply with a general "done" message.
+7. **Review comment replies are mandatory.** When the PM or any reviewer posts a comment on the
+   PR, you MUST reply to that specific comment thread before pushing the fix. The reply format is:
+   ```
+   Acknowledged. Fixing in next commit.
+   ```
+   Then after pushing, reply again to the same thread:
+   ```
+   Fixed in <full-commit-hash> — <one line description of exactly what changed>
+   ```
+   Both replies are required. A silent push with no thread reply is a process violation.
+   Do not post a single general "all fixed" comment — reply to each thread individually.
 
 ---
 
@@ -135,6 +146,7 @@ These are non-negotiable. Violating any of these is grounds for the PM to reject
    Do not work around it silently.
 8. **Data contracts first.** If a step passes data between modules, verify the dataclass
    schema in `core/platform_state.py` exists and is approved before writing code that uses it.
+9. **Review replies are mandatory.** See Git Rule 7. This is not optional.
 
 ---
 
@@ -157,3 +169,7 @@ Do not open a PR if CI is failing.
 - **M2 — Hardware Layer**: `hardware/serial_manager.py`, `hardware/servo_driver.py`, `tests/test_servo_driver.py`
   - CI flipped to exclude-list pattern per reviewer feedback
   - CHANGELOG reformatted to keepachangelog standard
+- **M3 — IK Consolidation**: `core/ik_engine.py`, `tests/test_ik_engine.py`
+  - `visualization/visualizer3d.py` refactored to accept pre-solved geometry, uses IKEngine as fallback
+  - `visualization/` removed from CI exclude lists
+  - `conftest.py` extended with `stewart_control` module alias for legacy import compatibility
