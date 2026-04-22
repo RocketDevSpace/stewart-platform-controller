@@ -9,9 +9,25 @@ from stewart_control.comms.arduino_protocol import format_command
 from stewart_control.routines.routines import ROUTINES
 from stewart_control.cv.ball_tracker import BallTracker
 from stewart_control.cv.ball_controller import BallController
+from control.routine_runner import RoutineRunner
+from core.ik_engine import IKEngine
+from hardware.servo_driver import ServoDriver
 import time
 import threading
 
+
+class _LegacySerialAdapter:
+    """Adapts legacy SerialSender to the SerialManager.send() interface
+    expected by hardware/servo_driver.py. Only used so RoutineRunner can
+    dispatch via ServoDriver while gui_layout still owns a SerialSender."""
+    def __init__(self, legacy_serial):
+        self._s = legacy_serial
+    def send(self, data: bytes) -> bool:
+        try:
+            self._s.send_command(data)
+            return True
+        except Exception:
+            return False
 
 
 class StewartGUILayout(QWidget):
@@ -21,9 +37,6 @@ class StewartGUILayout(QWidget):
         super().__init__()
     
         # --- Internal flags and data structures ---
-        self.preview_mode = False
-        self.current_routine_steps = []
-        self.current_routine_index = 0
         self.ik_solver = ik_solver  # inject IK solver for real servo angles
         
         self.visualizer_update_skip = 5
@@ -48,6 +61,15 @@ class StewartGUILayout(QWidget):
         self.serial = SerialSender('COM4')
         self.serial.connect()
         self.serial.set_receive_callback(lambda line: self.serial_line_received.emit(line))
+
+        # --- Routine runner (Qt-free state machine) ---
+        self._ik_engine = IKEngine()
+        self._servo_driver = ServoDriver(_LegacySerialAdapter(self.serial))
+        self.routine_runner = RoutineRunner(
+            ik_engine=self._ik_engine,
+            serial_driver=self._servo_driver,
+            on_pose_update=self._on_routine_pose,
+        )
         
         self.profile_enabled = True
         self.profile_every_n = 10  # print every 10 steps
@@ -216,28 +238,20 @@ class StewartGUILayout(QWidget):
         self.preview_output.append(f"[INFO] Command sent: {cmd}")
 
         
-    def run_selected_routine(self):
-        routine_name = self.demo_list.currentText()
-    
-        if routine_name not in ROUTINES:
-            self.preview_output.append("[ERROR] Routine not found.")
-            return
-    
-        routine_func = ROUTINES[routine_name]
-    
-        # generate poses
-        poses = routine_func()
-    
-        self.preview_output.append(f"[INFO] Running routine: {routine_name}")
-        self.preview_output.append(f"[INFO] Steps: {len(poses)}")
-    
-        # store routine state for animation
-        self.current_routine_steps = poses
-        self.current_routine_index = 0
-    
-        # start timer-based playback
-        self.routine_timer.start(20)  # 500ms per step
-        
+    def _on_routine_pose(self, pose):
+        """Callback from RoutineRunner: mirror pose to sliders and visualizer."""
+        for ax in ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]:
+            self.sliders[ax].blockSignals(True)
+        self.sliders["X"].setValue(int(pose["x"]))
+        self.sliders["Y"].setValue(int(pose["y"]))
+        self.sliders["Z"].setValue(int(pose["z"]))
+        self.sliders["Roll"].setValue(int(pose["roll"]))
+        self.sliders["Pitch"].setValue(int(pose["pitch"]))
+        self.sliders["Yaw"].setValue(int(pose["yaw"]))
+        for ax in ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]:
+            self.sliders[ax].blockSignals(False)
+        self.visualizer.update_platform(pose)
+
     def on_routine_changed(self):
         routine_name = self.demo_list.currentText()
     
@@ -256,8 +270,8 @@ class StewartGUILayout(QWidget):
         
     def start_routine_preview(self, routine_name):
         self.preview_output.append(f"[INFO] Previewing routine: {routine_name}")
-        
-        # Get current pose from sliders to seed prev_arm_points
+
+        # Seed prev_arm_points from current slider pose for smooth visualization
         current_pose = {
             "x": self.sliders["X"].value(),
             "y": self.sliders["Y"].value(),
@@ -271,62 +285,41 @@ class StewartGUILayout(QWidget):
             current_pose['roll'], current_pose['pitch'], current_pose['yaw'],
             prev_arm_points=self.visualizer.prev_arm_points
         )
-        
-        # seed prev_arm_points
         self.visualizer.prev_arm_points = ik_seed.get("arm_points", None)
-    
-        routine_func = ROUTINES[routine_name]
-        poses = routine_func()
-    
-        if not poses or len(poses) < 2:
+
+        if not self.routine_runner.load(routine_name):
+            self.preview_output.append("[ERROR] Routine not found.")
+            return
+        if self.routine_runner.total_steps < 2:
             self.preview_output.append("[ERROR] Routine has no poses.")
             return
-    
-        self.preview_mode = True
-    
-        # Store routine state
-        self.current_routine_steps = poses
-        self.current_routine_index = 0
-    
-        # Disable manual controls
+
+        self.routine_runner.start_preview()
+
         for slider in self.sliders.values():
             slider.setEnabled(False)
-    
         self.cancel_routine_btn.setEnabled(True)
-    
-        # Start timer loop animation
-        self.routine_timer.start(20)  # speed of preview (ms)
-        
+
+        self.routine_timer.start(20)
+
     def cancel_routine_preview(self):
-        if self.preview_mode:
+        if self.routine_runner.is_running:
             self.preview_output.append("[INFO] Routine preview cancelled.")
-    
-        self.preview_mode = False
-    
-        # stop timer
+
+        self.routine_runner.cancel()
         self.routine_timer.stop()
-    
-        # RESET timer connections to default preview step
-        try:
-            self.routine_timer.timeout.disconnect()
-        except TypeError:
-            pass
-        self.routine_timer.timeout.connect(self._routine_step)
-    
-        self.current_routine_steps = []
-        self.current_routine_index = 0
-    
+
         for slider in self.sliders.values():
             slider.setEnabled(True)
-    
+
         self.send_button.setEnabled(True)
         self.cancel_routine_btn.setEnabled(False)
-    
+
         if self.demo_list.currentText() != "(Choose a routine...)":
             self.demo_list.blockSignals(True)
             self.demo_list.setCurrentIndex(0)
             self.demo_list.blockSignals(False)
-    
+
         pose = {
             "x": self.sliders["X"].value(),
             "y": self.sliders["Y"].value(),
@@ -335,48 +328,16 @@ class StewartGUILayout(QWidget):
             "pitch": self.sliders["Pitch"].value(),
             "yaw": self.sliders["Yaw"].value()
         }
-    
         self.visualizer.update_platform(pose)
 
-
     def _routine_step(self):
-        if not self.preview_mode:
-            return
-    
-        if len(self.current_routine_steps) == 0:
-            return
-    
-        pose = self.current_routine_steps[self.current_routine_index]
-    
-        # increment and wrap (looping)
-        self.current_routine_index += 1
-        if self.current_routine_index >= len(self.current_routine_steps):
-            self.current_routine_index = 0
-    
-        # Update sliders (even though disabled)
-        for ax in ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]:
-            self.sliders[ax].blockSignals(True)
-        
-        self.sliders["X"].setValue(int(pose["x"]))
-        self.sliders["Y"].setValue(int(pose["y"]))
-        self.sliders["Z"].setValue(int(pose["z"]))
-        self.sliders["Roll"].setValue(int(pose["roll"]))
-        self.sliders["Pitch"].setValue(int(pose["pitch"]))
-        self.sliders["Yaw"].setValue(int(pose["yaw"]))
-        
-        for ax in ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]:
-            self.sliders[ax].blockSignals(False)
-
-    
-        # Update visualizer preview
-        self.visualizer.update_platform({
-            "x": pose["x"],
-            "y": pose["y"],
-            "z": pose["z"],
-            "roll": pose["roll"],
-            "pitch": pose["pitch"],
-            "yaw": pose["yaw"]
-        })
+        still_going = self.routine_runner.tick()
+        if not still_going and not self.routine_runner.is_running:
+            self.routine_timer.stop()
+            for slider in self.sliders.values():
+                slider.setEnabled(True)
+            self.send_button.setEnabled(True)
+            self.cancel_routine_btn.setEnabled(False)
     
     
     def update_slider(self, axis, value, label):
@@ -421,228 +382,22 @@ class StewartGUILayout(QWidget):
 
 
     def send_to_arduino(self):
-        """Send either current slider pose or full routine to Arduino with confirmation + profiling."""
-    
-        if self.preview_mode:
-            self.preview_output.append("[PROFILE] Building routine command list...")
-    
-            t_build_start = time.perf_counter()
-    
-            # --- Step 1: Generate all routine commands ---
-            all_commands = []
-            ik_fail_count = 0
-    
-            for pose in self.current_routine_steps:
-                try:
-                    t_ik_start = time.perf_counter()
-    
-                    ik_result = self.ik_solver.solve_pose(
-                        pose['x'], pose['y'], pose['z'],
-                        pose['roll'], pose['pitch'], pose['yaw'],
-                        prev_arm_points=self.visualizer.prev_arm_points
-                    )
-    
-                    t_ik_end = time.perf_counter()
-    
-                    if not ik_result["success"]:
-                        ik_fail_count += 1
-                        continue
-    
-                    angles = [int(round(a)) for a in ik_result["servo_angles_deg"]]
+        """Send either current slider pose or full routine to Arduino."""
 
-                    safe_angles, clipped = self.safety_clip_servos(angles)
-                    
-                    cmd = "S," + ",".join(str(a) for a in safe_angles) + ",0\n"
-                    
-                    if clipped:
-                        for idx, original, new in clipped:
-                            self.preview_output.append(
-                                f'<span style="color:red;">[SAFETY CLIP] Servo {idx}: {original} → {new}</span>'
-                            )
+        if self.routine_runner.is_running:
+            routine_name = self.demo_list.currentText()
+            if not self.routine_runner.load(routine_name):
+                self.preview_output.append("[ERROR] Routine not found.")
+                return
+            self.routine_runner.start_send()
 
-    
-                    all_commands.append((cmd, pose))
-    
-                except Exception as e:
-                    ik_fail_count += 1
-                    self.preview_output.append(f"[ERROR] Routine IK calculation failed: {e}")
-                    continue
-    
-            t_build_end = time.perf_counter()
-    
-            build_ms = (t_build_end - t_build_start) * 1000
-            self.preview_output.append(
-                f"[PROFILE] Routine command generation complete: "
-                f"{len(all_commands)} valid steps, {ik_fail_count} failed. "
-                f"Build time = {build_ms:.2f} ms"
-            )
-    
-            if not all_commands:
-                self.preview_output.append("[ERROR] No valid servo commands generated for routine.")
-                return
-    
-            # --- Step 2: Show confirmation ---
-            cmds_text = "\n".join(c.strip() for c, _ in all_commands)
-    
-            t_confirm_start = time.perf_counter()
-            confirmed = self.confirm_large_text(
-                "Confirm Send Routine",
-                f"Send the following {len(all_commands)} servo commands to Arduino?",
-                cmds_text
-            )
-            t_confirm_end = time.perf_counter()
-    
-            confirm_ms = (t_confirm_end - t_confirm_start) * 1000
-            self.preview_output.append(f"[PROFILE] Confirm dialog time = {confirm_ms:.2f} ms")
-    
-            if not confirmed:
-                self.preview_output.append("[INFO] Routine send canceled by user.")
-                return
-    
-            # --- Step 3: Disable manual controls ---
             for slider in self.sliders.values():
                 slider.setEnabled(False)
-    
             self.send_button.setEnabled(False)
             self.cancel_routine_btn.setEnabled(True)
-    
-            # --- Step 4: Send routine step by step ---
-            self._routine_send_index = 0
-            self.routine_timer.stop()
-    
-            try:
-                self.routine_timer.timeout.disconnect(self._routine_step)
-            except TypeError:
-                pass
-    
-            # --- PROFILING STATE ---
-            self._profile_last_tick = None
-            self._profile_total_time = 0.0
-            self._profile_step_count = 0
-    
-            def send_next_step():
-                import time
-    
-                step_total_start = time.perf_counter()
-    
-                # --- TIMER JITTER CHECK ---
-                tick_now = time.perf_counter()
-                if self._profile_last_tick is not None:
-                    dt_ms = (tick_now - self._profile_last_tick) * 1000
-                else:
-                    dt_ms = None
-                self._profile_last_tick = tick_now
-    
-                if self._routine_send_index >= len(all_commands):
-                    self.preview_output.append("[INFO] Routine sent successfully.")
-    
-                    # Final stats
-                    if self._profile_step_count > 0:
-                        avg_step_ms = (self._profile_total_time / self._profile_step_count) * 1000
-                        hz = 1000.0 / avg_step_ms if avg_step_ms > 0 else 0
-                        self.preview_output.append(
-                            f"[PROFILE] Routine complete. Avg step time = {avg_step_ms:.2f} ms (~{hz:.1f} Hz)"
-                        )
-    
-                    for slider in self.sliders.values():
-                        slider.setEnabled(True)
-    
-                    self.send_button.setEnabled(True)
-                    self.cancel_routine_btn.setEnabled(self.preview_mode)
-    
-                    if self.preview_mode:
-                        try:
-                            self.routine_timer.timeout.disconnect(send_next_step)
-                        except TypeError:
-                            pass
-    
-                        self.routine_timer.timeout.connect(self._routine_step)
-                        self.routine_timer.start(20)
-    
-                    return
-    
-                cmd, pose = all_commands[self._routine_send_index]
-    
-                # --- SERIAL SEND TIMING ---
-                t_serial_start = time.perf_counter()
-                try:
-                    self.serial.send_command(cmd.encode())
-                except Exception as e:
-                    self.preview_output.append(f"[SERIAL ERROR] Send failed: {e}")
-                t_serial_end = time.perf_counter()
-    
-                # --- SLIDER UPDATE TIMING ---
-                t_slider_start = time.perf_counter()
-    
-                for ax in ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]:
-                    self.sliders[ax].blockSignals(True)
-    
-                for ax, key in zip(["X", "Y", "Z", "Roll", "Pitch", "Yaw"],
-                                   ["x", "y", "z", "roll", "pitch", "yaw"]):
-                    self.sliders[ax].setValue(int(pose[key]))
-    
-                for ax in ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]:
-                    self.sliders[ax].blockSignals(False)
-    
-                t_slider_end = time.perf_counter()
-    
-                # --- VISUALIZER UPDATE TIMING ---
-                t_vis_start = time.perf_counter()
-    
-                did_vis_update = False
-                if self._routine_send_index % self.visualizer_update_skip == 0:
-                    did_vis_update = True
-                    self.visualizer.update_platform({
-                        "x": pose["x"],
-                        "y": pose["y"],
-                        "z": pose["z"],
-                        "roll": pose["roll"],
-                        "pitch": pose["pitch"],
-                        "yaw": pose["yaw"]
-                    })
-    
-                t_vis_end = time.perf_counter()
-    
-                self._routine_send_index += 1
-    
-                step_total_end = time.perf_counter()
-    
-                # --- STEP TIMINGS ---
-                serial_ms = (t_serial_end - t_serial_start) * 1000
-                slider_ms = (t_slider_end - t_slider_start) * 1000
-                vis_ms = (t_vis_end - t_vis_start) * 1000
-                step_total_ms = (step_total_end - step_total_start) * 1000
-    
-                self._profile_total_time += (step_total_end - step_total_start)
-                self._profile_step_count += 1
-    
-                # --- PRINT EVERY N STEPS ---
-                if self._routine_send_index % 10 == 0:
-                    hz = 1000.0 / step_total_ms if step_total_ms > 0 else 0
-    
-                    if dt_ms is None:
-                        dt_str = "N/A"
-                    else:
-                        dt_str = f"{dt_ms:.2f}ms"
-    
-                    self.preview_output.append(
-                        f"[PROFILE] step {self._routine_send_index}/{len(all_commands)} | "
-                        f"tick_dt={dt_str} | "
-                        f"total={step_total_ms:.2f}ms (~{hz:.1f}Hz) | "
-                        f"serial={serial_ms:.2f}ms | "
-                        f"sliders={slider_ms:.2f}ms | "
-                        f"vis={vis_ms:.2f}ms (updated={did_vis_update})"
-                    )
-    
-            # connect and start
-            try:
-                self.routine_timer.timeout.disconnect()
-            except TypeError:
-                pass
-    
-            self.routine_timer.timeout.connect(send_next_step)
+
             self.routine_timer.start(20)
-    
+
         else:
             # --- Slider-driven send ---
             pose = {
