@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 from core.ik_engine import IKEngine, solve_ik
 from core.platform_state import Pose
