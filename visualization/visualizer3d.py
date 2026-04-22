@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from matplotlib.figure import Figure  # noqa: F401
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 from stewart_control.config import SERVO_SHAFTS, SERVO_AXES, PLATFORM_SIZE

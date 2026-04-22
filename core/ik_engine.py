@@ -19,4 +19,10 @@ class IKEngine:
 
 
 def solve_ik(pose: Pose, prev_arm_points: np.ndarray | None = None) -> dict:
+    """Stateless convenience wrapper around IKEngine.solve.
+
+    For repeated calls where arm-point continuity matters, the caller should
+    instantiate IKEngine directly and thread `prev_arm_points` through
+    successive calls rather than using this function.
+    """
     return IKEngine().solve(pose, prev_arm_points)
