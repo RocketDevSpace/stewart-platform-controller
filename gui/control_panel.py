@@ -46,6 +46,7 @@ class ControlPanel(QWidget):
 
         self._sliders: dict[str, QSlider] = {}
         self._slider_labels: dict[str, QLabel] = {}
+        self._vision_active = False
 
         main_layout = QHBoxLayout()
         main_layout.addLayout(self._build_slider_column())
@@ -176,10 +177,7 @@ class ControlPanel(QWidget):
             self.routine_selected.emit(name)
 
     def _on_vision_button(self) -> None:
-        # Toggle based on current button text — MainWindow drives the
-        # state via set_vision_active().
-        enabling = self._vision_button.text() == "Enable Vision Mode"
-        self.vision_toggled.emit(enabling)
+        self.vision_toggled.emit(not self._vision_active)
 
     def _on_kp_changed(self, raw: int) -> None:
         kp = raw / 1000.0
@@ -211,6 +209,7 @@ class ControlPanel(QWidget):
         self._cancel_routine_btn.setEnabled(enabled)
 
     def set_vision_active(self, active: bool) -> None:
+        self._vision_active = active
         if active:
             self._vision_button.setText("Vision Mode ACTIVE")
             self._vision_button.setStyleSheet(

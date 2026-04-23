@@ -51,6 +51,8 @@ class MainWindow(QWidget):
     serial_line_received = QtCore.pyqtSignal(str)
 
     def __init__(self, ik_solver: object = None) -> None:  # noqa: ARG002
+        # ik_solver accepted for API compatibility but ignored —
+        # MainWindow instantiates IKEngine directly. Remove in M6.
         super().__init__()
 
         # --- Core engines ---
