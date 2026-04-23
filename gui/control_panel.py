@@ -246,7 +246,7 @@ class ControlPanel(QWidget):
 
     def current_routine(self) -> str:
         """Return the current dropdown selection (placeholder if none)."""
-        return self._demo_list.currentText()
+        return str(self._demo_list.currentText())
 
     def append_preview(self, text: str) -> None:
         self._preview_output.append(text)
@@ -270,4 +270,4 @@ class ControlPanel(QWidget):
             message,
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         )
-        return reply == QtWidgets.QMessageBox.Yes
+        return bool(reply == QtWidgets.QMessageBox.Yes)
