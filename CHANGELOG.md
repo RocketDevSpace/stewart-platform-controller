@@ -10,6 +10,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Milestone-4] - 2026-04-22
+
+### Added
+- `control/__init__.py`, `control/routine_runner.py` — Qt-free routine
+  playback state machine; owns step list, current index, running flag, and
+  preview/send mode; accepts tick() calls from an external timer
+- `tests/test_routine_runner.py` — 14 unit tests covering load, preview
+  wrap-around, send-mode IK + serial dispatch, exhaustion, and cancel
+
+### Changed
+- `gui/gui_layout.py` — routine playback delegates to `RoutineRunner`;
+  removed `self.preview_mode`, `self.current_routine_steps`,
+  `self.current_routine_index`, and dead `run_selected_routine()`; the
+  send-routine path is now `load() + start_send()` (pre-compute loop,
+  confirm dialog, and profiling harness removed per milestone spec)
+- `setup.cfg` — added `[mypy-routines.*]` per-module override
+
+---
+
 ## [Milestone-3] - 2026-04-22
 
 ### Added
