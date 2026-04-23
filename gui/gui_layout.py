@@ -384,8 +384,8 @@ class StewartGUILayout(QWidget):
     def send_to_arduino(self):
         """Send either current slider pose or full routine to Arduino."""
 
-        if self.routine_runner.is_running:
-            routine_name = self.demo_list.currentText()
+        routine_name = self.demo_list.currentText()
+        if routine_name != "(Choose a routine...)":
             if not self.routine_runner.load(routine_name):
                 self.preview_output.append("[ERROR] Routine not found.")
                 return
