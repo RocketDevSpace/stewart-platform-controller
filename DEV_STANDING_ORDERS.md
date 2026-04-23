@@ -32,8 +32,7 @@ Directory structure (current state on main):
 │   └── servo_driver.py        # Formats commands, calls serial_manager. ✅
 │
 ├── control/
-│   ├── __init__.py
-│   ├── routine_runner.py      # Routine playback state machine. No Qt dependencies.
+│   ├── routine_runner.py      # Routine playback state machine. No Qt dependencies. ✅
 │   └── ball_controller.py     # PD controller. Pure math. No Qt dependencies.
 │
 ├── cv/
@@ -46,15 +45,16 @@ Directory structure (current state on main):
 │   └── visualizer3d.py        # Draws pre-solved geometry. Does NOT call IK. ✅
 │
 ├── gui/
-│   ├── gui_layout.py          # Legacy monolith — will be split in M5.
-│   ├── main_window.py         # Top-level QWidget. Wires all modules. (target)
-│   ├── control_panel.py       # Sliders, buttons, routine selector. (target)
-│   └── serial_monitor.py      # Serial output display widget. (target)
+│   ├── gui_layout.py          # Legacy monolith — RETIRED in M5. Do not add to it.
+│   ├── main_window.py         # Top-level QWidget. Wires all modules. (M5 target)
+│   ├── control_panel.py       # Sliders, buttons, routine selector. (M5 target)
+│   └── serial_monitor.py      # Serial output display widget. (M5 target)
 │
 └── tests/
     ├── test_safety.py         # ✅
     ├── test_servo_driver.py   # ✅
-    └── test_ik_engine.py      # ✅
+    ├── test_ik_engine.py      # ✅
+    └── test_routine_runner.py # ✅
 ```
 
 **Module responsibilities — what each owns / does NOT own:**
@@ -69,13 +69,16 @@ Directory structure (current state on main):
 - `control/ball_controller.py` — PD math only.
 - `cv/ball_tracker.py` — vision pipeline. Returns BallState.
 - `visualization/visualizer3d.py` — drawing only. Accepts pre-solved geometry. Does NOT call IK.
-- `gui/*` — view and wiring only. No control logic, no IK calls, no serial command building.
+- `gui/main_window.py` — top-level window, wires all modules together. View and wiring only.
+- `gui/control_panel.py` — slider and button widgets. No logic.
+- `gui/serial_monitor.py` — serial display widget. No logic.
 
 **Shared data contracts:**
 - `Pose`: x, y, z, roll, pitch, yaw — all float, mm and degrees
 - `ServoAngles`: list[float], 6 elements, degrees, index 0-5
 - `BallState`: x_mm, y_mm, vx_mm_s, vy_mm_s (required); z_mm, vz_mm_s (Optional, None if 2D)
 - IK result dict: {success, platform_points, arm_points, servo_angles_deg, platform_center, platform_R, debug}
+- Routine pose dict: {x, y, z, roll, pitch, yaw} — all float, passed to on_pose_update callback
 
 **Naming conventions:**
 - files: snake_case — classes: PascalCase — functions/methods: snake_case
@@ -93,7 +96,7 @@ These are non-negotiable. Violating any of these is grounds for the PM to reject
 3. Do not call `ik_solver.solve_pose()` directly — always go through `core/ik_engine.py`.
 4. Do not build `"S,..."` serial command strings inline — always use `hardware/servo_driver.py`.
 5. Do not put control logic or IK calls in any `gui/` file.
-6. Do not add hardcoded ports, intervals, or limits in logic files — use `settings.py`.
+6. Do not add hardcoded ports, intervals, or limits in logic files — use `settings.py`
 7. Import paths are repo-root-relative: `from settings import ...`, `from core.safety import ...`
    Never use `stewart_control.*` prefixes.
 8. Hardware tests that require a physical Arduino must be marked `[HARDWARE]` and skipped in CI
@@ -101,6 +104,8 @@ These are non-negotiable. Violating any of these is grounds for the PM to reject
 9. Qt timer callbacks must stay fast (<5ms). Offload blocking work to threads.
 10. `visualization/visualizer3d.py` must NOT call IK directly. It uses IKEngine as a fallback only.
 11. `control/routine_runner.py` must have NO Qt imports. It accepts a tick() call from the GUI timer.
+12. `gui/main_window.py` owns the QTimer and calls `routine_runner.tick()`. It does NOT contain
+    routine state logic, IK calls, or serial command building.
 
 ---
 
@@ -158,7 +163,7 @@ Every push and PR triggers `.github/workflows/ci.yml` which runs:
 - **mypy** — whole repo, legacy modules excluded via `setup.cfg` exclude regex
 - **types-pyserial** is installed as a dev dep — no `# type: ignore[import]` needed for serial
 
-When a module is refactored in a milestone, remove it from the exclude lists in `setup.cfg`.
+When a legacy module is refactored in a milestone, remove it from the exclude lists in `setup.cfg`.
 Do not open a PR if CI is failing.
 
 ---
@@ -172,4 +177,7 @@ Do not open a PR if CI is failing.
 - **M3 — IK Consolidation**: `core/ik_engine.py`, `tests/test_ik_engine.py`
   - `visualization/visualizer3d.py` refactored to accept pre-solved geometry, uses IKEngine as fallback
   - `visualization/` removed from CI exclude lists
-  - `conftest.py` extended with `stewart_control` module alias for legacy import compatibility
+- **M4 — Routine Runner Extraction**: `control/routine_runner.py`, `tests/test_routine_runner.py`
+  - `gui/gui_layout.py` routine state machine replaced with RoutineRunner calls
+  - `_LegacySerialAdapter` bridges SerialSender to ServoDriver for M4; will be removed in M5
+  - `self.preview_mode`, `self.current_routine_steps`, `self.current_routine_index` removed from GUI
