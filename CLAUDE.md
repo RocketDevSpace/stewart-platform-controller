@@ -41,8 +41,11 @@ routines/              # pure pose-list generators.
 visualization/
   visualizer3d.py      # drawing only. Accepts pre-solved geometry. ✅
 gui/
-  gui_layout.py        # legacy 25KB monolith. RETIRING in M5. Do not add to it.
-  gui_main.py          # ⚠ orphaned, not in any architecture doc — likely dead, kill in M5.
+  gui_layout_legacy.py # legacy monolith — RENAMED from gui_layout.py in PR #5. M6 deletes.
+  gui_main.py          # ⚠ orphaned, not in any architecture doc — likely dead, kill in M6.
+  main_window.py       # top-level window. Wires all modules. (PR #5)
+  control_panel.py     # sliders, buttons, signals. (PR #5)
+  serial_monitor.py    # serial output display widget. (PR #5)
 tests/                 # test_safety, test_servo_driver, test_ik_engine, test_routine_runner.
 ```
 
@@ -63,13 +66,13 @@ tests/                 # test_safety, test_servo_driver, test_ik_engine, test_ro
 
 ## Refactor state
 
-A 6-milestone refactor is in flight, extracting logic from `gui_layout.py` into clean modules. **M1–M4 complete. M5 and M6 pending.** Read `SPEC.md` for milestone scope and acceptance criteria. Read `CHANGELOG.md` for what each completed milestone shipped.
+A 6-milestone refactor is in flight, extracting logic from `gui_layout.py` into clean modules. **M1–M4 complete. M5 implemented in PR #5 (awaiting hardware smoke test). M6 pending.** Read `SPEC.md` for milestone scope and acceptance criteria. Read `CHANGELOG.md` for what each completed milestone shipped. Always check the open PR list before treating any milestone as 'pending' — implementation may be in review.
 
-**Known scope gaps** to fold into the remaining milestones:
-- M5 should also fix `main.py`'s `stewart_control.*` imports and remove orphaned `gui/gui_main.py`.
-- M6 should also move `ball_controller.py` from `cv/` to `control/` and retire any remaining usage of the `comms/` folder.
+**PR #5 status:** the M5 work is implemented on branch `milestone/5-gui-split`. New files: `gui/main_window.py`, `gui/control_panel.py`, `gui/serial_monitor.py`. Legacy file renamed to `gui/gui_layout_legacy.py`, preserved for one cycle, scheduled for deletion in M6. `_LegacySerialAdapter` removed. `main.py` rewritten without `stewart_control.*` imports. CI green; manual hardware smoke test pending.
 
-These weren't in the original SPEC and should be added when M5/M6 plans are finalized.
+**M6 scope** (the only remaining refactor milestone):
+- Original: `BallTracker` returns `BallState` dataclass, `BallController` accepts `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop ownership confirmed in `gui/main_window.py`.
+- Cleanup: move `ball_controller.py` from `cv/` to `control/`, retire `comms/`, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
 
 ## What good looks like in this domain
 
@@ -122,7 +125,7 @@ These are non-negotiable. Violating any is grounds to reject and revert.
 
 *Running log. Append when corrections happen. Format: trigger / failure / corrected pattern. Scan at the start of each session.*
 
-- *No entries yet — Stewart project just transitioning to the v5 / bootstrap-v2 doc system. Will accumulate as we work.*
+- **Entry 1 (2026-05-08):** *Trigger: a fresh Claude session reads PROJECT_STATE.md's 'M5: not started, next up' and treats it as authoritative without checking open PRs. Failure: produced a full M5 plan from scratch when PR #5 had been open for two weeks containing real M5 work. Corrected pattern: at session start, after reading PROJECT_STATE / CLAUDE.md, run `gh pr list` (or the GitHub MCP equivalent) and read open PR titles before treating any 'next up' / 'pending' status as the ground truth.*
 
 ## Verification expectations
 

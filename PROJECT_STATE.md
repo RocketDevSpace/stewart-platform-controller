@@ -12,14 +12,13 @@ A PyQt5 desktop application that drives a hand-built 6-DOF Stewart platform via 
 
 ## Current phase
 
-**Refactor: M1–M4 complete (merged), M5 + M6 pending.**
+**Refactor: M1–M4 complete (merged), M5 in review (PR #5), M6 pending.**
 
-M5 (GUI Split) and M6 (Vision Loop Cleanup) are the remaining milestones to fully retire `gui/gui_layout.py` and clean the vision pipeline. Two scope-gap items have been identified and should be folded into the M5 and M6 plans when those plans are written:
+M5 (GUI Split) is implemented and open as PR #5 on the `milestone/5-gui-split` branch. The PR splits `gui/gui_layout.py` into three focused widgets (`main_window.py`, `control_panel.py`, `serial_monitor.py`), removes `_LegacySerialAdapter`, eliminates inline `"S,..."` command strings and direct `ik_solver` calls from the GUI, and rewires `main.py` to drop the `stewart_control.*` imports. The legacy file is renamed to `gui_layout_legacy.py` and scheduled for deletion in M6 along with `gui/gui_main.py`. Pending: manual hardware smoke test, then merge.
 
-- M5 should also fix `main.py`'s `stewart_control.*` imports and remove orphaned `gui/gui_main.py`.
-- M6 should also move `ball_controller.py` from `cv/` to `control/` and retire any remaining usage of the `comms/` folder.
-
-After M5 and M6 ship, the refactor is complete and the project moves to feature work — the highest-priority new feature being a second-camera setup for 3D ball tracking (see Phase Roadmap below).
+M6 (Vision Loop Cleanup) remains pending. Its scope absorbs:
+- Original M6 scope: `BallTracker` returning `BallState` dataclass, `BallController` accepting `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop moved into `gui/main_window.py`.
+- Scope-gap items: move `ball_controller.py` from `cv/` to `control/`, retire the now-unreferenced `comms/` folder, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
 
 ## Architectural commitments
 
@@ -49,6 +48,7 @@ These are committed and shape the project. Revisable only with explicit discussi
 | 7 | CI uses exclude-list pattern (not include-list) for flake8 / mypy | Per reviewer feedback in M2; new clean modules are covered automatically without CI config changes. | Committed (M2) |
 | 8 | Adopt the v5 / bootstrap-v2 doc system | Replaces AI_WORKFLOW.md and DEV_STANDING_ORDERS.md with CLAUDE.md + PROJECT_CONTEXT + PROJECT_STATE. Existing SPEC.md and CHANGELOG.md retained. | Committed (May 7, 2026) |
 | 9 | M5 and M6 scope expanded to include cleanup items | `main.py` import fix + `gui/gui_main.py` removal added to M5; `ball_controller.py` move + `comms/` retirement added to M6. | Committed (May 7, 2026) |
+| 10 | M5 implementation took the 'preserve legacy file as `gui_layout_legacy.py` for one cycle' approach instead of immediate deletion | Allows side-by-side comparison during the M5 review and first manual hardware test. Deletion happens in M6. | Committed (PR #5, 2026-04-23) |
 
 For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone scope and acceptance criteria, see `SPEC.md`.
 
@@ -69,6 +69,8 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 *No entries yet — Stewart project just transitioned to the v5 / bootstrap-v2 doc system. Entries will accumulate as we work.*
 
 (Note: a fresh Claude reading the prior `AI_WORKFLOW.md` and `DEV_STANDING_ORDERS.md` would have inferred the "current state" architecture matches the target architecture. It doesn't — `main.py` uses forbidden imports, `ball_controller.py` is in the wrong directory, `gui/gui_main.py` is orphaned. **First entry for the log if any of these surface again:** *Trigger: a fresh session reads the architecture doc and assumes target = current. Failure: would propose changes against the wrong baseline. Corrected pattern: read CLAUDE.md's "Refactor state" section explicitly; do not assume target architecture matches current code.*)
+
+**Entry 1 (2026-05-08):** *Trigger: a fresh Claude session reads PROJECT_STATE.md's 'M5: not started, next up' and treats it as authoritative without checking open PRs. Failure: produced a full M5 plan from scratch when PR #5 had been open for two weeks containing real M5 work. Corrected pattern: at session start, after reading PROJECT_STATE / CLAUDE.md, run `gh pr list` (or the GitHub MCP equivalent) and read open PR titles before treating any 'next up' / 'pending' status as the ground truth.*
 
 ## Open questions
 
@@ -96,7 +98,7 @@ Rough plan, will evolve. Each phase produces reviewable artifacts; each builds o
 2. **M2 — Hardware Layer** ✅ (April 22, 2026)
 3. **M3 — IK Consolidation** ✅ (April 22, 2026)
 4. **M4 — Routine Runner Extraction** ✅ (April 22, 2026)
-5. **M5 — GUI Split + cleanup items** — not started, next up
+5. **M5 — GUI Split + cleanup items** — implemented in PR #5, awaiting hardware smoke test
 6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** — not started
 7. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
 8. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
