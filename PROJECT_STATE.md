@@ -66,8 +66,6 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 
 *Running log. Format: trigger / failure / corrected pattern. Scan at the start of each session.*
 
-*No entries yet — Stewart project just transitioned to the v5 / bootstrap-v2 doc system. Entries will accumulate as we work.*
-
 (Note: a fresh Claude reading the prior `AI_WORKFLOW.md` and `DEV_STANDING_ORDERS.md` would have inferred the "current state" architecture matches the target architecture. It doesn't — `main.py` uses forbidden imports, `ball_controller.py` is in the wrong directory, `gui/gui_main.py` is orphaned. **First entry for the log if any of these surface again:** *Trigger: a fresh session reads the architecture doc and assumes target = current. Failure: would propose changes against the wrong baseline. Corrected pattern: read CLAUDE.md's "Refactor state" section explicitly; do not assume target architecture matches current code.*)
 
 **Entry 1 (2026-05-08):** *Trigger: a fresh Claude session reads PROJECT_STATE.md's 'M5: not started, next up' and treats it as authoritative without checking open PRs. Failure: produced a full M5 plan from scratch when PR #5 had been open for two weeks containing real M5 work. Corrected pattern: at session start, after reading PROJECT_STATE / CLAUDE.md, run `gh pr list` (or the GitHub MCP equivalent) and read open PR titles before treating any 'next up' / 'pending' status as the ground truth.*
@@ -75,8 +73,7 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 ## Open questions
 
 **Open, current phase (M5):**
-- M5 implementation plan has not been written yet. Needs to address: original M5 scope (GUI split into main_window / control_panel / serial_monitor) plus the scope-gap items (main.py imports, gui_main.py removal, _LegacySerialAdapter removal).
-- After GUI split, where do the QTimer ownership and the vision-loop ownership land? SPEC.md M6 mentions "Vision loop moved to `gui/main_window.py`" — confirm this stays the M6 design.
+- Hardware smoke test pending before PR #5 can merge. M5 is fully implemented; this is the only remaining gate.
 
 **Open, M6:**
 - `BallTracker` returning `BallState` dataclass instead of dict — straightforward but requires touching ball_controller's input shape.

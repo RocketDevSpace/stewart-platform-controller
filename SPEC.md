@@ -118,7 +118,7 @@ No behavior changes. Pure restructuring.
 ---
 
 ### Milestone 5 — GUI Split
-**Status:** Not started
+**Status:** In review (PR #5, awaiting hardware smoke test)
 
 **What it does:** Breaks `gui_layout.py` into focused widgets.
 
