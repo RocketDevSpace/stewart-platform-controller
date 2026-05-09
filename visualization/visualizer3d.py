@@ -5,7 +5,7 @@ from typing import Any
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
-from stewart_control.config import SERVO_SHAFTS, SERVO_AXES, PLATFORM_SIZE
+from config import SERVO_SHAFTS, SERVO_AXES, PLATFORM_SIZE
 from core.ik_engine import IKEngine
 from core.platform_state import Pose
 
