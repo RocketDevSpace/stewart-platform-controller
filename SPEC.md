@@ -33,7 +33,7 @@ using computer vision.
 ## Refactor Milestones
 
 ### Milestone 1 — Foundation
-**Status:** In progress
+**Status:** Complete (2026-04-21)
 
 **What it does:** Establishes data contracts, runtime config, and safety layer.
 No behavior changes. Pure restructuring.
@@ -58,7 +58,7 @@ No behavior changes. Pure restructuring.
 ---
 
 ### Milestone 2 — Hardware Layer
-**Status:** Not started
+**Status:** Complete (2026-04-22)
 
 **What it does:** Consolidates all serial command building and dispatch.
 
@@ -80,7 +80,7 @@ No behavior changes. Pure restructuring.
 ---
 
 ### Milestone 3 — IK Consolidation
-**Status:** Not started
+**Status:** Complete (2026-04-22)
 
 **What it does:** Creates a single IK call site. Removes IK from the visualizer.
 
@@ -99,7 +99,7 @@ No behavior changes. Pure restructuring.
 ---
 
 ### Milestone 4 — Routine Runner Extraction
-**Status:** Not started
+**Status:** Complete (2026-04-22)
 
 **What it does:** Moves routine playback state machine out of the GUI.
 
@@ -118,7 +118,7 @@ No behavior changes. Pure restructuring.
 ---
 
 ### Milestone 5 — GUI Split
-**Status:** Not started
+**Status:** In review (PR #5, awaiting hardware smoke test)
 
 **What it does:** Breaks `gui_layout.py` into focused widgets.
 
