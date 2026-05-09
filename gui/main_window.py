@@ -48,6 +48,7 @@ from visualization.visualizer3d import StewartVisualizer
 
 class MainWindow(QWidget):
     serial_line_received = QtCore.pyqtSignal(str)
+    _draw_pose = QtCore.pyqtSignal(dict)
 
     def __init__(self, ik_solver: object = None) -> None:  # noqa: ARG002
         # ik_solver accepted for API compatibility but ignored —
@@ -107,6 +108,7 @@ class MainWindow(QWidget):
         self._vis_thread.start()
 
         # --- Wire signals ---
+        self._draw_pose.connect(self.visualizer.update_platform)
         self.serial_line_received.connect(self.serial_monitor.append_line)
         self.control_panel.slider_changed.connect(self._on_slider_changed)
         self.control_panel.routine_selected.connect(self._on_routine_selected)
@@ -340,7 +342,7 @@ class MainWindow(QWidget):
                 if self._latest_pose is not None:
                     pose = self._latest_pose.copy()
             if pose is not None:
-                self.visualizer.update_platform(pose)
+                self._draw_pose.emit(pose)
             time.sleep(VISUALIZER_THREAD_INTERVAL_S)
 
     # ------------------------------------------------------------------
