@@ -41,10 +41,9 @@ from settings import (
     SERIAL_BAUD,
     SERIAL_PORT,
     VISION_LOOP_INTERVAL_MS,
+    VISUALIZER_THREAD_INTERVAL_S,
 )
 from visualization.visualizer3d import StewartVisualizer
-
-VISUALIZER_THREAD_INTERVAL_S = 0.03
 
 
 class MainWindow(QWidget):
