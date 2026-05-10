@@ -7,19 +7,9 @@ Created on Tue Feb 24 16:13:27 2026
 
 import math
 import time
-from dataclasses import dataclass
 
-
-@dataclass
-class BallState:
-    """
-    Standardized ball state container.
-    This mirrors what the CV module should provide.
-    """
-    x_mm: float
-    y_mm: float
-    vx_mm_s: float
-    vy_mm_s: float
+from core.platform_state import BallState
+from settings import DEBUG_PRINTS
 
 
 class BallController:
@@ -69,7 +59,7 @@ class BallController:
     def disable(self):
         self.enabled = False
 
-    def compute(self, ball_state: dict | BallState):
+    def compute(self, ball_state: BallState):
         """
         Compute desired platform tilt.
 
@@ -84,17 +74,10 @@ class BallController:
         if ball_state is None:
             return 0.0, 0.0
 
-        # Accept dict or BallState
-        if isinstance(ball_state, dict):
-            x = ball_state["x_mm"]
-            y = ball_state["y_mm"]
-            vx = ball_state["vx_mm_s"]
-            vy = ball_state["vy_mm_s"]
-        else:
-            x = ball_state.x_mm
-            y = ball_state.y_mm
-            vx = ball_state.vx_mm_s
-            vy = ball_state.vy_mm_s
+        x = ball_state.x_mm
+        y = ball_state.y_mm
+        vx = ball_state.vx_mm_s
+        vy = ball_state.vy_mm_s
 
         # ---------------------------
         # Control Law
@@ -119,8 +102,9 @@ class BallController:
         pitch = self._clamp(pitch, -self.max_tilt_deg, self.max_tilt_deg)
         
         t1 = time.perf_counter()
-        
-        print(f"PD compute: {(t1-t0)*1000:.3f} ms")
+
+        if DEBUG_PRINTS:
+            print(f"PD compute: {(t1-t0)*1000:.3f} ms")
         
         # print(f"pitch={pitch:.3f}, roll_y={roll:.3f}")
 
