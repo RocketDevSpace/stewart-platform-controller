@@ -150,11 +150,12 @@ workspace issue at yaw=-35°, not an M5 regression. Logged for M6.
 - Vision loop moved to `gui/main_window.py`
 
 **Acceptance criteria:**
-- Ball balancing works as before
+- BallState dataclass used end-to-end (BallTracker → BallController)
 - No timing prints when `DEBUG_PRINTS = False`
-- BallState dataclass used end-to-end
+- Vision loop wires cleanly through new interfaces; code path is correct. Ball balance behavior is known broken pre-M6 and is not a test gate here — fix is deferred to the Codex integration milestone.
+- No regressions in manual control, routines, visualizer, or serial monitor.
 
-**Test gate:** Unit test for BallController with mock BallState. Manual vision mode test.
+**Test gate:** Unit test for BallController with mock BallState. Manual smoke test of non-vision functionality.
 
 ---
 

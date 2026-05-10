@@ -95,12 +95,13 @@ Rough plan, will evolve. Each phase produces reviewable artifacts; each builds o
 4. **M4 — Routine Runner Extraction** ✅ (April 22, 2026)
 5. **M5 — GUI Split + cleanup items** ✅ (May 10, 2026)
 6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** — in progress
-7. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
-8. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
-9. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.
-10. **Phase 5: Multiple ball targets** — multi-blob tracking, target assignment.
+7. **Codex audit + integration** — full diff of refactored codebase vs latest Codex branches; port new features and vision fixes; iterate to full working ball balance. Immediate post-M6 priority before any Phase 2 hardware work.
+8. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
+9. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
+10. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.
+11. **Phase 5: Multiple ball targets** — multi-blob tracking, target assignment.
 
-The post-refactor phases (7–10) are not committed; they're the trajectory the architecture is being built to support. Real plans get written when M6 lands and a Phase 2 SPEC update is needed.
+The post-refactor phases (8–11) are not committed; they're the trajectory the architecture is being built to support. Real plans get written when M6 lands and a Phase 2 SPEC update is needed.
 
 ## Project layout on disk
 
