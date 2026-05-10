@@ -10,6 +10,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Milestone-6] - 2026-05-10
+
+### Added
+- `control/ball_controller.py` — `BallController` moved from `cv/` to `control/`;
+  now imports `BallState` from `core.platform_state` (local duplicate removed);
+  `compute()` accepts `BallState` only (dict fallback removed); timing print gated
+  on `settings.DEBUG_PRINTS`.
+- `tests/test_ball_controller.py` — 13 unit tests covering None input, disabled
+  controller, roll/pitch output direction (all four quadrants), clamping at
+  `max_tilt_deg`, and `set_gains()` behaviour.
+
+### Changed
+- `cv/ball_tracker.py` — `update()` returns `BallState` (from `core.platform_state`)
+  instead of a raw dict; three timing `print()` calls gated on `settings.DEBUG_PRINTS`.
+- `setup.cfg` — exclude lists trimmed: `comms`, `gui/gui_layout_legacy.py`,
+  `gui/gui_main.py` removed (files deleted); `cv/` directory exclude narrowed to
+  `cv/ball_tracker.py` (ball_controller moved to `control/`); `[mypy-cv.*]`
+  override narrowed to `[mypy-cv.ball_tracker]`.
+
+### Removed
+- `cv/ball_controller.py` — moved to `control/ball_controller.py`.
+- `comms/` — entire folder deleted (`__init__.py`, `arduino_protocol.py`,
+  `serial_sender.py` all superseded by `hardware/` since M2; nothing imported them).
+- `gui/gui_layout_legacy.py` — legacy monolith retired in M5, deleted in M6.
+- `gui/gui_main.py` — orphaned shim, never wired into architecture.
+
+---
+
 ## [Milestone-5] - 2026-04-23
 
 ### Added
