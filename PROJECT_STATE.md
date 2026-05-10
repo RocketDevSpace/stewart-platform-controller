@@ -2,7 +2,7 @@
 
 *Living document — update at the end of substantive sessions. Sync between venues if applicable.*
 
-**Last updated:** May 7, 2026 — initial PROJECT_STATE creation; folding existing artifacts (CHANGELOG, SPEC, AI_WORKFLOW, DEV_STANDING_ORDERS) into the v5 / bootstrap-v2 doc system.
+**Last updated:** May 10, 2026 — M5 merged; M6 branch opened.
 
 ---
 
@@ -12,13 +12,13 @@ A PyQt5 desktop application that drives a hand-built 6-DOF Stewart platform via 
 
 ## Current phase
 
-**Refactor: M1–M4 complete (merged), M5 in review (PR #5), M6 pending.**
+**Refactor: M1–M5 complete (merged), M6 in progress.**
 
-M5 (GUI Split) is implemented and open as PR #5 on the `milestone/5-gui-split` branch. The PR splits `gui/gui_layout.py` into three focused widgets (`main_window.py`, `control_panel.py`, `serial_monitor.py`), removes `_LegacySerialAdapter`, eliminates inline `"S,..."` command strings and direct `ik_solver` calls from the GUI, and rewires `main.py` to drop the `stewart_control.*` imports. The legacy file is renamed to `gui_layout_legacy.py` and scheduled for deletion in M6 along with `gui/gui_main.py`. Pending: manual hardware smoke test, then merge.
+M5 (GUI Split) merged 2026-05-10. Smoke test confirmed: manual control, parabola routine, visualizer, serial monitor all working. Screw routine has a pre-existing IK branch-switching issue at yaw=-35° (not an M5 regression); logged for investigation in M6.
 
-M6 (Vision Loop Cleanup) remains pending. Its scope absorbs:
-- Original M6 scope: `BallTracker` returning `BallState` dataclass, `BallController` accepting `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop moved into `gui/main_window.py`.
-- Scope-gap items: move `ball_controller.py` from `cv/` to `control/`, retire the now-unreferenced `comms/` folder, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
+M6 (Vision Loop Cleanup) is now the active milestone on branch `milestone/6-vision-loop-cleanup`. Its scope:
+- Original M6 scope: `BallTracker` returning `BallState` dataclass, `BallController` accepting `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop confirmed in `gui/main_window.py`.
+- Cleanup: move `ball_controller.py` from `cv/` to `control/`, retire the now-unreferenced `comms/` folder, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
 
 ## Architectural commitments
 

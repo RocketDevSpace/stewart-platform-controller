@@ -118,7 +118,7 @@ No behavior changes. Pure restructuring.
 ---
 
 ### Milestone 5 — GUI Split
-**Status:** In review (PR #5, awaiting hardware smoke test)
+**Status:** Complete (2026-05-10)
 
 **What it does:** Breaks `gui_layout.py` into focused widgets.
 
@@ -132,10 +132,14 @@ No behavior changes. Pure restructuring.
 
 **Test gate:** Full manual GUI smoke test.
 
+**Notes:** Screw routine produces unexpected servo limit behaviour (3 servos
+snap min→max ~2s in). Root cause is a pre-existing IK branch-switching
+workspace issue at yaw=-35°, not an M5 regression. Logged for M6.
+
 ---
 
 ### Milestone 6 — Vision Loop Cleanup
-**Status:** Not started
+**Status:** In progress
 
 **What it does:** Wires CV through clean interfaces. Cleans up debug output.
 
