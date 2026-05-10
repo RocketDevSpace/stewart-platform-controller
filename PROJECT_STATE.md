@@ -49,6 +49,8 @@ These are committed and shape the project. Revisable only with explicit discussi
 | 8 | Adopt the v5 / bootstrap-v2 doc system | Replaces AI_WORKFLOW.md and DEV_STANDING_ORDERS.md with CLAUDE.md + PROJECT_CONTEXT + PROJECT_STATE. Existing SPEC.md and CHANGELOG.md retained. | Committed (May 7, 2026) |
 | 9 | M5 and M6 scope expanded to include cleanup items | `main.py` import fix + `gui/gui_main.py` removal added to M5; `ball_controller.py` move + `comms/` retirement added to M6. | Committed (May 7, 2026) |
 | 10 | M5 implementation took the 'preserve legacy file as `gui_layout_legacy.py` for one cycle' approach instead of immediate deletion | Allows side-by-side comparison during the M5 review and first manual hardware test. Deletion happens in M6. | Committed (PR #5, 2026-04-23) |
+| 11 | M6 Step 1 also updates `gui/main_window.py` dict accesses on `ball_state` | PM plan omitted this; `_vision_control_step` accesses `ball_state["x_mm"]` and `ball_state["y_mm"]` which break at runtime once tracker returns `BallState`. Fix is in-scope for Step 1 since it's the same transition. | Committed (M6, May 10, 2026) |
+| 12 | M6 Step 5 narrows `cv/` flake8/mypy exclude to `cv/ball_tracker.py` rather than removing it | PM plan said "remove cv/ball_controller.py from excludes" but setup.cfg excludes the whole `cv/` directory. After ball_controller moves to `control/`, `cv/ball_tracker.py` remains untyped and must stay excluded. Directory-level exclude is replaced with a file-level one. | Committed (M6, May 10, 2026) |
 
 For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone scope and acceptance criteria, see `SPEC.md`.
 
