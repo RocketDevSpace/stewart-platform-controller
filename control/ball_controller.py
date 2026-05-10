@@ -1,25 +1,7 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Feb 24 16:13:27 2026
-
-@author: hudso
-"""
-
-import math
 import time
-from dataclasses import dataclass
 
-
-@dataclass
-class BallState:
-    """
-    Standardized ball state container.
-    This mirrors what the CV module should provide.
-    """
-    x_mm: float
-    y_mm: float
-    vx_mm_s: float
-    vy_mm_s: float
+from core.platform_state import BallState
+from settings import DEBUG_PRINTS
 
 
 class BallController:
@@ -46,7 +28,7 @@ class BallController:
         self.max_tilt_deg = max_tilt_deg
 
         self.enabled = True
-        
+
         self.pitch_offset = 0
         self.roll_offset = 0
 
@@ -54,22 +36,22 @@ class BallController:
     # Public Interface
     # ---------------------------
 
-    def set_gains(self, kp: float, kd: float):
+    def set_gains(self, kp: float, kd: float) -> None:
         """Update controller gains live (from GUI sliders)."""
         self.kp = kp
         self.kd = kd
 
-    def set_max_tilt(self, max_tilt_deg: float):
+    def set_max_tilt(self, max_tilt_deg: float) -> None:
         """Update safety tilt limit."""
         self.max_tilt_deg = max_tilt_deg
 
-    def enable(self):
+    def enable(self) -> None:
         self.enabled = True
 
-    def disable(self):
+    def disable(self) -> None:
         self.enabled = False
 
-    def compute(self, ball_state: dict | BallState):
+    def compute(self, ball_state: BallState | None) -> tuple[float, float]:
         """
         Compute desired platform tilt.
 
@@ -84,45 +66,27 @@ class BallController:
         if ball_state is None:
             return 0.0, 0.0
 
-        # Accept dict or BallState
-        if isinstance(ball_state, dict):
-            x = ball_state["x_mm"]
-            y = ball_state["y_mm"]
-            vx = ball_state["vx_mm_s"]
-            vy = ball_state["vy_mm_s"]
-        else:
-            x = ball_state.x_mm
-            y = ball_state.y_mm
-            vx = ball_state.vx_mm_s
-            vy = ball_state.vy_mm_s
+        x = ball_state.x_mm
+        y = ball_state.y_mm
+        vx = ball_state.vx_mm_s
+        vy = ball_state.vy_mm_s
 
-        # ---------------------------
-        # Control Law
-        # ---------------------------
-
-        # Error: want ball at (0, 0)
         ex = -x
         ey = -y
 
-        # PD control
         pitch = self.kp * ex + self.kd * (-vx)
         roll = -(self.kp * ey + self.kd * (-vy))
-        
+
         pitch = pitch + self.pitch_offset
         roll = roll + self.roll_offset
 
-        # ---------------------------
-        # Safety Clamping
-        # ---------------------------
-
         roll = self._clamp(roll, -self.max_tilt_deg, self.max_tilt_deg)
         pitch = self._clamp(pitch, -self.max_tilt_deg, self.max_tilt_deg)
-        
+
         t1 = time.perf_counter()
-        
-        print(f"PD compute: {(t1-t0)*1000:.3f} ms")
-        
-        # print(f"pitch={pitch:.3f}, roll_y={roll:.3f}")
+
+        if DEBUG_PRINTS:
+            print(f"PD compute: {(t1-t0)*1000:.3f} ms")
 
         return roll, pitch
 
@@ -131,5 +95,5 @@ class BallController:
     # ---------------------------
 
     @staticmethod
-    def _clamp(value: float, min_val: float, max_val: float):
+    def _clamp(value: float, min_val: float, max_val: float) -> float:
         return max(min(value, max_val), min_val)

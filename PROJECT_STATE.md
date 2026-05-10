@@ -2,7 +2,7 @@
 
 *Living document — update at the end of substantive sessions. Sync between venues if applicable.*
 
-**Last updated:** May 7, 2026 — initial PROJECT_STATE creation; folding existing artifacts (CHANGELOG, SPEC, AI_WORKFLOW, DEV_STANDING_ORDERS) into the v5 / bootstrap-v2 doc system.
+**Last updated:** May 10, 2026 — M5 merged; M6 branch opened.
 
 ---
 
@@ -12,13 +12,13 @@ A PyQt5 desktop application that drives a hand-built 6-DOF Stewart platform via 
 
 ## Current phase
 
-**Refactor: M1–M4 complete (merged), M5 in review (PR #5), M6 pending.**
+**Refactor: M1–M5 complete (merged), M6 in progress.**
 
-M5 (GUI Split) is implemented and open as PR #5 on the `milestone/5-gui-split` branch. The PR splits `gui/gui_layout.py` into three focused widgets (`main_window.py`, `control_panel.py`, `serial_monitor.py`), removes `_LegacySerialAdapter`, eliminates inline `"S,..."` command strings and direct `ik_solver` calls from the GUI, and rewires `main.py` to drop the `stewart_control.*` imports. The legacy file is renamed to `gui_layout_legacy.py` and scheduled for deletion in M6 along with `gui/gui_main.py`. Pending: manual hardware smoke test, then merge.
+M5 (GUI Split) merged 2026-05-10. Smoke test confirmed: manual control, parabola routine, visualizer, serial monitor all working. Screw routine has a pre-existing IK branch-switching issue at yaw=-35° (not an M5 regression); logged for investigation in M6.
 
-M6 (Vision Loop Cleanup) remains pending. Its scope absorbs:
-- Original M6 scope: `BallTracker` returning `BallState` dataclass, `BallController` accepting `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop moved into `gui/main_window.py`.
-- Scope-gap items: move `ball_controller.py` from `cv/` to `control/`, retire the now-unreferenced `comms/` folder, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
+M6 (Vision Loop Cleanup) is now the active milestone on branch `milestone/6-vision-loop-cleanup`. Its scope:
+- Original M6 scope: `BallTracker` returning `BallState` dataclass, `BallController` accepting `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop confirmed in `gui/main_window.py`.
+- Cleanup: move `ball_controller.py` from `cv/` to `control/`, retire the now-unreferenced `comms/` folder, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
 
 ## Architectural commitments
 
@@ -49,6 +49,8 @@ These are committed and shape the project. Revisable only with explicit discussi
 | 8 | Adopt the v5 / bootstrap-v2 doc system | Replaces AI_WORKFLOW.md and DEV_STANDING_ORDERS.md with CLAUDE.md + PROJECT_CONTEXT + PROJECT_STATE. Existing SPEC.md and CHANGELOG.md retained. | Committed (May 7, 2026) |
 | 9 | M5 and M6 scope expanded to include cleanup items | `main.py` import fix + `gui/gui_main.py` removal added to M5; `ball_controller.py` move + `comms/` retirement added to M6. | Committed (May 7, 2026) |
 | 10 | M5 implementation took the 'preserve legacy file as `gui_layout_legacy.py` for one cycle' approach instead of immediate deletion | Allows side-by-side comparison during the M5 review and first manual hardware test. Deletion happens in M6. | Committed (PR #5, 2026-04-23) |
+| 11 | M6 Step 1 also updates `gui/main_window.py` dict accesses on `ball_state` | PM plan omitted this; `_vision_control_step` accesses `ball_state["x_mm"]` and `ball_state["y_mm"]` which break at runtime once tracker returns `BallState`. Fix is in-scope for Step 1 since it's the same transition. | Committed (M6, May 10, 2026) |
+| 12 | M6 Step 5 narrows `cv/` flake8/mypy exclude to `cv/ball_tracker.py` rather than removing it | PM plan said "remove cv/ball_controller.py from excludes" but setup.cfg excludes the whole `cv/` directory. After ball_controller moves to `control/`, `cv/ball_tracker.py` remains untyped and must stay excluded. Directory-level exclude is replaced with a file-level one. | Committed (M6, May 10, 2026) |
 
 For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone scope and acceptance criteria, see `SPEC.md`.
 
@@ -72,13 +74,6 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 
 ## Open questions
 
-**Open, current phase (M5):**
-- Hardware smoke test pending before PR #5 can merge. M5 is fully implemented; this is the only remaining gate.
-
-**Open, M6:**
-- `BallTracker` returning `BallState` dataclass instead of dict — straightforward but requires touching ball_controller's input shape.
-- Where exactly does `ball_controller.py` move to in `control/`, and does anything currently importing it from `cv/` need updating?
-
 **Open, future phase:**
 - Second-camera setup. SPEC.md has it under "Future Features" — needs a real plan when M5/M6 land. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
 - Ball catching feasibility is gated on whether the control loop can run sub-20ms. Should be benchmarked on actual hardware before scoping the feature.
@@ -86,6 +81,9 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 **Closed:**
 - Whether to use the v5 / bootstrap-v2 doc system → adopted May 7, 2026 (Decision #8 above).
 - Whether to expand M5/M6 scope to include cleanup → yes, expanded May 7, 2026 (Decision #9 above).
+- Hardware smoke test gate for PR #5 → passed May 10, 2026. Manual control, parabola routine, visualizer, serial monitor all confirmed working. Screw routine IK issue is pre-existing, not a regression.
+- `BallTracker` returning `BallState` dataclass → resolved in M6 (PR #7, Step 1). `update()` now returns `BallState` from `core.platform_state`.
+- Where `ball_controller.py` moves → resolved in M6 (PR #7, Step 3). Moved to `control/ball_controller.py`; only `gui/main_window.py` imported from `cv.ball_controller` in clean code, updated in same step.
 
 ## Phase roadmap
 
@@ -95,14 +93,15 @@ Rough plan, will evolve. Each phase produces reviewable artifacts; each builds o
 2. **M2 — Hardware Layer** ✅ (April 22, 2026)
 3. **M3 — IK Consolidation** ✅ (April 22, 2026)
 4. **M4 — Routine Runner Extraction** ✅ (April 22, 2026)
-5. **M5 — GUI Split + cleanup items** — implemented in PR #5, awaiting hardware smoke test
-6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** — not started
-7. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
-8. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
-9. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.
-10. **Phase 5: Multiple ball targets** — multi-blob tracking, target assignment.
+5. **M5 — GUI Split + cleanup items** ✅ (May 10, 2026)
+6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** — in progress
+7. **Codex audit + integration** — full diff of refactored codebase vs latest Codex branches; port new features and vision fixes; iterate to full working ball balance. Immediate post-M6 priority before any Phase 2 hardware work.
+8. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
+9. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
+10. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.
+11. **Phase 5: Multiple ball targets** — multi-blob tracking, target assignment.
 
-The post-refactor phases (7–10) are not committed; they're the trajectory the architecture is being built to support. Real plans get written when M6 lands and a Phase 2 SPEC update is needed.
+The post-refactor phases (8–11) are not committed; they're the trajectory the architecture is being built to support. Real plans get written when M6 lands and a Phase 2 SPEC update is needed.
 
 ## Project layout on disk
 

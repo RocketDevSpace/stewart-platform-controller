@@ -30,7 +30,7 @@ from matplotlib.figure import Figure
 from control.routine_runner import RoutineRunner
 from core.ik_engine import IKEngine
 from core.platform_state import Pose
-from cv.ball_controller import BallController
+from control.ball_controller import BallController
 from cv.ball_tracker import BallTracker
 from gui.control_panel import ControlPanel, ROUTINE_PLACEHOLDER
 from gui.serial_monitor import SerialMonitor

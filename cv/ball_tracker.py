@@ -3,6 +3,9 @@ import numpy as np
 import time
 import math
 
+from core.platform_state import BallState
+from settings import DEBUG_PRINTS
+
 
 class BallTracker:
 
@@ -265,17 +268,13 @@ class BallTracker:
         self.prev_time = current_time
 
         self._debug_show(frame, warped, mask, bx, by, vx, vy)
-        
-        print(f"Capture: {(t1-t0)*1000:.1f} ms")
-        print(f"Aruco: {(t2-t1)*1000:.1f} ms")
-        print(f"Ball: {(t3-t2)*1000:.1f} ms")
 
-        return {
-            "x_mm": x_mm,
-            "y_mm": y_mm,
-            "vx_mm_s": vx,
-            "vy_mm_s": vy
-        }
+        if DEBUG_PRINTS:
+            print(f"Capture: {(t1-t0)*1000:.1f} ms")
+            print(f"Aruco: {(t2-t1)*1000:.1f} ms")
+            print(f"Ball: {(t3-t2)*1000:.1f} ms")
+
+        return BallState(x_mm=x_mm, y_mm=y_mm, vx_mm_s=vx, vy_mm_s=vy)
 
     # =========================
     # DEBUG DISPLAY
