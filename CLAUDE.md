@@ -14,7 +14,7 @@ PyQt5 desktop app controlling a 6-DOF Stewart platform via Arduino serial. Inclu
 ## Current architecture (in flight — see "Refactor state" below)
 
 ```
-main.py                # entry point — currently has stewart_control.* imports (M5 fix)
+main.py                # entry point — repo-root-relative imports. ✅
 config.py              # physical geometry constants only. NOT runtime config.
 settings.py            # runtime config: port, baud, intervals, safety limits.
 conftest.py            # pytest path shim.
@@ -66,11 +66,11 @@ tests/                 # test_safety, test_servo_driver, test_ik_engine, test_ro
 
 ## Refactor state
 
-A 6-milestone refactor is in flight, extracting logic from `gui_layout.py` into clean modules. **M1–M4 complete. M5 implemented in PR #5 (awaiting hardware smoke test). M6 pending.** Read `SPEC.md` for milestone scope and acceptance criteria. Read `CHANGELOG.md` for what each completed milestone shipped. Always check the open PR list before treating any milestone as 'pending' — implementation may be in review.
+A 6-milestone refactor is in flight, extracting logic from `gui_layout.py` into clean modules. **M1–M5 complete (M5 merged 2026-05-10). M6 active on branch `milestone/6-vision-loop-cleanup`.** Read `SPEC.md` for milestone scope and acceptance criteria. Read `CHANGELOG.md` for what each completed milestone shipped. Always check the open PR list before treating any milestone as 'pending' — implementation may be in review.
 
-**PR #5 status:** the M5 work is implemented on branch `milestone/5-gui-split`. New files: `gui/main_window.py`, `gui/control_panel.py`, `gui/serial_monitor.py`. Legacy file renamed to `gui/gui_layout_legacy.py`, preserved for one cycle, scheduled for deletion in M6. `_LegacySerialAdapter` removed. `main.py` rewritten without `stewart_control.*` imports. CI green; manual hardware smoke test pending.
+**M5 status:** merged 2026-05-10. Smoke test passed — manual control, routines (parabola confirmed), visualizer, serial monitor all working. Screw routine has a pre-existing IK branch-switching issue at yaw=-35° (3 servos snap min→max ~2s in); not an M5 regression, logged for M6 investigation.
 
-**M6 scope** (the only remaining refactor milestone):
+**M6 scope** (the only remaining refactor milestone, branch `milestone/6-vision-loop-cleanup`):
 - Original: `BallTracker` returns `BallState` dataclass, `BallController` accepts `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop ownership confirmed in `gui/main_window.py`.
 - Cleanup: move `ball_controller.py` from `cv/` to `control/`, retire `comms/`, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
 

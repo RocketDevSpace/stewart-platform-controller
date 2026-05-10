@@ -72,9 +72,6 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 
 ## Open questions
 
-**Open, current phase (M5):**
-- Hardware smoke test pending before PR #5 can merge. M5 is fully implemented; this is the only remaining gate.
-
 **Open, M6:**
 - `BallTracker` returning `BallState` dataclass instead of dict — straightforward but requires touching ball_controller's input shape.
 - Where exactly does `ball_controller.py` move to in `control/`, and does anything currently importing it from `cv/` need updating?
@@ -86,6 +83,7 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 **Closed:**
 - Whether to use the v5 / bootstrap-v2 doc system → adopted May 7, 2026 (Decision #8 above).
 - Whether to expand M5/M6 scope to include cleanup → yes, expanded May 7, 2026 (Decision #9 above).
+- Hardware smoke test gate for PR #5 → passed May 10, 2026. Manual control, parabola routine, visualizer, serial monitor all confirmed working. Screw routine IK issue is pre-existing, not a regression.
 
 ## Phase roadmap
 
@@ -95,8 +93,8 @@ Rough plan, will evolve. Each phase produces reviewable artifacts; each builds o
 2. **M2 — Hardware Layer** ✅ (April 22, 2026)
 3. **M3 — IK Consolidation** ✅ (April 22, 2026)
 4. **M4 — Routine Runner Extraction** ✅ (April 22, 2026)
-5. **M5 — GUI Split + cleanup items** — implemented in PR #5, awaiting hardware smoke test
-6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** — not started
+5. **M5 — GUI Split + cleanup items** ✅ (May 10, 2026)
+6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** — in progress
 7. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
 8. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
 9. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.
