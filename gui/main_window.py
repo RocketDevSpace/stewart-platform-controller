@@ -37,6 +37,7 @@ from gui.serial_monitor import SerialMonitor
 from hardware.serial_manager import SerialManager
 from hardware.servo_driver import ServoDriver
 from settings import (
+    CAMERA_INDEX,
     CONTROL_LOOP_INTERVAL_MS,
     SERIAL_BAUD,
     SERIAL_PORT,
@@ -83,7 +84,7 @@ class MainWindow(QWidget):
         )
 
         # --- Ball balancing ---
-        self.ball_tracker = BallTracker()
+        self.ball_tracker = BallTracker(camera_index=CAMERA_INDEX)
         self.ball_controller = BallController(
             kp=0.005, kd=0.010, max_tilt_deg=8.0
         )
