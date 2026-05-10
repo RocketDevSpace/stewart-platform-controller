@@ -31,22 +31,19 @@ hardware/
 
 control/
   routine_runner.py    # routine playback state machine. No Qt deps. ✅
-  ball_controller.py   # PD controller. ⚠ STILL IN cv/ — move pending in M6.
+  ball_controller.py   # PD controller. ✅
 
 cv/
-  ball_tracker.py      # vision pipeline. Returns BallState (pending M6 dataclass refactor).
-  ball_controller.py   # ⚠ should be in control/ — pending M6.
+  ball_tracker.py      # vision pipeline. Returns BallState. ✅
 
 routines/              # pure pose-list generators.
 visualization/
   visualizer3d.py      # drawing only. Accepts pre-solved geometry. ✅
 gui/
-  gui_layout_legacy.py # legacy monolith — RENAMED from gui_layout.py in PR #5. M6 deletes.
-  gui_main.py          # ⚠ orphaned, not in any architecture doc — likely dead, kill in M6.
-  main_window.py       # top-level window. Wires all modules. (PR #5)
-  control_panel.py     # sliders, buttons, signals. (PR #5)
-  serial_monitor.py    # serial output display widget. (PR #5)
-tests/                 # test_safety, test_servo_driver, test_ik_engine, test_routine_runner.
+  main_window.py       # top-level window. Wires all modules. ✅
+  control_panel.py     # sliders, buttons, signals. ✅
+  serial_monitor.py    # serial output display widget. ✅
+tests/                 # test_safety, test_servo_driver, test_ik_engine, test_routine_runner, test_ball_controller.
 ```
 
 **Module ownership boundaries:**

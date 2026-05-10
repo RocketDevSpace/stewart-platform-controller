@@ -74,10 +74,6 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 
 ## Open questions
 
-**Open, M6:**
-- `BallTracker` returning `BallState` dataclass instead of dict — straightforward but requires touching ball_controller's input shape.
-- Where exactly does `ball_controller.py` move to in `control/`, and does anything currently importing it from `cv/` need updating?
-
 **Open, future phase:**
 - Second-camera setup. SPEC.md has it under "Future Features" — needs a real plan when M5/M6 land. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
 - Ball catching feasibility is gated on whether the control loop can run sub-20ms. Should be benchmarked on actual hardware before scoping the feature.
@@ -86,6 +82,8 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 - Whether to use the v5 / bootstrap-v2 doc system → adopted May 7, 2026 (Decision #8 above).
 - Whether to expand M5/M6 scope to include cleanup → yes, expanded May 7, 2026 (Decision #9 above).
 - Hardware smoke test gate for PR #5 → passed May 10, 2026. Manual control, parabola routine, visualizer, serial monitor all confirmed working. Screw routine IK issue is pre-existing, not a regression.
+- `BallTracker` returning `BallState` dataclass → resolved in M6 (PR #7, Step 1). `update()` now returns `BallState` from `core.platform_state`.
+- Where `ball_controller.py` moves → resolved in M6 (PR #7, Step 3). Moved to `control/ball_controller.py`; only `gui/main_window.py` imported from `cv.ball_controller` in clean code, updated in same step.
 
 ## Phase roadmap
 
