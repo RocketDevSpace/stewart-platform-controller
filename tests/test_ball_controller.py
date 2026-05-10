@@ -14,7 +14,7 @@ from control.ball_controller import BallController
 from core.platform_state import BallState
 
 
-def _state(x=0.0, y=0.0, vx=0.0, vy=0.0) -> BallState:
+def _state(x: float = 0.0, y: float = 0.0, vx: float = 0.0, vy: float = 0.0) -> BallState:
     return BallState(x_mm=x, y_mm=y, vx_mm_s=vx, vy_mm_s=vy)
 
 

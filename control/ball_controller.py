@@ -36,22 +36,22 @@ class BallController:
     # Public Interface
     # ---------------------------
 
-    def set_gains(self, kp: float, kd: float):
+    def set_gains(self, kp: float, kd: float) -> None:
         """Update controller gains live (from GUI sliders)."""
         self.kp = kp
         self.kd = kd
 
-    def set_max_tilt(self, max_tilt_deg: float):
+    def set_max_tilt(self, max_tilt_deg: float) -> None:
         """Update safety tilt limit."""
         self.max_tilt_deg = max_tilt_deg
 
-    def enable(self):
+    def enable(self) -> None:
         self.enabled = True
 
-    def disable(self):
+    def disable(self) -> None:
         self.enabled = False
 
-    def compute(self, ball_state: BallState):
+    def compute(self, ball_state: BallState | None) -> tuple[float, float]:
         """
         Compute desired platform tilt.
 
@@ -95,5 +95,5 @@ class BallController:
     # ---------------------------
 
     @staticmethod
-    def _clamp(value: float, min_val: float, max_val: float):
+    def _clamp(value: float, min_val: float, max_val: float) -> float:
         return max(min(value, max_val), min_val)
