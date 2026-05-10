@@ -1,11 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Feb 24 16:13:27 2026
-
-@author: hudso
-"""
-
-import math
 import time
 
 from core.platform_state import BallState
@@ -36,7 +28,7 @@ class BallController:
         self.max_tilt_deg = max_tilt_deg
 
         self.enabled = True
-        
+
         self.pitch_offset = 0
         self.roll_offset = 0
 
@@ -79,34 +71,22 @@ class BallController:
         vx = ball_state.vx_mm_s
         vy = ball_state.vy_mm_s
 
-        # ---------------------------
-        # Control Law
-        # ---------------------------
-
-        # Error: want ball at (0, 0)
         ex = -x
         ey = -y
 
-        # PD control
         pitch = self.kp * ex + self.kd * (-vx)
         roll = -(self.kp * ey + self.kd * (-vy))
-        
+
         pitch = pitch + self.pitch_offset
         roll = roll + self.roll_offset
 
-        # ---------------------------
-        # Safety Clamping
-        # ---------------------------
-
         roll = self._clamp(roll, -self.max_tilt_deg, self.max_tilt_deg)
         pitch = self._clamp(pitch, -self.max_tilt_deg, self.max_tilt_deg)
-        
+
         t1 = time.perf_counter()
 
         if DEBUG_PRINTS:
             print(f"PD compute: {(t1-t0)*1000:.3f} ms")
-        
-        # print(f"pitch={pitch:.3f}, roll_y={roll:.3f}")
 
         return roll, pitch
 
