@@ -10,6 +10,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Milestone-5] - 2026-04-23
+
+### Added
+- `gui/main_window.py` — top-level window; wires `SerialManager`,
+  `ServoDriver`, `IKEngine`, `RoutineRunner`, `StewartVisualizer`,
+  `ControlPanel`, `SerialMonitor`, `BallTracker`, `BallController`. Owns
+  the routine and vision QTimers and the background visualizer thread.
+- `gui/control_panel.py` — slider/button widget; signal-only public
+  interface (`slider_changed`, `routine_selected`, `routine_cancelled`,
+  `send_clicked`, `vision_toggled`, `kp_changed`, `kd_changed`,
+  `raw_command_sent`) plus setter methods for view state.
+- `gui/serial_monitor.py` — read-only display widget for the Arduino
+  serial stream.
+
+### Changed
+- `main.py` — now imports `MainWindow`; `IKWrapper` removed (`MainWindow`
+  instantiates `IKEngine` directly).
+- `gui/gui_layout.py` renamed to `gui/gui_layout_legacy.py` (retired;
+  scheduled for deletion in M6).
+- `hardware/serial_manager.py` is now used directly by `MainWindow`;
+  `_LegacySerialAdapter` bridge removed.
+- `setup.cfg` — `gui/` removed from CI exclude lists; only
+  `gui/gui_layout_legacy.py` and the pre-existing
+  `gui/gui_main.py` shim remain excluded. Added `[mypy-cv.*]`,
+  `[mypy-PyQt5.*]`, and `[mypy-matplotlib.*]` overrides.
+
+### Removed
+- `_LegacySerialAdapter` bridge class.
+- `IKWrapper` class from `main.py`.
+
+---
+
 ## [Milestone-4] - 2026-04-22
 
 ### Added

@@ -6,7 +6,7 @@ Updated: 2026-02-16
 """
 
 import numpy as np
-from stewart_control.config import (
+from config import (
     SERVO_SHAFTS,
     SERVO_AXES,
     SERVO_SIGN,
