@@ -13,6 +13,7 @@ from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
     QComboBox,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -24,11 +25,47 @@ from PyQt5.QtWidgets import (
 )
 
 from routines.routines import ROUTINES
+from settings import (
+    BALL_TARGET_DEFAULT_X_MM,
+    BALL_TARGET_DEFAULT_Y_MM,
+    MANUAL_PITCH_TRIM_DEG,
+    MANUAL_ROLL_TRIM_DEG,
+    PD_DEFAULT_KD,
+    PD_DEFAULT_KP,
+    TRACKER_HSV_H_MAX,
+    TRACKER_HSV_H_MIN,
+    TRACKER_HSV_S_MAX,
+    TRACKER_HSV_S_MIN,
+    TRACKER_HSV_V_MAX,
+    TRACKER_HSV_V_MIN,
+)
 
 ROUTINE_PLACEHOLDER = "(Choose a routine...)"
 AXES = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_KEYS = {"X": "x", "Y": "y", "Z": "z",
              "Roll": "roll", "Pitch": "pitch", "Yaw": "yaw"}
+
+_DARK_QSS = (
+    "QWidget { background: #0b0f16; color: #d6e2ff;"
+    " font-family: 'Segoe UI'; font-size: 10pt; }"
+    " QGroupBox { border: 1px solid #1f2a3a; margin-top: 10px;"
+    " border-radius: 6px; padding: 8px; }"
+    " QGroupBox::title { subcontrol-origin: margin; left: 8px;"
+    " padding: 0 4px; color: #7dd3fc; font-weight: 600; }"
+    " QPushButton { background: #162033; border: 1px solid #2a3b59;"
+    " border-radius: 5px; padding: 6px 10px; color: #d6e2ff; }"
+    " QPushButton:hover { background: #1e2c45; }"
+    " QPushButton:pressed { background: #0f1726; }"
+    " QPushButton:disabled { color: #6b7a90; border-color: #2a3342; }"
+    " QTextEdit, QLineEdit, QComboBox { background: #0f1726;"
+    " border: 1px solid #27364d; border-radius: 4px; color: #d6e2ff; }"
+    " QSlider::groove:horizontal { border: 1px solid #2a3b59; height: 6px;"
+    " background: #121a2a; border-radius: 3px; }"
+    " QSlider::handle:horizontal { background: #7dd3fc;"
+    " border: 1px solid #38bdf8; width: 14px; margin: -6px 0;"
+    " border-radius: 7px; }"
+    " QLabel { color: #d6e2ff; }"
+)
 
 
 class ControlPanel(QWidget):
@@ -40,6 +77,16 @@ class ControlPanel(QWidget):
     kp_changed = pyqtSignal(float)
     kd_changed = pyqtSignal(float)
     raw_command_sent = pyqtSignal(str)
+    target_changed = pyqtSignal(float, float)        # x_mm, y_mm
+    trim_changed = pyqtSignal(float, float)          # roll_deg, pitch_deg
+    auto_trim_toggled = pyqtSignal(bool)
+    calibrate_home_clicked = pyqtSignal()
+    reset_trim_clicked = pyqtSignal()
+    autotune_enable_clicked = pyqtSignal(bool)
+    autotune_apply_clicked = pyqtSignal()
+    autotune_auto_apply_clicked = pyqtSignal(bool)
+    hsv_changed = pyqtSignal(int, int, int, int, int, int)  # hmin,hmax,smin,smax,vmin,vmax
+    open_vision_monitor_clicked = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -47,11 +94,18 @@ class ControlPanel(QWidget):
         self._sliders: dict[str, QSlider] = {}
         self._slider_labels: dict[str, QLabel] = {}
         self._vision_active = False
+        self._auto_trim_active = False
+        self._calibrating_home = False
+        self._autotune_enabled = False
+        self._autotune_auto_apply = False
 
         main_layout = QHBoxLayout()
         main_layout.addLayout(self._build_slider_column())
         main_layout.addLayout(self._build_middle_column())
+        main_layout.addLayout(self._build_vision_column())
         self.setLayout(main_layout)
+
+        self.setStyleSheet(_DARK_QSS)
 
     # ------------------------------------------------------------------
     # Layout builders
@@ -85,10 +139,7 @@ class ControlPanel(QWidget):
         layout.addWidget(QLabel("Demo Routines:"))
         layout.addWidget(self._demo_list)
 
-        self._cancel_routine_btn = QPushButton("\u274c Cancel Routine")
-        self._cancel_routine_btn.setStyleSheet(
-            "background-color: darkred; color: white; font-weight: bold;"
-        )
+        self._cancel_routine_btn = QPushButton("❌ Cancel Routine")
         self._cancel_routine_btn.clicked.connect(self.routine_cancelled.emit)
         self._cancel_routine_btn.setEnabled(False)
         layout.addWidget(self._cancel_routine_btn)
@@ -96,44 +147,35 @@ class ControlPanel(QWidget):
         layout.addWidget(QLabel("Ball Balancing Control"))
 
         self._vision_button = QPushButton("Enable Vision Mode")
-        self._vision_button.setStyleSheet(
-            "background-color: darkgreen; color: white;"
-        )
         self._vision_button.clicked.connect(self._on_vision_button)
         layout.addWidget(self._vision_button)
 
         self._cancel_vision_btn = QPushButton("\U0001f6d1 Cancel Vision Mode")
-        self._cancel_vision_btn.setStyleSheet(
-            "background-color: darkred; color: white;"
-        )
         self._cancel_vision_btn.clicked.connect(
             lambda: self.vision_toggled.emit(False)
         )
         self._cancel_vision_btn.setEnabled(False)
         layout.addWidget(self._cancel_vision_btn)
 
-        self._kp_label = QLabel("Kp: 0.005")
+        self._kp_label = QLabel(f"Kp: {PD_DEFAULT_KP:.3f}")
         self._kp_slider = QSlider(QtCore.Qt.Horizontal)
         self._kp_slider.setMinimum(0)
-        self._kp_slider.setMaximum(100)
-        self._kp_slider.setValue(5)
+        self._kp_slider.setMaximum(300)  # supports PD_AUTOTUNE_MAX_KP = 0.250
+        self._kp_slider.setValue(int(PD_DEFAULT_KP * 1000))
         self._kp_slider.valueChanged.connect(self._on_kp_changed)
         layout.addWidget(self._kp_label)
         layout.addWidget(self._kp_slider)
 
-        self._kd_label = QLabel("Kd: 0.010")
+        self._kd_label = QLabel(f"Kd: {PD_DEFAULT_KD:.3f}")
         self._kd_slider = QSlider(QtCore.Qt.Horizontal)
         self._kd_slider.setMinimum(0)
         self._kd_slider.setMaximum(100)
-        self._kd_slider.setValue(10)
+        self._kd_slider.setValue(int(PD_DEFAULT_KD * 1000))
         self._kd_slider.valueChanged.connect(self._on_kd_changed)
         layout.addWidget(self._kd_label)
         layout.addWidget(self._kd_slider)
 
         self._send_button = QPushButton("SEND TO ARDUINO")
-        self._send_button.setStyleSheet(
-            "background-color: red; color: white; font-size: 16pt;"
-        )
         self._send_button.clicked.connect(self.send_clicked.emit)
         layout.addWidget(self._send_button)
 
@@ -161,8 +203,163 @@ class ControlPanel(QWidget):
 
         return layout
 
+    def _build_vision_column(self) -> QVBoxLayout:
+        layout = QVBoxLayout()
+
+        # --- Ball Target ---
+        target_group = QGroupBox("Ball Target")
+        tg = QVBoxLayout()
+
+        self._target_x_label = QLabel(
+            f"Target X: {BALL_TARGET_DEFAULT_X_MM:.0f} mm"
+        )
+        self._target_x_slider = QSlider(QtCore.Qt.Horizontal)
+        self._target_x_slider.setMinimum(-120)
+        self._target_x_slider.setMaximum(120)
+        self._target_x_slider.setValue(int(BALL_TARGET_DEFAULT_X_MM))
+        self._target_x_slider.valueChanged.connect(self._on_target_changed)
+        tg.addWidget(self._target_x_label)
+        tg.addWidget(self._target_x_slider)
+
+        self._target_y_label = QLabel(
+            f"Target Y: {BALL_TARGET_DEFAULT_Y_MM:.0f} mm"
+        )
+        self._target_y_slider = QSlider(QtCore.Qt.Horizontal)
+        self._target_y_slider.setMinimum(-120)
+        self._target_y_slider.setMaximum(120)
+        self._target_y_slider.setValue(int(BALL_TARGET_DEFAULT_Y_MM))
+        self._target_y_slider.valueChanged.connect(self._on_target_changed)
+        tg.addWidget(self._target_y_label)
+        tg.addWidget(self._target_y_slider)
+
+        target_group.setLayout(tg)
+        layout.addWidget(target_group)
+
+        # --- Platform Trim ---
+        trim_group = QGroupBox("Platform Trim")
+        tr = QVBoxLayout()
+
+        self._trim_roll_label = QLabel(f"Roll Trim: {MANUAL_ROLL_TRIM_DEG:.2f}°")
+        self._trim_roll_slider = QSlider(QtCore.Qt.Horizontal)
+        self._trim_roll_slider.setMinimum(-1000)
+        self._trim_roll_slider.setMaximum(1000)
+        self._trim_roll_slider.setValue(int(MANUAL_ROLL_TRIM_DEG * 100))
+        self._trim_roll_slider.valueChanged.connect(self._on_trim_changed)
+        tr.addWidget(self._trim_roll_label)
+        tr.addWidget(self._trim_roll_slider)
+
+        self._trim_pitch_label = QLabel(
+            f"Pitch Trim: {MANUAL_PITCH_TRIM_DEG:.2f}°"
+        )
+        self._trim_pitch_slider = QSlider(QtCore.Qt.Horizontal)
+        self._trim_pitch_slider.setMinimum(-1000)
+        self._trim_pitch_slider.setMaximum(1000)
+        self._trim_pitch_slider.setValue(int(MANUAL_PITCH_TRIM_DEG * 100))
+        self._trim_pitch_slider.valueChanged.connect(self._on_trim_changed)
+        tr.addWidget(self._trim_pitch_label)
+        tr.addWidget(self._trim_pitch_slider)
+
+        self._auto_trim_btn = QPushButton("Auto-Trim: OFF")
+        self._auto_trim_btn.clicked.connect(self._on_auto_trim_toggled)
+        tr.addWidget(self._auto_trim_btn)
+
+        self._calibrate_home_btn = QPushButton("Calibrate Home")
+        self._calibrate_home_btn.clicked.connect(self._on_calibrate_home)
+        tr.addWidget(self._calibrate_home_btn)
+
+        self._reset_trim_btn = QPushButton("Reset Trim to Config")
+        self._reset_trim_btn.clicked.connect(self.reset_trim_clicked.emit)
+        tr.addWidget(self._reset_trim_btn)
+
+        trim_group.setLayout(tr)
+        layout.addWidget(trim_group)
+
+        # --- PD Autotune ---
+        tune_group = QGroupBox("PD Autotune")
+        tune = QVBoxLayout()
+
+        self._autotune_enable_btn = QPushButton("AutoTune: OFF")
+        self._autotune_enable_btn.clicked.connect(self._on_autotune_enable)
+        tune.addWidget(self._autotune_enable_btn)
+
+        self._autotune_apply_btn = QPushButton("Apply Now")
+        self._autotune_apply_btn.clicked.connect(self.autotune_apply_clicked.emit)
+        tune.addWidget(self._autotune_apply_btn)
+
+        self._autotune_auto_apply_btn = QPushButton("Auto-Apply: OFF")
+        self._autotune_auto_apply_btn.clicked.connect(self._on_autotune_auto_apply)
+        tune.addWidget(self._autotune_auto_apply_btn)
+
+        tune_group.setLayout(tune)
+        layout.addWidget(tune_group)
+
+        # --- HSV Thresholds ---
+        hsv_group = QGroupBox("HSV Thresholds")
+        hsv = QVBoxLayout()
+
+        self._hsv_h_min_label = QLabel(f"H Min: {TRACKER_HSV_H_MIN}")
+        self._hsv_h_min_slider = QSlider(QtCore.Qt.Horizontal)
+        self._hsv_h_min_slider.setRange(0, 179)
+        self._hsv_h_min_slider.setValue(TRACKER_HSV_H_MIN)
+        self._hsv_h_min_slider.valueChanged.connect(self._on_hsv_changed)
+        hsv.addWidget(self._hsv_h_min_label)
+        hsv.addWidget(self._hsv_h_min_slider)
+
+        self._hsv_h_max_label = QLabel(f"H Max: {TRACKER_HSV_H_MAX}")
+        self._hsv_h_max_slider = QSlider(QtCore.Qt.Horizontal)
+        self._hsv_h_max_slider.setRange(0, 179)
+        self._hsv_h_max_slider.setValue(TRACKER_HSV_H_MAX)
+        self._hsv_h_max_slider.valueChanged.connect(self._on_hsv_changed)
+        hsv.addWidget(self._hsv_h_max_label)
+        hsv.addWidget(self._hsv_h_max_slider)
+
+        self._hsv_s_min_label = QLabel(f"S Min: {TRACKER_HSV_S_MIN}")
+        self._hsv_s_min_slider = QSlider(QtCore.Qt.Horizontal)
+        self._hsv_s_min_slider.setRange(0, 255)
+        self._hsv_s_min_slider.setValue(TRACKER_HSV_S_MIN)
+        self._hsv_s_min_slider.valueChanged.connect(self._on_hsv_changed)
+        hsv.addWidget(self._hsv_s_min_label)
+        hsv.addWidget(self._hsv_s_min_slider)
+
+        self._hsv_s_max_label = QLabel(f"S Max: {TRACKER_HSV_S_MAX}")
+        self._hsv_s_max_slider = QSlider(QtCore.Qt.Horizontal)
+        self._hsv_s_max_slider.setRange(0, 255)
+        self._hsv_s_max_slider.setValue(TRACKER_HSV_S_MAX)
+        self._hsv_s_max_slider.valueChanged.connect(self._on_hsv_changed)
+        hsv.addWidget(self._hsv_s_max_label)
+        hsv.addWidget(self._hsv_s_max_slider)
+
+        self._hsv_v_min_label = QLabel(f"V Min: {TRACKER_HSV_V_MIN}")
+        self._hsv_v_min_slider = QSlider(QtCore.Qt.Horizontal)
+        self._hsv_v_min_slider.setRange(0, 255)
+        self._hsv_v_min_slider.setValue(TRACKER_HSV_V_MIN)
+        self._hsv_v_min_slider.valueChanged.connect(self._on_hsv_changed)
+        hsv.addWidget(self._hsv_v_min_label)
+        hsv.addWidget(self._hsv_v_min_slider)
+
+        self._hsv_v_max_label = QLabel(f"V Max: {TRACKER_HSV_V_MAX}")
+        self._hsv_v_max_slider = QSlider(QtCore.Qt.Horizontal)
+        self._hsv_v_max_slider.setRange(0, 255)
+        self._hsv_v_max_slider.setValue(TRACKER_HSV_V_MAX)
+        self._hsv_v_max_slider.valueChanged.connect(self._on_hsv_changed)
+        hsv.addWidget(self._hsv_v_max_label)
+        hsv.addWidget(self._hsv_v_max_slider)
+
+        hsv_group.setLayout(hsv)
+        layout.addWidget(hsv_group)
+
+        # --- Vision Monitor ---
+        self._open_vision_monitor_btn = QPushButton("Open Vision Monitor")
+        self._open_vision_monitor_btn.clicked.connect(
+            self.open_vision_monitor_clicked.emit
+        )
+        layout.addWidget(self._open_vision_monitor_btn)
+
+        layout.addStretch()
+        return layout
+
     # ------------------------------------------------------------------
-    # Internal slot adapters
+    # Internal slot adapters (original)
     # ------------------------------------------------------------------
 
     def _on_slider_value(self, axis: str, value: int, label: QLabel) -> None:
@@ -195,7 +392,68 @@ class ControlPanel(QWidget):
             self.raw_command_sent.emit(cmd)
 
     # ------------------------------------------------------------------
-    # Public interface
+    # Internal slot adapters (new vision controls)
+    # ------------------------------------------------------------------
+
+    def _on_target_changed(self) -> None:
+        x = float(self._target_x_slider.value())
+        y = float(self._target_y_slider.value())
+        self._target_x_label.setText(f"Target X: {x:.0f} mm")
+        self._target_y_label.setText(f"Target Y: {y:.0f} mm")
+        self.target_changed.emit(x, y)
+
+    def _on_trim_changed(self) -> None:
+        roll = self._trim_roll_slider.value() / 100.0
+        pitch = self._trim_pitch_slider.value() / 100.0
+        self._trim_roll_label.setText(f"Roll Trim: {roll:.2f}°")
+        self._trim_pitch_label.setText(f"Pitch Trim: {pitch:.2f}°")
+        self.trim_changed.emit(roll, pitch)
+
+    def _on_auto_trim_toggled(self) -> None:
+        self._auto_trim_active = not self._auto_trim_active
+        self._auto_trim_btn.setText(
+            "Auto-Trim: ON" if self._auto_trim_active else "Auto-Trim: OFF"
+        )
+        self.auto_trim_toggled.emit(self._auto_trim_active)
+
+    def _on_calibrate_home(self) -> None:
+        self._calibrating_home = not self._calibrating_home
+        self._calibrate_home_btn.setText(
+            "Cancel Calibration" if self._calibrating_home else "Calibrate Home"
+        )
+        self.calibrate_home_clicked.emit()
+
+    def _on_autotune_enable(self) -> None:
+        self._autotune_enabled = not self._autotune_enabled
+        self._autotune_enable_btn.setText(
+            "AutoTune: ON" if self._autotune_enabled else "AutoTune: OFF"
+        )
+        self.autotune_enable_clicked.emit(self._autotune_enabled)
+
+    def _on_autotune_auto_apply(self) -> None:
+        self._autotune_auto_apply = not self._autotune_auto_apply
+        self._autotune_auto_apply_btn.setText(
+            "Auto-Apply: ON" if self._autotune_auto_apply else "Auto-Apply: OFF"
+        )
+        self.autotune_auto_apply_clicked.emit(self._autotune_auto_apply)
+
+    def _on_hsv_changed(self) -> None:
+        hmin = self._hsv_h_min_slider.value()
+        hmax = self._hsv_h_max_slider.value()
+        smin = self._hsv_s_min_slider.value()
+        smax = self._hsv_s_max_slider.value()
+        vmin = self._hsv_v_min_slider.value()
+        vmax = self._hsv_v_max_slider.value()
+        self._hsv_h_min_label.setText(f"H Min: {hmin}")
+        self._hsv_h_max_label.setText(f"H Max: {hmax}")
+        self._hsv_s_min_label.setText(f"S Min: {smin}")
+        self._hsv_s_max_label.setText(f"S Max: {smax}")
+        self._hsv_v_min_label.setText(f"V Min: {vmin}")
+        self._hsv_v_max_label.setText(f"V Max: {vmax}")
+        self.hsv_changed.emit(hmin, hmax, smin, smax, vmin, vmax)
+
+    # ------------------------------------------------------------------
+    # Public interface (original)
     # ------------------------------------------------------------------
 
     def set_sliders_enabled(self, enabled: bool) -> None:
@@ -212,15 +470,9 @@ class ControlPanel(QWidget):
         self._vision_active = active
         if active:
             self._vision_button.setText("Vision Mode ACTIVE")
-            self._vision_button.setStyleSheet(
-                "background-color: orange; color: black;"
-            )
             self._cancel_vision_btn.setEnabled(True)
         else:
             self._vision_button.setText("Enable Vision Mode")
-            self._vision_button.setStyleSheet(
-                "background-color: darkgreen; color: white;"
-            )
             self._cancel_vision_btn.setEnabled(False)
 
     def get_slider_values(self) -> dict:
@@ -254,11 +506,7 @@ class ControlPanel(QWidget):
         self._raw_serial_input.clear()
 
     def attach_below(self, widget: QWidget) -> None:
-        """Place an extra widget at the bottom of the middle column.
-
-        Used by MainWindow to embed SerialMonitor in the same column as
-        the existing controls (matches legacy gui_layout layout).
-        """
+        """Place an extra widget at the bottom of the middle column."""
         self._aux_layout.addWidget(widget)
 
     def confirm(self, title: str, message: str) -> bool:
@@ -270,3 +518,82 @@ class ControlPanel(QWidget):
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         )
         return bool(reply == QtWidgets.QMessageBox.Yes)
+
+    # ------------------------------------------------------------------
+    # Sync methods — called from MainWindow to push state into the GUI
+    # without triggering re-emission (blockSignals pattern).
+    # ------------------------------------------------------------------
+
+    def sync_kp_kd(self, kp: float, kd: float) -> None:
+        self._kp_slider.blockSignals(True)
+        self._kp_slider.setValue(int(kp * 1000))
+        self._kp_label.setText(f"Kp: {kp:.3f}")
+        self._kp_slider.blockSignals(False)
+
+        self._kd_slider.blockSignals(True)
+        self._kd_slider.setValue(int(kd * 1000))
+        self._kd_label.setText(f"Kd: {kd:.3f}")
+        self._kd_slider.blockSignals(False)
+
+    def sync_target(self, x_mm: float, y_mm: float) -> None:
+        self._target_x_slider.blockSignals(True)
+        self._target_x_slider.setValue(int(x_mm))
+        self._target_x_label.setText(f"Target X: {x_mm:.0f} mm")
+        self._target_x_slider.blockSignals(False)
+
+        self._target_y_slider.blockSignals(True)
+        self._target_y_slider.setValue(int(y_mm))
+        self._target_y_label.setText(f"Target Y: {y_mm:.0f} mm")
+        self._target_y_slider.blockSignals(False)
+
+    def sync_trim(self, roll_deg: float, pitch_deg: float) -> None:
+        self._trim_roll_slider.blockSignals(True)
+        self._trim_roll_slider.setValue(int(roll_deg * 100))
+        self._trim_roll_label.setText(f"Roll Trim: {roll_deg:.2f}°")
+        self._trim_roll_slider.blockSignals(False)
+
+        self._trim_pitch_slider.blockSignals(True)
+        self._trim_pitch_slider.setValue(int(pitch_deg * 100))
+        self._trim_pitch_label.setText(f"Pitch Trim: {pitch_deg:.2f}°")
+        self._trim_pitch_slider.blockSignals(False)
+
+    def sync_auto_trim_button(self, active: bool) -> None:
+        self._auto_trim_active = active
+        self._auto_trim_btn.setText(
+            "Auto-Trim: ON" if active else "Auto-Trim: OFF"
+        )
+
+    def sync_calibrate_button(self, calibrating: bool) -> None:
+        self._calibrating_home = calibrating
+        self._calibrate_home_btn.setText(
+            "Cancel Calibration" if calibrating else "Calibrate Home"
+        )
+
+    def sync_autotune_buttons(self, enabled: bool, auto_apply: bool) -> None:
+        self._autotune_enabled = enabled
+        self._autotune_enable_btn.setText(
+            "AutoTune: ON" if enabled else "AutoTune: OFF"
+        )
+        self._autotune_auto_apply = auto_apply
+        self._autotune_auto_apply_btn.setText(
+            "Auto-Apply: ON" if auto_apply else "Auto-Apply: OFF"
+        )
+
+    def sync_hsv(
+        self,
+        hmin: int, hmax: int,
+        smin: int, smax: int,
+        vmin: int, vmax: int,
+    ) -> None:
+        for sld, val, lbl, name in (
+            (self._hsv_h_min_slider, hmin, self._hsv_h_min_label, "H Min"),
+            (self._hsv_h_max_slider, hmax, self._hsv_h_max_label, "H Max"),
+            (self._hsv_s_min_slider, smin, self._hsv_s_min_label, "S Min"),
+            (self._hsv_s_max_slider, smax, self._hsv_s_max_label, "S Max"),
+            (self._hsv_v_min_slider, vmin, self._hsv_v_min_label, "V Min"),
+            (self._hsv_v_max_slider, vmax, self._hsv_v_max_label, "V Max"),
+        ):
+            sld.blockSignals(True)
+            sld.setValue(val)
+            lbl.setText(f"{name}: {val}")
+            sld.blockSignals(False)
