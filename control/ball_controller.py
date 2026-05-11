@@ -19,9 +19,125 @@ from settings import (
     DEBUG_PRINTS,
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
+    PD_AUTOTUNE_AUTO_APPLY,
+    PD_AUTOTUNE_ENABLED,
+    PD_AUTOTUNE_KD_STEP,
+    PD_AUTOTUNE_KP_STEP,
+    PD_AUTOTUNE_MAX_KD,
+    PD_AUTOTUNE_MAX_KP,
+    PD_AUTOTUNE_MIN_KD,
+    PD_AUTOTUNE_MIN_KP,
+    PD_AUTOTUNE_MIN_TRIAL_S,
+    PD_AUTOTUNE_SETTLE_HOLD_S,
+    PD_AUTOTUNE_SETTLE_RADIUS_MM,
+    PD_AUTOTUNE_SETTLE_SPEED_MM_S,
+    PD_AUTOTUNE_TARGET_SETTLE_S,
+    PD_AUTOTUNE_TEST_DIAGONAL_MM,
+    PD_AUTOTUNE_TIMEOUT_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KP,
 )
+
+
+class _PDLegEvaluator:
+    """Evaluates a single leg of a two-target step test for PD autotune."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.start_ts = 0.0
+        self.last_ts = 0.0
+        self.settle_timer = 0.0
+        self.u_x = 0.0
+        self.u_y = 0.0
+        self.s0 = 0.0
+        self.min_s = 0.0
+        self.peak_abs_s = 0.0
+        self.iae = 0.0
+        self.sign_changes = 0
+        self.last_s: float | None = None
+
+    def start(self, ts: float, x: float, y: float, tx: float, ty: float) -> bool:
+        ex = tx - x
+        ey = ty - y
+        e0 = math.hypot(ex, ey)
+        if e0 <= 1e-6:
+            return False
+        self.active = True
+        self.start_ts = ts
+        self.last_ts = ts
+        self.settle_timer = 0.0
+        self.u_x = ex / e0
+        self.u_y = ey / e0
+        self.s0 = e0
+        self.min_s = e0
+        self.peak_abs_s = e0
+        self.iae = 0.0
+        self.sign_changes = 0
+        self.last_s = e0
+        return True
+
+    def observe(
+        self,
+        ts: float,
+        x: float,
+        y: float,
+        vx: float,
+        vy: float,
+        tx: float,
+        ty: float,
+        settle_radius_mm: float,
+        settle_speed_mm_s: float,
+        settle_hold_s: float,
+        min_trial_s: float,
+        timeout_s: float,
+    ) -> dict | None:
+        if not self.active:
+            return None
+        ex = tx - x
+        ey = ty - y
+        err = math.hypot(ex, ey)
+        speed = math.hypot(vx, vy)
+        dt = max(1e-4, min(0.1, ts - self.last_ts))
+        self.last_ts = ts
+
+        s = ex * self.u_x + ey * self.u_y
+        self.iae += abs(s) * dt
+        self.peak_abs_s = max(self.peak_abs_s, abs(s))
+        self.min_s = min(self.min_s, s)
+        if self.last_s is not None:
+            band = max(2.0, settle_radius_mm)
+            if abs(s) > band and abs(self.last_s) > band and (s * self.last_s) < 0.0:
+                self.sign_changes += 1
+        self.last_s = s
+
+        if err <= settle_radius_mm and speed <= settle_speed_mm_s:
+            self.settle_timer += dt
+        else:
+            self.settle_timer = 0.0
+
+        elapsed = ts - self.start_ts
+        settled = self.settle_timer >= settle_hold_s
+        timed_out = elapsed >= timeout_s
+        if elapsed < min_trial_s:
+            return None
+        if not settled and not timed_out:
+            return None
+
+        overshoot_mm = max(0.0, -self.min_s)
+        metrics: dict = {
+            "initial_offset_mm": self.s0,
+            "settle_time_s": elapsed,
+            "overshoot_mm": overshoot_mm,
+            "overshoot_ratio": overshoot_mm / max(self.s0, 1e-6),
+            "oscillation_crossings": float(self.sign_changes),
+            "iae_mm_s": self.iae,
+            "peak_abs_proj_mm": self.peak_abs_s,
+            "timed_out": 1.0 if timed_out and not settled else 0.0,
+            "target_x_mm": float(tx),
+            "target_y_mm": float(ty),
+        }
+        self.active = False
+        return metrics
 
 
 class BallController:
@@ -42,6 +158,8 @@ class BallController:
         kp: float = PD_DEFAULT_KP,
         kd: float = PD_DEFAULT_KD,
         max_tilt_deg: float = 10.0,
+        max_tilt_rate_deg_s: float = 300.0,
+        d_term_limit_deg: float | None = 2.5,
         roll_offset: float = 0.0,
         pitch_offset: float = 0.0,
         auto_trim_enabled: bool = False,
@@ -49,6 +167,8 @@ class BallController:
         self.kp = kp
         self.kd = kd
         self.max_tilt_deg = max_tilt_deg
+        self.max_tilt_rate_deg_s = max_tilt_rate_deg_s
+        self.d_term_limit_deg = d_term_limit_deg
         self.enabled = True
 
         # Trim offsets (FG-9)
@@ -100,6 +220,34 @@ class BallController:
         self.home_calibration_active = False
         self._home_calibration_start_ts = 0.0
 
+        # Slew limit state (FG-11)
+        self._prev_roll_cmd = 0.0
+        self._prev_pitch_cmd = 0.0
+        self._prev_cmd_time: float | None = None
+
+        # PD autotune state (FG-10)
+        self.pd_autotune_enabled = bool(PD_AUTOTUNE_ENABLED)
+        self.pd_autotune_auto_apply = bool(PD_AUTOTUNE_AUTO_APPLY)
+        self.pd_autotune_kp_step = float(PD_AUTOTUNE_KP_STEP)
+        self.pd_autotune_kd_step = float(PD_AUTOTUNE_KD_STEP)
+        self.pd_autotune_min_kp = float(PD_AUTOTUNE_MIN_KP)
+        self.pd_autotune_max_kp = float(PD_AUTOTUNE_MAX_KP)
+        self.pd_autotune_min_kd = float(PD_AUTOTUNE_MIN_KD)
+        self.pd_autotune_max_kd = float(PD_AUTOTUNE_MAX_KD)
+        self.pd_autotune_target_settle_s = float(PD_AUTOTUNE_TARGET_SETTLE_S)
+        self.pd_autotune_test_diag_mm = float(PD_AUTOTUNE_TEST_DIAGONAL_MM)
+        self._pd_autotune_trial_count = 0
+        self._pd_autotune_last_message = ""
+        self._pd_autotune_has_suggestion = False
+        self._pd_autotune_suggested_kp = float(kp)
+        self._pd_autotune_suggested_kd = float(kd)
+        self._pd_leg_eval = _PDLegEvaluator()
+        self._pd_autotune_leg_index = 0
+        self._pd_autotune_leg_initialized = False
+        self._pd_autotune_center_x_mm = self.target_x_mm
+        self._pd_autotune_center_y_mm = self.target_y_mm
+        self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
+
     # ---------------------------
     # Public Interface
     # ---------------------------
@@ -107,6 +255,9 @@ class BallController:
     def set_gains(self, kp: float, kd: float) -> None:
         self.kp = kp
         self.kd = kd
+        self._pd_autotune_has_suggestion = False
+        self._pd_autotune_suggested_kp = float(kp)
+        self._pd_autotune_suggested_kd = float(kd)
 
     def set_max_tilt(self, max_tilt_deg: float) -> None:
         self.max_tilt_deg = max_tilt_deg
@@ -162,8 +313,52 @@ class BallController:
         self._manual_target_y_mm = float(y_mm)
         self._settle_lp_initialized = False
         self._target_change_time = time.perf_counter()
-        self.target_x_mm = float(x_mm)
-        self.target_y_mm = float(y_mm)
+        if self.pd_autotune_enabled:
+            self._pd_autotune_center_x_mm = float(x_mm)
+            self._pd_autotune_center_y_mm = float(y_mm)
+            self._pd_autotune_leg_initialized = False
+            self._pd_leg_eval.active = False
+        else:
+            self.target_x_mm = float(x_mm)
+            self.target_y_mm = float(y_mm)
+
+    def set_pd_autotune(self, enabled: bool, auto_apply: bool | None = None) -> None:
+        prev_enabled = self.pd_autotune_enabled
+        self.pd_autotune_enabled = bool(enabled)
+        if self.pd_autotune_enabled:
+            self.home_calibration_active = False
+            self._home_calibration_start_ts = 0.0
+        if auto_apply is not None:
+            self.pd_autotune_auto_apply = bool(auto_apply)
+        if prev_enabled != self.pd_autotune_enabled:
+            self._pd_autotune_leg_initialized = False
+            self._pd_leg_eval.active = False
+            if self.pd_autotune_enabled:
+                self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
+                self.auto_trim_enabled = True
+                self._pd_autotune_center_x_mm = float(self._manual_target_x_mm)
+                self._pd_autotune_center_y_mm = float(self._manual_target_y_mm)
+                self._target_change_time = time.perf_counter()
+            else:
+                self.auto_trim_enabled = self._pd_autotune_prev_auto_trim_enabled
+                self.target_x_mm = float(self._manual_target_x_mm)
+                self.target_y_mm = float(self._manual_target_y_mm)
+                self._target_change_time = time.perf_counter()
+        if (not self.pd_autotune_enabled) or self.pd_autotune_auto_apply:
+            self._pd_autotune_has_suggestion = False
+
+    def apply_pd_autotune_recommendation(self) -> tuple[bool, float, float]:
+        if not self._pd_autotune_has_suggestion:
+            return False, float(self.kp), float(self.kd)
+        self.kp = float(self._pd_autotune_suggested_kp)
+        self.kd = float(self._pd_autotune_suggested_kd)
+        self._pd_autotune_has_suggestion = False
+        return True, float(self.kp), float(self.kd)
+
+    def reset_motion_state(self) -> None:
+        self._prev_roll_cmd = 0.0
+        self._prev_pitch_cmd = 0.0
+        self._prev_cmd_time = None
 
     def compute(self, ball_state: BallState | None) -> tuple[float, float]:
         """Compute desired platform tilt. Returns (roll_deg, pitch_deg)."""
@@ -201,6 +396,118 @@ class BallController:
             print(f"PD compute: {(t1-t0)*1000:.3f} ms")
 
         return roll, pitch
+
+    def compute_with_terms(
+        self, ball_state: BallState | None
+    ) -> tuple[float, float, dict]:
+        """
+        Compute desired platform tilt and expose full diagnostics.
+
+        Returns:
+            (roll_deg, pitch_deg, terms_dict)
+        """
+        if not self.enabled or ball_state is None:
+            return 0.0, 0.0, {
+                "position_vec_mm": (0.0, 0.0),
+                "velocity_vec_mm_s": (0.0, 0.0),
+                "pd_vec": (0.0, 0.0),
+            }
+
+        x = ball_state.x_mm
+        y = ball_state.y_mm
+        vx = ball_state.vx_mm_s
+        vy = ball_state.vy_mm_s
+
+        # PD autotune step (FG-10) — may modify target_x/y_mm
+        tune_info = self._update_pd_autotune(x, y, vx, vy)
+
+        pos_vec_x = self.target_x_mm - x
+        pos_vec_y = self.target_y_mm - y
+        p_x = self.kp * pos_vec_x
+        p_y = self.kp * pos_vec_y
+        d_x = self.kd * (-vx)
+        d_y = self.kd * (-vy)
+
+        # Derivative term cap (FG-11)
+        if self.d_term_limit_deg is not None:
+            d_x = self._clamp(d_x, -self.d_term_limit_deg, self.d_term_limit_deg)
+            d_y = self._clamp(d_y, -self.d_term_limit_deg, self.d_term_limit_deg)
+
+        pd_x = p_x + d_x
+        pd_y = p_y + d_y
+
+        # Auto-trim update (FG-9)
+        self._update_auto_trim(pos_vec_x, pos_vec_y, vx, vy)
+
+        pitch_raw = pd_x + self.pitch_offset
+        roll_raw = -pd_y + self.roll_offset
+        roll_clamped = self._clamp(roll_raw, -self.max_tilt_deg, self.max_tilt_deg)
+        pitch_clamped = self._clamp(pitch_raw, -self.max_tilt_deg, self.max_tilt_deg)
+
+        # Slew limit (FG-11)
+        roll, pitch = self._apply_slew_limit(roll_clamped, pitch_clamped)
+
+        terms: dict = {
+            "position_vec_mm": (pos_vec_x, pos_vec_y),
+            "velocity_vec_mm_s": (vx, vy),
+            "pd_vec": (pd_x, pd_y),
+            "p_term": (p_x, p_y),
+            "d_term": (d_x, d_y),
+            "roll_raw": roll_raw,
+            "pitch_raw": pitch_raw,
+            "roll_clamped": roll_clamped,
+            "pitch_clamped": pitch_clamped,
+            "roll_cmd": roll,
+            "pitch_cmd": pitch,
+            "roll_offset": self.roll_offset,
+            "pitch_offset": self.pitch_offset,
+            "trim_settled_s": self._settled_time_s,
+            "trim_updates": self._auto_trim_update_count,
+            "auto_trim_enabled": self.auto_trim_enabled,
+            "auto_trim_state": self._auto_trim_state,
+            "auto_trim_target_hold_remaining_s": self._auto_trim_target_hold_remaining_s,
+            "auto_trim_speed_mm_s": self._auto_trim_last_speed_mm_s,
+            "auto_trim_radius_mm": self._auto_trim_last_radius_mm,
+            "auto_trim_speed_lpf_mm_s": self._settle_speed_lp,
+            "auto_trim_radius_lpf_mm": self._settle_radius_lp,
+            "auto_trim_speed_thresh_mm_s": self.auto_trim_settle_speed_mm_s,
+            "auto_trim_radius_thresh_mm": self.auto_trim_settle_radius_mm,
+            "auto_trim_hold_s": self.auto_trim_settle_hold_s,
+            "auto_trim_roll_step_deg": self._auto_trim_last_roll_step_deg,
+            "auto_trim_pitch_step_deg": self._auto_trim_last_pitch_step_deg,
+            "auto_trim_limit_deg_active": self._auto_trim_limit_deg_active,
+            "auto_trim_limit_deg_normal": self.auto_trim_max_deg,
+            "auto_trim_limit_deg_home_cal": self.auto_trim_home_cal_max_deg,
+            "auto_trim_roll_sat": 1.0 if abs(self.roll_offset) >= (
+                self._auto_trim_limit_deg_active - 1e-6) else 0.0,
+            "auto_trim_pitch_sat": 1.0 if abs(self.pitch_offset) >= (
+                self._auto_trim_limit_deg_active - 1e-6) else 0.0,
+            "auto_trim_gate_speed_ok": 1.0 if self._auto_trim_gate_speed_ok else 0.0,
+            "auto_trim_gate_radius_ok": 1.0 if self._auto_trim_gate_radius_ok else 0.0,
+            "auto_trim_gate_radius_bypassed": 1.0 if self._auto_trim_gate_radius_bypassed else 0.0,
+            "auto_trim_gate_settled_ok": 1.0 if self._auto_trim_gate_settled_ok else 0.0,
+            "auto_trim_gate_reason": self._auto_trim_gate_reason,
+            "home_calibration_active": self.home_calibration_active,
+            "home_calibration_elapsed_s": (
+                max(0.0, time.perf_counter() - self._home_calibration_start_ts)
+                if self.home_calibration_active and self._home_calibration_start_ts > 0.0
+                else 0.0
+            ),
+            "kp": self.kp,
+            "kd": self.kd,
+            "pd_autotune_enabled": self.pd_autotune_enabled,
+            "pd_autotune_auto_apply": self.pd_autotune_auto_apply,
+            "pd_autotune_trial_count": self._pd_autotune_trial_count,
+            "pd_autotune_message": self._pd_autotune_last_message,
+            "pd_autotune_has_suggestion": self._pd_autotune_has_suggestion,
+            "pd_autotune_suggested_kp": self._pd_autotune_suggested_kp,
+            "pd_autotune_suggested_kd": self._pd_autotune_suggested_kd,
+            "target_x_mm": self.target_x_mm,
+            "target_y_mm": self.target_y_mm,
+        }
+        if tune_info:
+            terms["pd_autotune_event"] = tune_info
+        return roll, pitch, terms
 
     # ---------------------------
     # Auto-trim (FG-9)
@@ -297,12 +604,8 @@ class BallController:
             return
 
         alpha = self._clamp(self.auto_trim_error_lpf_alpha, 0.0, 0.999)
-        self._trim_err_lp_x = (
-            alpha * self._trim_err_lp_x + (1.0 - alpha) * ex
-        )
-        self._trim_err_lp_y = (
-            alpha * self._trim_err_lp_y + (1.0 - alpha) * ey
-        )
+        self._trim_err_lp_x = alpha * self._trim_err_lp_x + (1.0 - alpha) * ex
+        self._trim_err_lp_y = alpha * self._trim_err_lp_y + (1.0 - alpha) * ey
 
         roll_rate = self.auto_trim_ki * (-self._trim_err_lp_y)
         pitch_rate = self.auto_trim_ki * self._trim_err_lp_x
@@ -329,6 +632,149 @@ class BallController:
         self._auto_trim_update_count += 1
         self._auto_trim_state = "updating"
         self._auto_trim_gate_reason = "updating"
+
+    # ---------------------------
+    # PD Autotune (FG-10)
+    # ---------------------------
+
+    def _autotune_leg_target(self, leg_index: int) -> tuple[float, float]:
+        sign = 1.0 if (int(leg_index) % 2 == 0) else -1.0
+        d = self.pd_autotune_test_diag_mm
+        return (
+            self._pd_autotune_center_x_mm + sign * d,
+            self._pd_autotune_center_y_mm + sign * d,
+        )
+
+    def _recommend_pd_update(self, metrics: dict) -> tuple[float, float, str]:
+        kp_new = float(self.kp)
+        kd_new = float(self.kd)
+        overshoot_ratio = float(metrics.get("overshoot_ratio", 0.0))
+        settle_s = float(metrics.get("settle_time_s", 0.0))
+        crossings = int(round(metrics.get("oscillation_crossings", 0.0)))
+        timed_out = bool(metrics.get("timed_out", 0.0) > 0.5)
+
+        if timed_out:
+            kp_new = min(self.pd_autotune_max_kp, kp_new + 0.5 * self.pd_autotune_kp_step)
+            kd_new = min(self.pd_autotune_max_kd, kd_new + self.pd_autotune_kd_step)
+            rationale = "timeout: increase authority and damping"
+        elif overshoot_ratio > 0.28 or crossings >= 2:
+            kd_new = min(self.pd_autotune_max_kd, kd_new + self.pd_autotune_kd_step)
+            kp_new = max(self.pd_autotune_min_kp, kp_new - 0.5 * self.pd_autotune_kp_step)
+            rationale = "overshoot/oscillation: add damping"
+        elif settle_s > self.pd_autotune_target_settle_s and overshoot_ratio < 0.12:
+            kp_new = min(self.pd_autotune_max_kp, kp_new + self.pd_autotune_kp_step)
+            rationale = "slow but stable: raise kp"
+        elif (
+            settle_s < 0.7 * self.pd_autotune_target_settle_s
+            and overshoot_ratio < 0.05
+            and crossings == 0
+        ):
+            kd_new = max(self.pd_autotune_min_kd, kd_new - 0.5 * self.pd_autotune_kd_step)
+            rationale = "fast and clean: trim kd"
+        else:
+            rationale = "balanced"
+
+        kp_new = self._clamp(kp_new, self.pd_autotune_min_kp, self.pd_autotune_max_kp)
+        kd_new = self._clamp(kd_new, self.pd_autotune_min_kd, self.pd_autotune_max_kd)
+        return kp_new, kd_new, rationale
+
+    def _update_pd_autotune(self, x: float, y: float, vx: float, vy: float) -> dict | None:
+        if (not self.pd_autotune_enabled) or (not self.enabled):
+            return None
+        now = time.perf_counter()
+        if not self._pd_autotune_leg_initialized:
+            self._pd_autotune_leg_index = 0
+            tx, ty = self._autotune_leg_target(self._pd_autotune_leg_index)
+            self.target_x_mm = tx
+            self.target_y_mm = ty
+            self._target_change_time = now
+            self._pd_leg_eval.start(now, x, y, tx, ty)
+            self._pd_autotune_leg_initialized = True
+            msg = f"active test started: target=({tx:.1f},{ty:.1f})"
+            self._pd_autotune_last_message = msg
+            return {"type": "trial_started", "message": msg}
+
+        metrics = self._pd_leg_eval.observe(
+            now, x, y, vx, vy,
+            self.target_x_mm, self.target_y_mm,
+            settle_radius_mm=PD_AUTOTUNE_SETTLE_RADIUS_MM,
+            settle_speed_mm_s=PD_AUTOTUNE_SETTLE_SPEED_MM_S,
+            settle_hold_s=PD_AUTOTUNE_SETTLE_HOLD_S,
+            min_trial_s=PD_AUTOTUNE_MIN_TRIAL_S,
+            timeout_s=PD_AUTOTUNE_TIMEOUT_S,
+        )
+        if metrics is None:
+            return None
+
+        self._pd_autotune_trial_count += 1
+        kp_new, kd_new, rationale = self._recommend_pd_update(metrics)
+        changed = (abs(kp_new - self.kp) > 1e-9) or (abs(kd_new - self.kd) > 1e-9)
+
+        if changed and self.pd_autotune_auto_apply:
+            self.kp = kp_new
+            self.kd = kd_new
+            self._pd_autotune_has_suggestion = False
+            self._pd_autotune_suggested_kp = float(self.kp)
+            self._pd_autotune_suggested_kd = float(self.kd)
+            action = f"applied kp={self.kp:.4f}, kd={self.kd:.4f}"
+        elif changed:
+            self._pd_autotune_has_suggestion = True
+            self._pd_autotune_suggested_kp = float(kp_new)
+            self._pd_autotune_suggested_kd = float(kd_new)
+            action = f"suggest kp={kp_new:.4f}, kd={kd_new:.4f}"
+        else:
+            self._pd_autotune_has_suggestion = False
+            self._pd_autotune_suggested_kp = float(self.kp)
+            self._pd_autotune_suggested_kd = float(self.kd)
+            action = "hold gains"
+
+        self._pd_autotune_leg_index = 1 - self._pd_autotune_leg_index
+        next_tx, next_ty = self._autotune_leg_target(self._pd_autotune_leg_index)
+        self.target_x_mm = next_tx
+        self.target_y_mm = next_ty
+        self._target_change_time = now
+        self._pd_leg_eval.start(now, x, y, next_tx, next_ty)
+
+        msg = (
+            f"trial#{self._pd_autotune_trial_count} "
+            f"settle={metrics['settle_time_s']:.2f}s "
+            f"overshoot={metrics['overshoot_ratio']:.2f} "
+            f"cross={metrics['oscillation_crossings']:.0f} "
+            f"iae={metrics['iae_mm_s']:.1f} -> {action} ({rationale})"
+        )
+        self._pd_autotune_last_message = msg
+        return {
+            "type": "trial_done",
+            "message": msg,
+            "metrics": metrics,
+            "kp_suggested": kp_new,
+            "kd_suggested": kd_new,
+            "applied": 1.0 if (changed and self.pd_autotune_auto_apply) else 0.0,
+        }
+
+    # ---------------------------
+    # Slew limit (FG-11)
+    # ---------------------------
+
+    def _apply_slew_limit(self, roll: float, pitch: float) -> tuple[float, float]:
+        now = time.perf_counter()
+        if self._prev_cmd_time is None:
+            self._prev_cmd_time = now
+            self._prev_roll_cmd = roll
+            self._prev_pitch_cmd = pitch
+            return roll, pitch
+        dt = max(1e-4, now - self._prev_cmd_time)
+        self._prev_cmd_time = now
+        max_step = self.max_tilt_rate_deg_s * dt
+        roll_out = self._prev_roll_cmd + self._clamp(
+            roll - self._prev_roll_cmd, -max_step, max_step
+        )
+        pitch_out = self._prev_pitch_cmd + self._clamp(
+            pitch - self._prev_pitch_cmd, -max_step, max_step
+        )
+        self._prev_roll_cmd = roll_out
+        self._prev_pitch_cmd = pitch_out
+        return roll_out, pitch_out
 
     # ---------------------------
     # Internal Helpers
