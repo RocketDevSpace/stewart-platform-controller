@@ -37,8 +37,14 @@ from gui.serial_monitor import SerialMonitor
 from hardware.serial_manager import SerialManager
 from hardware.servo_driver import ServoDriver
 from settings import (
+    AUTO_TRIM_ENABLED,
     CAMERA_INDEX,
     CONTROL_LOOP_INTERVAL_MS,
+    MANUAL_PITCH_TRIM_DEG,
+    MANUAL_ROLL_TRIM_DEG,
+    MAX_TILT_DEG,
+    PD_DEFAULT_KD,
+    PD_DEFAULT_KP,
     SERIAL_BAUD,
     SERIAL_PORT,
     VISION_LOOP_INTERVAL_MS,
@@ -86,7 +92,12 @@ class MainWindow(QWidget):
         # --- Ball balancing ---
         self.ball_tracker = BallTracker(camera_index=CAMERA_INDEX)
         self.ball_controller = BallController(
-            kp=0.005, kd=0.010, max_tilt_deg=8.0
+            kp=PD_DEFAULT_KP,
+            kd=PD_DEFAULT_KD,
+            max_tilt_deg=MAX_TILT_DEG,
+            roll_offset=MANUAL_ROLL_TRIM_DEG,
+            pitch_offset=MANUAL_PITCH_TRIM_DEG,
+            auto_trim_enabled=AUTO_TRIM_ENABLED,
         )
         self._vision_enabled = False
 
