@@ -139,7 +139,7 @@ workspace issue at yaw=-35°, not an M5 regression. Logged for M6.
 ---
 
 ### Milestone 6 — Vision Loop Cleanup
-**Status:** In progress
+**Status:** Complete (2026-05-10, PR #7)
 
 **What it does:** Wires CV through clean interfaces. Cleans up debug output.
 
@@ -147,15 +147,49 @@ workspace issue at yaw=-35°, not an M5 regression. Logged for M6.
 - `BallTracker` returns `BallState` dataclass (not raw dict)
 - `BallController` accepts `BallState` dataclass
 - Debug timing prints gated by `settings.DEBUG_PRINTS`
-- Vision loop moved to `gui/main_window.py`
+- `ball_controller.py` moved from `cv/` to `control/`
+- `comms/` retired; `gui_layout_legacy.py` and `gui_main.py` deleted
+
+**Acceptance criteria met:**
+- `BallState` dataclass used end-to-end (BallTracker → BallController) ✅
+- No timing prints when `DEBUG_PRINTS = False` ✅
+- Vision loop wires cleanly; ball balance behavior fix deferred to M7 ✅
+- No regressions in manual control, routines, visualizer, serial monitor ✅
+
+---
+
+### Milestone 7 — Codex Audit + Integration
+**Status:** Phase 1 complete (audit). Phase 2 (implementation) pending PM review.
+
+**What it does:** Ports all features and vision fixes from the Codex
+`offset-tuning-and-camera-exposure` branch into the refactored codebase. Restores
+ball balancing to full working state and adds all Codex-developed capabilities.
+
+**Scope (22 feature groups — see `docs/codex_audit.md` for full detail):**
+- `settings.py`: ~60 new runtime constants (camera, tracker, auto-trim, PD autotune, loop rates)
+- `cv/ball_tracker.py`: background capture thread; camera backend probing + adaptive exposure; ArUco scale/cache/hold/filter improvements; adaptive HSV detection; position filter
+- `control/ball_controller.py`: auto-trim (integral correction for table tilt); PD autotune (two-leg step test, kp/kd recommendation); slew limit + d-term cap; `compute_with_terms()` returning rich diagnostic dict
+- **NEW** `cv/vision_control_worker.py`: `VisionControlWorker(QObject)` + `ControlSnapshot` dataclass; runs in `QThread`; backpressure mechanism; decoupled command_sender
+- `gui/control_panel.py`: Target X/Y sliders; Roll/Pitch Trim sliders; Auto-Trim, Calibrate Home, Reset Trim, PD AutoTune buttons; HSV sliders in GUI; dark mode theme
+- **NEW** `gui/vision_monitor.py`: separate monitor window with Camera, Warped, and Mask views
+- `gui/main_window.py`: VisionControlWorker wiring; rolling 30s timing plot; bidirectional state sync; neutral-pose safety fallback on sustained ball loss; valid-streak reacquisition gating
+- Performance optimizations (from `docs/feedback-loop-optimizations.md`)
+
+**Out of scope:**
+- Platform geometry constants in `config.py` — hardware-specific, do not change
+- `routines/` — Codex version is identical to refactored version; no porting needed
 
 **Acceptance criteria:**
-- BallState dataclass used end-to-end (BallTracker → BallController)
-- No timing prints when `DEBUG_PRINTS = False`
-- Vision loop wires cleanly through new interfaces; code path is correct. Ball balance behavior is known broken pre-M6 and is not a test gate here — fix is deferred to the Codex integration milestone.
-- No regressions in manual control, routines, visualizer, or serial monitor.
+- Ball balancing functional end-to-end (camera → tracker → controller → serial → platform)
+- Auto-trim converges ball to target position under normal conditions
+- No Qt calls from background threads
+- All new constants sourced from `settings.py` — no inline literals in logic files
+- CI passes (pytest, flake8, mypy)
+- Manual smoke test: manual control, routines, vision mode all working
 
-**Test gate:** Unit test for BallController with mock BallState. Manual smoke test of non-vision functionality.
+**Test gate:** Unit tests for new `BallController` methods. Manual hardware test of full vision loop.
+
+**Implementation order:** See `docs/codex_audit.md` § Proposed Implementation Order (11 steps).
 
 ---
 
