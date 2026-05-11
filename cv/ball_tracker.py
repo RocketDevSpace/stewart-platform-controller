@@ -18,6 +18,20 @@ from settings import (
     CAMERA_RUNTIME_WARMUP_S,
     CAMERA_TARGET_FPS,
     DEBUG_PRINTS,
+    TRACKER_ARUCO_CENTER_FILTER_ALPHA,
+    TRACKER_ARUCO_DETECT_SCALE,
+    TRACKER_ARUCO_REDETECT_EVERY_N,
+    TRACKER_MAX_ARUCO_HOLD_FRAMES,
+    TRACKER_MAX_SPEED_MM_S,
+    TRACKER_MIN_CIRCULARITY,
+    TRACKER_MIN_CONTOUR_AREA,
+    TRACKER_MIN_FILL_RATIO,
+    TRACKER_MIN_RADIUS_PX,
+    TRACKER_POS_FILTER_ALPHA_FAST,
+    TRACKER_POS_FILTER_ALPHA_SLOW,
+    TRACKER_POS_FILTER_ENABLED,
+    TRACKER_POS_FILTER_MAX_LAG_MM,
+    TRACKER_POS_FILTER_SPEED_MM_S,
 )
 
 
@@ -57,7 +71,32 @@ class BallTracker:
             3: np.array([60.0, -60.0])
         }
 
-        # --- Runtime policy state ---
+        # --- ArUco tracking state (FG-6) ---
+        self._last_H = None
+        self._aruco_hold_count = 0
+        self._aruco_fail_streak = 0
+        self._marker_centers_lp = {}
+        self._frame_counter = 0
+        self.aruco_detect_scale = float(TRACKER_ARUCO_DETECT_SCALE)
+        self.aruco_redetect_every_n = max(1, int(TRACKER_ARUCO_REDETECT_EVERY_N))
+        self.aruco_center_filter_alpha = float(np.clip(TRACKER_ARUCO_CENTER_FILTER_ALPHA, 0.0, 0.98))
+
+        # --- Ball detection params (FG-7) ---
+        self.min_radius_px = float(TRACKER_MIN_RADIUS_PX)
+        self.min_contour_area = float(TRACKER_MIN_CONTOUR_AREA)
+        self.min_circularity = float(TRACKER_MIN_CIRCULARITY)
+        self.min_fill_ratio = float(TRACKER_MIN_FILL_RATIO)
+        self.max_speed_mm_s = float(TRACKER_MAX_SPEED_MM_S)
+
+        # --- Position filter state (FG-8) ---
+        self.pos_filter_enabled = bool(TRACKER_POS_FILTER_ENABLED)
+        self.pos_filter_alpha_slow = float(np.clip(TRACKER_POS_FILTER_ALPHA_SLOW, 0.0, 0.98))
+        self.pos_filter_alpha_fast = float(np.clip(TRACKER_POS_FILTER_ALPHA_FAST, 0.0, 0.98))
+        self.pos_filter_speed_mm_s = max(1.0, float(TRACKER_POS_FILTER_SPEED_MM_S))
+        self.pos_filter_max_lag_mm = max(0.1, float(TRACKER_POS_FILTER_MAX_LAG_MM))
+        self._last_pos_filter_alpha = self.pos_filter_alpha_fast
+
+        # --- Runtime policy state (FG-4) ---
         self._software_brightness_gain = 1.0
         self._runtime_policy_state = "bootstrap_auto"
         self._runtime_manual_exp = None
@@ -69,7 +108,7 @@ class BallTracker:
         self._last_runtime_mode_change_ts = 0.0
         self._capture_start_ts = time.perf_counter()
 
-        # --- Camera (FG-2: backend probing + FG-3: configure) ---
+        # --- Camera (FG-2, FG-3) ---
         self.cap = self._open_best_camera(camera_index)
         if self.cap is None or not self.cap.isOpened():
             raise RuntimeError("Camera failed to open.")
@@ -88,11 +127,16 @@ class BallTracker:
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
 
-        # --- Velocity state ---
+        # --- Velocity and position state ---
         self.prev_ball_mm = None
+        self.prev_ball_raw_mm = None
         self.prev_time = None
-        self.vx_smooth = 0
-        self.vy_smooth = 0
+        self.vx_smooth = 0.0
+        self.vy_smooth = 0.0
+
+        # --- HSV state ---
+        self.hsv_lower = np.array([10, 83, 125], dtype=np.uint8)
+        self.hsv_upper = np.array([28, 255, 255], dtype=np.uint8)
 
         # --- HSV window (optional) ---
         if self.show_debug:
@@ -361,20 +405,43 @@ class BallTracker:
         cv2.namedWindow("HSV Controls", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("HSV Controls", 500, 300)
 
-        cv2.createTrackbar("H Min", "HSV Controls", 10, 179, nothing)
-        cv2.createTrackbar("H Max", "HSV Controls", 28, 179, nothing)
-        cv2.createTrackbar("S Min", "HSV Controls", 83, 255, nothing)
-        cv2.createTrackbar("S Max", "HSV Controls", 255, 255, nothing)
-        cv2.createTrackbar("V Min", "HSV Controls", 125, 255, nothing)
-        cv2.createTrackbar("V Max", "HSV Controls", 255, 255, nothing)
+        cv2.createTrackbar("H Min", "HSV Controls", int(self.hsv_lower[0]), 179, nothing)
+        cv2.createTrackbar("H Max", "HSV Controls", int(self.hsv_upper[0]), 179, nothing)
+        cv2.createTrackbar("S Min", "HSV Controls", int(self.hsv_lower[1]), 255, nothing)
+        cv2.createTrackbar("S Max", "HSV Controls", int(self.hsv_upper[1]), 255, nothing)
+        cv2.createTrackbar("V Min", "HSV Controls", int(self.hsv_lower[2]), 255, nothing)
+        cv2.createTrackbar("V Max", "HSV Controls", int(self.hsv_upper[2]), 255, nothing)
+
+    def set_hsv_thresholds(self, hmin, hmax, smin, smax, vmin, vmax):
+        self.hsv_lower = np.array([int(hmin), int(smin), int(vmin)], dtype=np.uint8)
+        self.hsv_upper = np.array([int(hmax), int(smax), int(vmax)], dtype=np.uint8)
 
     # =========================
-    # HELPERS
+    # ARUCO HELPERS (FG-6)
     # =========================
 
     def get_marker_center(self, corners):
         pts = corners[0]
         return np.mean(pts, axis=0)
+
+    def _filter_marker_center(self, marker_id, center_px):
+        current = np.asarray(center_px, dtype=np.float32)
+        prev = self._marker_centers_lp.get(int(marker_id))
+        if prev is None:
+            filt = current
+        else:
+            # Reset on sudden jump (camera reopen / platform moved)
+            if float(np.hypot(*(current - prev))) > 40.0:
+                filt = current
+            else:
+                alpha = self.aruco_center_filter_alpha
+                filt = alpha * prev + (1.0 - alpha) * current
+        self._marker_centers_lp[int(marker_id)] = filt
+        return filt
+
+    # =========================
+    # BALL DETECTION (FG-7)
+    # =========================
 
     def find_ball_center(self, mask):
         kernel = np.ones((5, 5), np.uint8)
@@ -389,15 +456,30 @@ class BallTracker:
         largest = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(largest)
 
-        if area < 150:
+        if area < self.min_contour_area:
             return None
+
+        perimeter = cv2.arcLength(largest, True)
+        if perimeter > 1e-6 and self.min_circularity > 0:
+            circularity = float(4.0 * np.pi * area / (perimeter * perimeter))
+            if circularity < self.min_circularity:
+                return None
 
         (x, y), radius = cv2.minEnclosingCircle(largest)
 
-        if radius < 4:
+        if radius < self.min_radius_px:
             return None
 
+        if self.min_fill_ratio > 0:
+            circle_area = float(np.pi * radius * radius)
+            if circle_area > 1e-6 and (area / circle_area) < self.min_fill_ratio:
+                return None
+
         return (int(x), int(y)), int(radius)
+
+    # =========================
+    # HELPERS
+    # =========================
 
     def mm_to_warp_px(self, x_mm, y_mm):
         px_per_mm = self.WARP_SIZE_PX / self.PLATFORM_SIZE_MM
@@ -436,84 +518,122 @@ class BallTracker:
 
         frame = cv2.flip(frame, 1)
         frame = self._apply_software_brightness(frame)  # FG-5
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        corners, ids, _ = self.detector.detectMarkers(gray)
+        self._frame_counter += 1
 
+        # ---- ArUco detection (FG-6) ----
+        H = None
         warped = None
+        use_cached_h = (
+            self._last_H is not None
+            and (self._frame_counter % self.aruco_redetect_every_n != 0)
+        )
 
-        if ids is None:
-            self._debug_show(frame, None, None)
-            return None
+        if use_cached_h:
+            H = self._last_H
+            t2 = t1
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        ids = ids.flatten()
+            # Downscale for ArUco detection speed
+            if self.aruco_detect_scale < 0.99:
+                gray_detect = cv2.resize(
+                    gray,
+                    None,
+                    fx=self.aruco_detect_scale,
+                    fy=self.aruco_detect_scale,
+                    interpolation=cv2.INTER_AREA,
+                )
+                scale_inv = 1.0 / self.aruco_detect_scale
+            else:
+                gray_detect = gray
+                scale_inv = 1.0
 
-        marker_centers_px = {}
+            corners, ids, _ = self.detector.detectMarkers(gray_detect)
 
-        for i, marker_id in enumerate(ids):
-            if marker_id in self.CORNER_IDS:
-                marker_centers_px[marker_id] = self.get_marker_center(corners[i])
+            # Retry with histogram equalization on failure (FG-6)
+            if ids is None:
+                gray_eq = cv2.equalizeHist(gray_detect)
+                corners, ids, _ = self.detector.detectMarkers(gray_eq)
 
-        t2 = time.perf_counter()
-
-        if len(marker_centers_px) < 3:
-            self._debug_show(frame, None, None)
-            return None
-
-        if len(marker_centers_px) == 3:
-
-            missing_id = list(set(self.CORNER_IDS) - set(marker_centers_px.keys()))[0]
-
-            # Find neighbors in square order
-            order = self.CORNER_IDS
-            idx = order.index(missing_id)
-
-            prev_id = order[(idx - 1) % 4]
-            next_id = order[(idx + 1) % 4]
-
-            if prev_id in marker_centers_px and next_id in marker_centers_px:
-
-                # Opposite corner is the one not prev/next/missing
-                opposite_id = order[(idx + 2) % 4]
-
-                if opposite_id in marker_centers_px:
-
-                    A = marker_centers_px[prev_id]
-                    B = marker_centers_px[opposite_id]
-                    C = marker_centers_px[next_id]
-
-                    # Parallelogram estimate
-                    estimated = A + C - B
-
-                    marker_centers_px[missing_id] = estimated
-
+            if ids is None:
+                self._aruco_fail_streak += 1
+                # Use cached homography for up to TRACKER_MAX_ARUCO_HOLD_FRAMES frames
+                if self._last_H is not None and self._aruco_hold_count < TRACKER_MAX_ARUCO_HOLD_FRAMES:
+                    H = self._last_H
+                    self._aruco_hold_count += 1
+                    t2 = time.perf_counter()
                 else:
-                    # Cannot reconstruct
                     self._debug_show(frame, None, None)
                     return None
             else:
-                self._debug_show(frame, None, None)
-                return None
+                self._aruco_fail_streak = 0
+                ids = ids.flatten()
 
-        src_pts = []
-        dst_pts = []
+                marker_centers_px = {}
+                for i, marker_id in enumerate(ids):
+                    if marker_id in self.CORNER_IDS:
+                        center_px = self.get_marker_center(corners[i]) * scale_inv
+                        # Low-pass filter each marker center (FG-6)
+                        marker_centers_px[marker_id] = self._filter_marker_center(marker_id, center_px)
 
-        for mid in self.CORNER_IDS:
-            src_pts.append(marker_centers_px[mid])
-            x_mm, y_mm = self.aruco_world_mm[mid]
-            dst_pts.append(self.mm_to_warp_px(x_mm, y_mm))
+                t2 = time.perf_counter()
 
-        src_pts = np.array(src_pts, dtype=np.float32)
-        dst_pts = np.array(dst_pts, dtype=np.float32)
+                if len(marker_centers_px) < 3:
+                    if self._last_H is not None and self._aruco_hold_count < TRACKER_MAX_ARUCO_HOLD_FRAMES:
+                        H = self._last_H
+                        self._aruco_hold_count += 1
+                    else:
+                        self._debug_show(frame, None, None)
+                        return None
+                else:
+                    if len(marker_centers_px) == 3:
+                        missing_id = list(set(self.CORNER_IDS) - set(marker_centers_px.keys()))[0]
+                        order = self.CORNER_IDS
+                        idx = order.index(missing_id)
+                        prev_id = order[(idx - 1) % 4]
+                        next_id = order[(idx + 1) % 4]
+                        opposite_id = order[(idx + 2) % 4]
+                        if (
+                            prev_id in marker_centers_px
+                            and next_id in marker_centers_px
+                            and opposite_id in marker_centers_px
+                        ):
+                            A = marker_centers_px[prev_id]
+                            B = marker_centers_px[opposite_id]
+                            C = marker_centers_px[next_id]
+                            marker_centers_px[missing_id] = A + C - B
+                        else:
+                            if self._last_H is not None and self._aruco_hold_count < TRACKER_MAX_ARUCO_HOLD_FRAMES:
+                                H = self._last_H
+                                self._aruco_hold_count += 1
+                            else:
+                                self._debug_show(frame, None, None)
+                                return None
 
-        H, _ = cv2.findHomography(src_pts, dst_pts)
-
-        if H is None:
-            self._debug_show(frame, None, None)
-            return None
+                    if H is None:
+                        src_pts = np.array(
+                            [marker_centers_px[mid] for mid in self.CORNER_IDS],
+                            dtype=np.float32,
+                        )
+                        dst_pts = np.array(
+                            [self.mm_to_warp_px(*self.aruco_world_mm[mid]) for mid in self.CORNER_IDS],
+                            dtype=np.float32,
+                        )
+                        # Exact 4-point perspective is faster than findHomography
+                        if len(src_pts) == 4:
+                            H = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                        else:
+                            H, _ = cv2.findHomography(src_pts, dst_pts)
+                        if H is None:
+                            self._debug_show(frame, None, None)
+                            return None
+                        self._last_H = H
+                        self._aruco_hold_count = 0
 
         warped = cv2.warpPerspective(frame, H, (self.WARP_SIZE_PX, self.WARP_SIZE_PX))
 
+        # ---- Adaptive HSV detection (FG-7) ----
         hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
 
         if self.show_debug:
@@ -523,17 +643,28 @@ class BallTracker:
             smax = cv2.getTrackbarPos("S Max", "HSV Controls")
             vmin = cv2.getTrackbarPos("V Min", "HSV Controls")
             vmax = cv2.getTrackbarPos("V Max", "HSV Controls")
+            self.hsv_lower = np.array([hmin, smin, vmin], dtype=np.uint8)
+            self.hsv_upper = np.array([hmax, smax, vmax], dtype=np.uint8)
+
+        gray_warp_mean = float(np.mean(cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)))
+        vmin_base = int(self.hsv_lower[2])
+        if gray_warp_mean < 45.0:
+            relax = min(70, int((45.0 - gray_warp_mean) * 2.0))
+            vmin_eff = max(20, vmin_base - relax)
         else:
-            # default values if no debug
-            hmin, hmax = 10, 28
-            smin, smax = 83, 255
-            vmin, vmax = 125, 255
+            vmin_eff = vmin_base
 
-        lower = np.array([hmin, smin, vmin])
-        upper = np.array([hmax, smax, vmax])
-
-        mask = cv2.inRange(hsv, lower, upper)
+        lower_eff = self.hsv_lower.copy()
+        lower_eff[2] = vmin_eff
+        mask = cv2.inRange(hsv, lower_eff, self.hsv_upper)
         ball = self.find_ball_center(mask)
+
+        # Two-pass retry with further relaxed V-min (FG-7)
+        if ball is None and vmin_eff > 20:
+            lower_eff2 = self.hsv_lower.copy()
+            lower_eff2[2] = max(10, vmin_eff - 20)
+            mask = cv2.inRange(hsv, lower_eff2, self.hsv_upper)
+            ball = self.find_ball_center(mask)
 
         if ball is None:
             self._debug_show(frame, warped, mask)
@@ -545,31 +676,60 @@ class BallTracker:
         cy = self.WARP_SIZE_PX // 2
 
         mm_per_px = self.PLATFORM_SIZE_MM / self.WARP_SIZE_PX
-        x_mm = (bx - cx) * mm_per_px
-        y_mm = (cy - by) * mm_per_px
+        x_mm_raw = (bx - cx) * mm_per_px
+        y_mm_raw = (cy - by) * mm_per_px
 
-        current_time = time.time()
-
+        current_time = frame_ts if frame_ts > 0 else time.perf_counter()
         t3 = time.perf_counter()
 
-        if self.prev_ball_mm is None:
-            vx = 0
-            vy = 0
-        else:
+        # ---- Velocity and position filter (FG-8) ----
+        dt = 0.0
+        vx_raw_meas = 0.0
+        vy_raw_meas = 0.0
+        raw_speed_mm_s = 0.0
+
+        if self.prev_time is not None and self.prev_ball_raw_mm is not None:
             dt = current_time - self.prev_time
-            if dt <= 0:
-                vx = 0
-                vy = 0
-            else:
-                vx_raw = (x_mm - self.prev_ball_mm[0]) / dt
-                vy_raw = (y_mm - self.prev_ball_mm[1]) / dt
+            if dt > 0:
+                vx_raw_meas = (x_mm_raw - self.prev_ball_raw_mm[0]) / dt
+                vy_raw_meas = (y_mm_raw - self.prev_ball_raw_mm[1]) / dt
+                raw_speed_mm_s = float(np.hypot(vx_raw_meas, vy_raw_meas))
 
-                self.vx_smooth = self.VEL_ALPHA * self.vx_smooth + (1 - self.VEL_ALPHA) * vx_raw
-                self.vy_smooth = self.VEL_ALPHA * self.vy_smooth + (1 - self.VEL_ALPHA) * vy_raw
+                # Speed outlier rejection (FG-7)
+                if self.max_speed_mm_s > 0 and raw_speed_mm_s > self.max_speed_mm_s:
+                    self._debug_show(frame, warped, mask)
+                    return None
 
-                vx = self.vx_smooth
-                vy = self.vy_smooth
+        # Position filter (FG-8)
+        if self.pos_filter_enabled and self.prev_ball_mm is not None:
+            speed_ratio = min(1.0, raw_speed_mm_s / self.pos_filter_speed_mm_s)
+            filter_alpha = (
+                self.pos_filter_alpha_slow
+                + (self.pos_filter_alpha_fast - self.pos_filter_alpha_slow) * speed_ratio
+            )
+            x_mm = filter_alpha * self.prev_ball_mm[0] + (1.0 - filter_alpha) * x_mm_raw
+            y_mm = filter_alpha * self.prev_ball_mm[1] + (1.0 - filter_alpha) * y_mm_raw
+            # Bound phase lag
+            lag = float(np.hypot(x_mm_raw - x_mm, y_mm_raw - y_mm))
+            if lag > self.pos_filter_max_lag_mm:
+                scale = self.pos_filter_max_lag_mm / max(lag, 1e-6)
+                x_mm = x_mm_raw - (x_mm_raw - x_mm) * scale
+                y_mm = y_mm_raw - (y_mm_raw - y_mm) * scale
+            self._last_pos_filter_alpha = float(filter_alpha)
+        else:
+            x_mm = x_mm_raw
+            y_mm = y_mm_raw
 
+        if self.prev_ball_mm is None or self.prev_time is None or dt <= 0:
+            vx = 0.0
+            vy = 0.0
+        else:
+            self.vx_smooth = self.VEL_ALPHA * self.vx_smooth + (1 - self.VEL_ALPHA) * vx_raw_meas
+            self.vy_smooth = self.VEL_ALPHA * self.vy_smooth + (1 - self.VEL_ALPHA) * vy_raw_meas
+            vx = self.vx_smooth
+            vy = self.vy_smooth
+
+        self.prev_ball_raw_mm = (x_mm_raw, y_mm_raw)
         self.prev_ball_mm = (x_mm, y_mm)
         self.prev_time = current_time
         self._last_processed_frame_ts = frame_ts
