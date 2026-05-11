@@ -2,7 +2,7 @@
 
 *Living document — update at the end of substantive sessions. Sync between venues if applicable.*
 
-**Last updated:** May 10, 2026 — M5 merged; M6 branch opened.
+**Last updated:** May 10, 2026 — M6 merged (PR #7); M7 Codex audit initiated; Phase 1 audit doc committed to `docs/codex_audit.md`.
 
 ---
 
@@ -12,13 +12,11 @@ A PyQt5 desktop application that drives a hand-built 6-DOF Stewart platform via 
 
 ## Current phase
 
-**Refactor: M1–M5 complete (merged), M6 in progress.**
+**Refactor complete (M1–M6 merged). Active: M7 — Codex audit + integration.**
 
-M5 (GUI Split) merged 2026-05-10. Smoke test confirmed: manual control, parabola routine, visualizer, serial monitor all working. Screw routine has a pre-existing IK branch-switching issue at yaw=-35° (not an M5 regression); logged for investigation in M6.
+M6 (Vision Loop Cleanup) merged 2026-05-10 (PR #7). Shipped: `BallTracker.update()` returns `BallState`, `BallController` accepts `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, `ball_controller.py` moved to `control/`, `comms/` retired, `gui_layout_legacy.py` and `gui_main.py` deleted. Ball balance behavior was already broken pre-M6 (vision pipeline wires cleanly; fix deferred to M7).
 
-M6 (Vision Loop Cleanup) is now the active milestone on branch `milestone/6-vision-loop-cleanup`. Its scope:
-- Original M6 scope: `BallTracker` returning `BallState` dataclass, `BallController` accepting `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop confirmed in `gui/main_window.py`.
-- Cleanup: move `ball_controller.py` from `cv/` to `control/`, retire the now-unreferenced `comms/` folder, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
+M7 (Codex audit + integration) is now the active milestone. Phase 1 (full file-by-file audit of `codex/offset-tuning-and-camera-exposure`) is complete. The audit document lives at `docs/codex_audit.md`. It contains: module mapping table, commit-by-commit functional log, 22 feature groups with target files and implementation notes, required `settings.py` additions, and a proposed 11-step implementation order. Phase 2 (implementation PRs) begins after PM reviews and prioritizes the audit table.
 
 ## Architectural commitments
 
@@ -74,16 +72,24 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 
 ## Open questions
 
+**Open, M7 (Codex integration):**
+- PR granularity for `cv/ball_tracker.py` rewrite: one large PR or three (background thread / camera open+adaptive exposure / detection improvements)?
+- Dark mode scope: full app or vision panels only?
+- `BallTracker.update()` signature: Codex returns dict; refactored returns `BallState`. Port should keep `BallState` return and add new internal logic. Confirm.
+- Codex `config.py` geometry constants: must NOT be ported (hardware-specific, in existing `config.py`). Confirm dev Claude treats all geometry constants as read-only during M7.
+- `comms/serial_sender.py` was deleted in M6; Codex `gui_main.py` imports it. Dev Claude must map it to `hardware/serial_manager.py` + `hardware/servo_driver.py`. Confirm mapping before implementation.
+
 **Open, future phase:**
-- Second-camera setup. SPEC.md has it under "Future Features" — needs a real plan when M5/M6 land. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
-- Ball catching feasibility is gated on whether the control loop can run sub-20ms. Should be benchmarked on actual hardware before scoping the feature.
+- Second-camera setup. Needs a real plan after M7 lands. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
+- Ball catching feasibility gated on sub-20ms loop benchmark. Benchmark on hardware before scoping.
 
 **Closed:**
 - Whether to use the v5 / bootstrap-v2 doc system → adopted May 7, 2026 (Decision #8 above).
 - Whether to expand M5/M6 scope to include cleanup → yes, expanded May 7, 2026 (Decision #9 above).
-- Hardware smoke test gate for PR #5 → passed May 10, 2026. Manual control, parabola routine, visualizer, serial monitor all confirmed working. Screw routine IK issue is pre-existing, not a regression.
-- `BallTracker` returning `BallState` dataclass → resolved in M6 (PR #7, Step 1). `update()` now returns `BallState` from `core.platform_state`.
-- Where `ball_controller.py` moves → resolved in M6 (PR #7, Step 3). Moved to `control/ball_controller.py`; only `gui/main_window.py` imported from `cv.ball_controller` in clean code, updated in same step.
+- Hardware smoke test gate for PR #5 → passed May 10, 2026.
+- `BallTracker` returning `BallState` dataclass → resolved in M6 (PR #7, Step 1).
+- Where `ball_controller.py` moves → resolved in M6 (PR #7, Step 3). Moved to `control/ball_controller.py`.
+- M7 Phase 1 (audit) → complete May 10, 2026. Audit doc at `docs/codex_audit.md`.
 
 ## Phase roadmap
 
@@ -94,8 +100,8 @@ Rough plan, will evolve. Each phase produces reviewable artifacts; each builds o
 3. **M3 — IK Consolidation** ✅ (April 22, 2026)
 4. **M4 — Routine Runner Extraction** ✅ (April 22, 2026)
 5. **M5 — GUI Split + cleanup items** ✅ (May 10, 2026)
-6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** — in progress
-7. **Codex audit + integration** — full diff of refactored codebase vs latest Codex branches; port new features and vision fixes; iterate to full working ball balance. Immediate post-M6 priority before any Phase 2 hardware work.
+6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** ✅ (May 10, 2026)
+7. **M7 — Codex audit + integration** — Phase 1 (audit) complete. Phase 2 (implementation PRs) pending PM review of `docs/codex_audit.md`.
 8. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
 9. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
 10. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.
