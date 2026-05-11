@@ -8,6 +8,8 @@ SERIAL_QUEUE_MAX = 256
 # =============================================================================
 # Safety limits
 # =============================================================================
+MAX_TILT_DEG = 8.0                      # maximum platform tilt in vision mode
+
 SAFETY_LIMITS = {
     "max_angle": 180,
     "min_angle": 0,

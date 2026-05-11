@@ -9,6 +9,8 @@ from settings import (
     CAMERA_BUFFER_SIZE,
     CAMERA_EXPOSURE,
     CAMERA_FORCE_BACKEND,
+    CAMERA_HEIGHT,
+    CAMERA_WIDTH,
     CAMERA_RUNTIME_ADAPTIVE,
     CAMERA_RUNTIME_CHECK_S,
     CAMERA_RUNTIME_MAX_PERIOD_MS,
@@ -174,8 +176,8 @@ class BallTracker:
                 break
 
     def _configure_camera(self, cap, force_auto=False):
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
