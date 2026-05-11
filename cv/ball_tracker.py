@@ -1,10 +1,15 @@
 import cv2
 import numpy as np
 import time
-import math
+import threading
 
 from core.platform_state import BallState
-from settings import DEBUG_PRINTS
+from settings import (
+    CAMERA_BUFFER_SIZE,
+    CAMERA_RUNTIME_MAX_PERIOD_MS,
+    CAMERA_TARGET_FPS,
+    DEBUG_PRINTS,
+)
 
 
 class BallTracker:
@@ -46,9 +51,22 @@ class BallTracker:
         self.cap = cv2.VideoCapture(camera_index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
+        self.cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
 
         if not self.cap.isOpened():
             raise RuntimeError("Camera failed to open.")
+
+        # --- Background capture thread ---
+        self._capture_running = True
+        self._capture_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_frame_ts = 0.0
+        self._last_processed_frame_ts = 0.0
+        self._capture_period_ms = 0.0
+        self._prev_capture_ts = 0.0
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
 
         # --- Velocity state ---
         self.prev_ball_mm = None
@@ -59,6 +77,30 @@ class BallTracker:
         # --- HSV window (optional) ---
         if self.show_debug:
             self._init_hsv_controls()
+
+    # =========================
+    # BACKGROUND CAPTURE
+    # =========================
+
+    def _capture_loop(self):
+        while self._capture_running:
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.001)
+                continue
+            now = time.perf_counter()
+            with self._capture_lock:
+                if self._prev_capture_ts > 0:
+                    dt_ms = (now - self._prev_capture_ts) * 1000.0
+                    if self._capture_period_ms > 0:
+                        self._capture_period_ms = (
+                            0.9 * self._capture_period_ms + 0.1 * dt_ms
+                        )
+                    else:
+                        self._capture_period_ms = dt_ms
+                self._prev_capture_ts = now
+                self._latest_frame = frame
+                self._latest_frame_ts = now
 
     # =========================
     # HSV TRACKBARS
@@ -124,10 +166,24 @@ class BallTracker:
     def update(self):
         t0 = time.perf_counter()
 
-        ret, frame = self.cap.read()
-        t1 = time.perf_counter()
-        if not ret:
+        # Read from background thread buffer
+        with self._capture_lock:
+            frame_ts = self._latest_frame_ts
+            latest_frame = self._latest_frame
+
+        if latest_frame is None:
             return None
+
+        # Skip if we've already processed this exact frame
+        if (
+            frame_ts > 0
+            and self._last_processed_frame_ts > 0
+            and frame_ts <= self._last_processed_frame_ts
+        ):
+            return None
+
+        frame = latest_frame.copy()
+        t1 = time.perf_counter()
 
         frame = cv2.flip(frame, 1)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -147,40 +203,40 @@ class BallTracker:
         for i, marker_id in enumerate(ids):
             if marker_id in self.CORNER_IDS:
                 marker_centers_px[marker_id] = self.get_marker_center(corners[i])
-                
+
         t2 = time.perf_counter()
 
         if len(marker_centers_px) < 3:
             self._debug_show(frame, None, None)
             return None
-        
+
         if len(marker_centers_px) == 3:
-        
+
             missing_id = list(set(self.CORNER_IDS) - set(marker_centers_px.keys()))[0]
-        
+
             # Find neighbors in square order
             order = self.CORNER_IDS
             idx = order.index(missing_id)
-        
+
             prev_id = order[(idx - 1) % 4]
             next_id = order[(idx + 1) % 4]
-        
+
             if prev_id in marker_centers_px and next_id in marker_centers_px:
-        
+
                 # Opposite corner is the one not prev/next/missing
                 opposite_id = order[(idx + 2) % 4]
-        
+
                 if opposite_id in marker_centers_px:
-        
+
                     A = marker_centers_px[prev_id]
                     B = marker_centers_px[opposite_id]
                     C = marker_centers_px[next_id]
-        
+
                     # Parallelogram estimate
                     estimated = A + C - B
-        
+
                     marker_centers_px[missing_id] = estimated
-        
+
                 else:
                     # Cannot reconstruct
                     self._debug_show(frame, None, None)
@@ -243,7 +299,7 @@ class BallTracker:
         y_mm = (cy - by) * mm_per_px
 
         current_time = time.time()
-        
+
         t3 = time.perf_counter()
 
         if self.prev_ball_mm is None:
@@ -266,6 +322,7 @@ class BallTracker:
 
         self.prev_ball_mm = (x_mm, y_mm)
         self.prev_time = current_time
+        self._last_processed_frame_ts = frame_ts
 
         self._debug_show(frame, warped, mask, bx, by, vx, vy)
 
@@ -311,6 +368,8 @@ class BallTracker:
     # =========================
 
     def release(self):
+        self._capture_running = False
+        self._capture_thread.join(timeout=2.0)
         if self.cap:
             self.cap.release()
         if self.show_debug:
