@@ -40,8 +40,13 @@ _VEL_ARROW_SCALE = 8.0
 _LABEL_COLOR = (0, 210, 255)     # cyan-yellow
 _BALL_COLOR = (0, 255, 80)       # green
 _VEL_COLOR = (0, 165, 255)       # orange
+_DISP_COLOR = (255, 255, 255)    # white — displacement to target
+_PD_COLOR = (220, 80, 220)       # magenta — PD restoration command
 _TARGET_COLOR = (80, 80, 255)    # red-ish
 _TEXT_COLOR = (210, 255, 210)    # pale green
+
+# PD vec scale: px per degree of computed tilt command
+_PD_VEC_SCALE_PX_PER_DEG = 18.0
 
 
 def _bgr_to_pixmap(bgr: np.ndarray, w: int, h: int) -> QPixmap:
@@ -86,11 +91,28 @@ def _put_label(frame: np.ndarray, text: str) -> None:
     )
 
 
+def _arrow(
+    frame: np.ndarray,
+    p1: tuple[int, int],
+    p2: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+) -> None:
+    """Draw a clamped arrowed line; skips if too short."""
+    h, w = frame.shape[:2]
+    x2 = max(0, min(w - 1, p2[0]))
+    y2 = max(0, min(h - 1, p2[1]))
+    if abs(x2 - p1[0]) + abs(y2 - p1[1]) < 3:
+        return
+    cv2.arrowedLine(frame, p1, (x2, y2), color, thickness, cv2.LINE_AA, tipLength=0.25)
+
+
 def _draw_warped_overlays(
     bgr: np.ndarray,
     ball_state: BallState | None,
     target_x_mm: float = 0.0,
     target_y_mm: float = 0.0,
+    control_terms: dict | None = None,
 ) -> np.ndarray:
     frame = bgr.copy()
     h, w = frame.shape[:2]
@@ -103,39 +125,79 @@ def _draw_warped_overlays(
     # Target crosshair
     tx = int(cx + target_x_mm * px_per_mm)
     ty = int(cy - target_y_mm * px_per_mm)
-    cv2.line(frame, (tx - 12, ty), (tx + 12, ty), _TARGET_COLOR, 1, cv2.LINE_AA)
-    cv2.line(frame, (tx, ty - 12), (tx, ty + 12), _TARGET_COLOR, 1, cv2.LINE_AA)
+    cv2.line(frame, (tx - 14, ty), (tx + 14, ty), _TARGET_COLOR, 1, cv2.LINE_AA)
+    cv2.line(frame, (tx, ty - 14), (tx, ty + 14), _TARGET_COLOR, 1, cv2.LINE_AA)
 
     if ball_state is not None:
         bx = int(cx + ball_state.x_mm * px_per_mm)
         by = int(cy - ball_state.y_mm * px_per_mm)
+        bp = (bx, by)
 
         # Ball circle
-        cv2.circle(frame, (bx, by), 10, _BALL_COLOR, 2, cv2.LINE_AA)
-        cv2.circle(frame, (bx, by), 3, _BALL_COLOR, -1)
+        cv2.circle(frame, bp, 10, _BALL_COLOR, 2, cv2.LINE_AA)
+        cv2.circle(frame, bp, 3, _BALL_COLOR, -1)
 
-        # Velocity arrow
-        vx_px = int(ball_state.vx_mm_s * px_per_mm / _VEL_ARROW_SCALE)
-        vy_px = int(-ball_state.vy_mm_s * px_per_mm / _VEL_ARROW_SCALE)
-        if abs(vx_px) + abs(vy_px) > 3:
-            ex = max(0, min(w - 1, bx + vx_px))
-            ey = max(0, min(h - 1, by + vy_px))
-            cv2.arrowedLine(
-                frame, (bx, by), (ex, ey),
-                _VEL_COLOR, 2, cv2.LINE_AA, tipLength=0.35,
-            )
+        # --- Vector 1: displacement to target (white) ---
+        if control_terms is not None:
+            dv = control_terms.get("position_vec_mm", None)
+        else:
+            dv = (target_x_mm - ball_state.x_mm, target_y_mm - ball_state.y_mm)
+        if dv is not None:
+            dx_px = int(dv[0] * px_per_mm)
+            dy_px = int(-dv[1] * px_per_mm)
+            _arrow(frame, bp, (bx + dx_px, by + dy_px), _DISP_COLOR, 2)
 
-        # Position and velocity text
-        pos_txt = f"pos ({ball_state.x_mm:+.1f}, {ball_state.y_mm:+.1f}) mm"
-        vel_txt = f"vel ({ball_state.vx_mm_s:+.0f}, {ball_state.vy_mm_s:+.0f}) mm/s"
-        for i, txt in enumerate((pos_txt, vel_txt)):
-            y_txt = h - 28 + i * 18
+        # --- Vector 2: velocity (orange) ---
+        if control_terms is not None:
+            vv = control_terms.get("velocity_vec_mm_s", None)
+        else:
+            vv = (ball_state.vx_mm_s, ball_state.vy_mm_s)
+        if vv is not None:
+            vx_px = int(vv[0] * px_per_mm / _VEL_ARROW_SCALE)
+            vy_px = int(-vv[1] * px_per_mm / _VEL_ARROW_SCALE)
+            _arrow(frame, bp, (bx + vx_px, by + vy_px), _VEL_COLOR, 2)
+
+        # --- Vector 3: PD restoration command (magenta) ---
+        if control_terms is not None:
+            pd = control_terms.get("pd_vec", None)
+            if pd is not None:
+                pd_x_px = int(pd[0] * _PD_VEC_SCALE_PX_PER_DEG)
+                pd_y_px = int(-pd[1] * _PD_VEC_SCALE_PX_PER_DEG)
+                _arrow(frame, bp, (bx + pd_x_px, by + pd_y_px), _PD_COLOR, 2)
+
+        # Legend (top-right)
+        legend = [
+            ("disp", _DISP_COLOR),
+            ("vel", _VEL_COLOR),
+            ("PD", _PD_COLOR),
+        ]
+        for i, (lbl, col) in enumerate(legend):
+            lx = w - 70
+            ly = 22 + i * 18
+            cv2.line(frame, (lx, ly), (lx + 20, ly), col, 2, cv2.LINE_AA)
+            cv2.putText(frame, lbl, (lx + 24, ly + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, lbl, (lx + 24, ly + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
+
+        # Status text (bottom-left)
+        pd_txt = ""
+        if control_terms is not None:
+            pd = control_terms.get("pd_vec")
+            if pd is not None:
+                pd_txt = f"PD ({pd[0]:+.2f}, {pd[1]:+.2f}) deg"
+        lines = [
+            f"pos ({ball_state.x_mm:+.1f}, {ball_state.y_mm:+.1f}) mm",
+            f"vel ({ball_state.vx_mm_s:+.0f}, {ball_state.vy_mm_s:+.0f}) mm/s",
+        ]
+        if pd_txt:
+            lines.append(pd_txt)
+        for i, txt in enumerate(lines):
+            y_txt = h - (len(lines) - i) * 18 - 4
             cv2.putText(frame, txt, (8, y_txt),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                        (0, 0, 0), 3, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(frame, txt, (8, y_txt),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                        _TEXT_COLOR, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, _TEXT_COLOR, 1, cv2.LINE_AA)
 
     return frame
 
@@ -191,11 +253,14 @@ class VisionMonitorWindow(QWidget):
         ball_state: BallState | None = None,
         target_x_mm: float = 0.0,
         target_y_mm: float = 0.0,
+        control_terms: dict | None = None,
     ) -> None:
         if bgr is None:
             self._warped_label.setText("Warped: Disabled")
             return
-        frame = _draw_warped_overlays(bgr, ball_state, target_x_mm, target_y_mm)
+        frame = _draw_warped_overlays(
+            bgr, ball_state, target_x_mm, target_y_mm, control_terms,
+        )
         w = self._warped_label.width()
         h = self._warped_label.height()
         self._warped_label.setPixmap(_bgr_to_pixmap(frame, w, h))

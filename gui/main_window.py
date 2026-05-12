@@ -946,6 +946,7 @@ class MainWindow(QWidget):
             ball_state=snapshot.ball_state,
             target_x_mm=self._target_x_mm,
             target_y_mm=self._target_y_mm,
+            control_terms=snapshot.control_terms if snapshot.tracking_valid else None,
         )
         self._vision_monitor.update_camera(
             getattr(snapshot, "camera_bgr", None)
