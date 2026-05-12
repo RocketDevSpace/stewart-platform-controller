@@ -55,7 +55,7 @@ class TestControlSnapshot:
             worker_emit_perf_ts=1234.5,
         )
         assert snap.tracking_valid is True
-        assert snap.ball_state.x_mm == 10.0
+        assert snap.ball_state is not None and snap.ball_state.x_mm == 10.0
         assert snap.ik_success is True
         assert snap.worker_emit_perf_ts == 1234.5
 
@@ -65,7 +65,7 @@ class TestControlSnapshot:
 # ---------------------------------------------------------------------------
 
 
-def _get_app():
+def _get_app() -> object:
     from PyQt5.QtWidgets import QApplication
     app = QApplication.instance()
     if app is None:
