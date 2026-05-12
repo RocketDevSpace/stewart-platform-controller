@@ -379,6 +379,9 @@ class VisionControlWorker(QtCore.QObject):
                     tracking_valid=False,
                     reason="no_ball_detected",
                     miss_count=self._miss_count,
+                    camera_bgr=getattr(self.ball_tracker, "_last_camera_bgr", None),
+                    warped_bgr=getattr(self.ball_tracker, "_last_warped_bgr", None),
+                    mask_gray=getattr(self.ball_tracker, "_last_mask_gray", None),
                     worker_emit_perf_ts=time.perf_counter(),
                 )
                 if should_emit and not self._snapshot_inflight:
@@ -451,6 +454,9 @@ class VisionControlWorker(QtCore.QObject):
                 tracking_valid=True,
                 reason="ok",
                 miss_count=0,
+                camera_bgr=getattr(self.ball_tracker, "_last_camera_bgr", None),
+                warped_bgr=getattr(self.ball_tracker, "_last_warped_bgr", None),
+                mask_gray=getattr(self.ball_tracker, "_last_mask_gray", None),
                 worker_emit_perf_ts=time.perf_counter(),
             )
             if should_emit and not self._snapshot_inflight:

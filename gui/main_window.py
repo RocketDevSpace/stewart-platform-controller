@@ -14,6 +14,7 @@ thread lifecycle, GUI sync, timing plot, and neutral-pose fallback.
 
 from __future__ import annotations
 
+import pathlib
 import time
 from collections import deque
 
@@ -85,6 +86,10 @@ _TIMING_WINDOW_S = 30.0
 _PLOT_UPDATE_EVERY = 5
 
 
+def _settings_path() -> pathlib.Path:
+    return pathlib.Path(__file__).parent.parent / "settings.py"
+
+
 class MainWindow(QWidget):
     serial_line_received = QtCore.pyqtSignal(str)
 
@@ -117,7 +122,7 @@ class MainWindow(QWidget):
         # --- Visualizer ---
         self._figure = Figure(facecolor="#0f1726")
         self._canvas = FigureCanvas(self._figure)
-        self._canvas.setFixedSize(500, 500)
+        self._canvas.setMinimumSize(380, 350)
         self._canvas.setStyleSheet("background: #0f1726;")
         self.visualizer = StewartVisualizer(self._canvas)
 
@@ -205,6 +210,9 @@ class MainWindow(QWidget):
             self._on_calibrate_home_clicked
         )
         self.control_panel.reset_trim_clicked.connect(self._on_reset_trim_clicked)
+        self.control_panel.save_trim_as_default_clicked.connect(
+            self._on_save_trim_as_default
+        )
         self.control_panel.autotune_enable_clicked.connect(
             self._on_autotune_enable_clicked
         )
@@ -224,14 +232,13 @@ class MainWindow(QWidget):
 
         # --- Layout ---
         right_layout = QVBoxLayout()
-        right_layout.addWidget(self._canvas)
-        right_layout.addWidget(self._timing_summary_label)
-        right_layout.addWidget(self._timing_canvas)
-        right_layout.addStretch()
+        right_layout.addWidget(self._canvas, stretch=3)
+        right_layout.addWidget(self._timing_summary_label, stretch=0)
+        right_layout.addWidget(self._timing_canvas, stretch=1)
 
         layout = QHBoxLayout()
-        layout.addWidget(self.control_panel)
-        layout.addLayout(right_layout)
+        layout.addWidget(self.control_panel, stretch=0)
+        layout.addLayout(right_layout, stretch=1)
         self.setLayout(layout)
 
     # ------------------------------------------------------------------
@@ -461,6 +468,30 @@ class MainWindow(QWidget):
         self.control_panel.append_preview(
             "[AUTO HOME] trim reset requested (config defaults)"
         )
+
+    def _on_save_trim_as_default(self) -> None:
+        roll = self._trim_roll_deg
+        pitch = self._trim_pitch_deg
+        settings_path = _settings_path()
+        try:
+            text = settings_path.read_text(encoding="utf-8")
+            import re
+            text = re.sub(
+                r"^(MANUAL_ROLL_TRIM_DEG\s*=\s*)[\-0-9.]+",
+                rf"\g<1>{roll}",
+                text, flags=re.MULTILINE,
+            )
+            text = re.sub(
+                r"^(MANUAL_PITCH_TRIM_DEG\s*=\s*)[\-0-9.]+",
+                rf"\g<1>{pitch}",
+                text, flags=re.MULTILINE,
+            )
+            settings_path.write_text(text, encoding="utf-8")
+            self.control_panel.append_preview(
+                f"[TRIM] saved roll={roll:.2f}° pitch={pitch:.2f}° to settings.py"
+            )
+        except Exception as exc:
+            self.control_panel.append_preview(f"[TRIM] save failed: {exc}")
 
     def _on_autotune_enable_clicked(self, enabled: bool) -> None:
         self._pd_autotune_enabled = enabled

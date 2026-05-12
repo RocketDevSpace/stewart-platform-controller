@@ -125,6 +125,10 @@ class BallTracker:
         self._capture_gray_mean = 0.0
         self._prev_capture_ts = 0.0
         self._slow_capture_streak = 0
+        # Latest processed frames — read by worker to populate snapshot
+        self._last_camera_bgr = None
+        self._last_warped_bgr = None
+        self._last_mask_gray = None
         self._capture_fail_streak = 0
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
@@ -520,6 +524,7 @@ class BallTracker:
 
         frame = cv2.flip(frame, 1)
         frame = self._apply_software_brightness(frame)  # FG-5
+        self._last_camera_bgr = frame
 
         self._frame_counter += 1
 
@@ -634,6 +639,7 @@ class BallTracker:
                         self._aruco_hold_count = 0
 
         warped = cv2.warpPerspective(frame, H, (self.WARP_SIZE_PX, self.WARP_SIZE_PX))
+        self._last_warped_bgr = warped
 
         # ---- Adaptive HSV detection (FG-7) ----
         hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
@@ -659,6 +665,7 @@ class BallTracker:
         lower_eff = self.hsv_lower.copy()
         lower_eff[2] = vmin_eff
         mask = cv2.inRange(hsv, lower_eff, self.hsv_upper)
+        self._last_mask_gray = mask
         ball = self.find_ball_center(mask)
 
         # Two-pass retry with further relaxed V-min (FG-7)

@@ -82,6 +82,7 @@ class ControlPanel(QWidget):
     auto_trim_toggled = pyqtSignal(bool)
     calibrate_home_clicked = pyqtSignal()
     reset_trim_clicked = pyqtSignal()
+    save_trim_as_default_clicked = pyqtSignal()
     autotune_enable_clicked = pyqtSignal(bool)
     autotune_apply_clicked = pyqtSignal()
     autotune_auto_apply_clicked = pyqtSignal(bool)
@@ -253,6 +254,10 @@ class ControlPanel(QWidget):
         self._reset_trim_btn = QPushButton("Reset Trim to Config")
         self._reset_trim_btn.clicked.connect(self.reset_trim_clicked.emit)
         tr.addWidget(self._reset_trim_btn)
+
+        self._save_trim_btn = QPushButton("Save Trim as Default")
+        self._save_trim_btn.clicked.connect(self.save_trim_as_default_clicked.emit)
+        tr.addWidget(self._save_trim_btn)
 
         trim_group.setLayout(tr)
         layout.addWidget(trim_group)
