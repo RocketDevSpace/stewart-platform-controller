@@ -122,17 +122,17 @@ class MainWindow(QWidget):
         self.visualizer = StewartVisualizer(self._canvas)
 
         # --- Timing plot ---
-        self._timing_figure = Figure(figsize=(5, 1.8))
+        self._timing_figure = Figure(figsize=(5, 2.2))
         self._timing_figure.patch.set_facecolor("#0f1726")
         self._timing_ax = self._timing_figure.add_subplot(111)
         self._timing_canvas = FigureCanvas(self._timing_figure)
-        self._timing_canvas.setFixedHeight(160)
+        self._timing_canvas.setFixedHeight(210)
         self._init_timing_plot_style()
 
         self._timing_summary_label = QLabel(
             "Vision Timing Avg (ms): waiting for data..."
         )
-        self._timing_summary_label.setWordWrap(True)
+        self._timing_summary_label.setMaximumHeight(22)
 
         timing_capacity = max(TIMING_PLOT_POINTS, int(VISION_LOOP_HZ * 35))
         self._timing_history: dict[str, deque] = {
@@ -227,6 +227,7 @@ class MainWindow(QWidget):
         right_layout.addWidget(self._canvas)
         right_layout.addWidget(self._timing_summary_label)
         right_layout.addWidget(self._timing_canvas)
+        right_layout.addStretch()
 
         layout = QHBoxLayout()
         layout.addWidget(self.control_panel)

@@ -101,8 +101,8 @@ class ControlPanel(QWidget):
 
         main_layout = QHBoxLayout()
         main_layout.addLayout(self._build_slider_column())
-        main_layout.addLayout(self._build_middle_column())
-        main_layout.addLayout(self._build_vision_column())
+        main_layout.addLayout(self._build_ball_pd_column())
+        main_layout.addLayout(self._build_command_column())
         self.setLayout(main_layout)
 
         self.setStyleSheet(DARK_QSS)
@@ -111,104 +111,81 @@ class ControlPanel(QWidget):
     # Layout builders
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Column 1: compact position sliders + HSV thresholds
+    # ------------------------------------------------------------------
+
     def _build_slider_column(self) -> QVBoxLayout:
         layout = QVBoxLayout()
+        layout.setSpacing(4)
+
+        axis_group = QGroupBox("Position Controls")
+        ag = QVBoxLayout()
+        ag.setSpacing(2)
+        ag.setContentsMargins(6, 10, 6, 6)
         for ax in AXES:
             lbl = QLabel(f"{ax}: 0")
             sld = QSlider(QtCore.Qt.Horizontal)
             sld.setMinimum(-100)
             sld.setMaximum(100)
             sld.setValue(0)
+            sld.setMaximumHeight(20)
             sld.valueChanged.connect(
                 lambda val, a=ax, lab=lbl: self._on_slider_value(a, val, lab)
             )
-            layout.addWidget(lbl)
-            layout.addWidget(sld)
+            ag.addWidget(lbl)
+            ag.addWidget(sld)
             self._sliders[ax] = sld
             self._slider_labels[ax] = lbl
+        axis_group.setLayout(ag)
+        layout.addWidget(axis_group)
+
+        layout.addWidget(self._build_hsv_group())
+        layout.addStretch()
         return layout
 
-    def _build_middle_column(self) -> QVBoxLayout:
+    def _build_hsv_group(self) -> QGroupBox:
+        hsv_group = QGroupBox("HSV Thresholds")
+        hsv = QVBoxLayout()
+        hsv.setSpacing(2)
+        hsv.setContentsMargins(6, 10, 6, 6)
+
+        _hsv_defs = [
+            ("H Min", "h_min", 0, 179, TRACKER_HSV_H_MIN),
+            ("H Max", "h_max", 0, 179, TRACKER_HSV_H_MAX),
+            ("S Min", "s_min", 0, 255, TRACKER_HSV_S_MIN),
+            ("S Max", "s_max", 0, 255, TRACKER_HSV_S_MAX),
+            ("V Min", "v_min", 0, 255, TRACKER_HSV_V_MIN),
+            ("V Max", "v_max", 0, 255, TRACKER_HSV_V_MAX),
+        ]
+        for display, attr, lo, hi, default in _hsv_defs:
+            lbl = QLabel(f"{display}: {default}")
+            sld = QSlider(QtCore.Qt.Horizontal)
+            sld.setRange(lo, hi)
+            sld.setValue(default)
+            sld.setMaximumHeight(20)
+            sld.valueChanged.connect(self._on_hsv_changed)
+            setattr(self, f"_hsv_{attr}_label", lbl)
+            setattr(self, f"_hsv_{attr}_slider", sld)
+            hsv.addWidget(lbl)
+            hsv.addWidget(sld)
+
+        hsv_group.setLayout(hsv)
+        return hsv_group
+
+    # ------------------------------------------------------------------
+    # Column 2: ball target, trim, PD control (Kp/Kd + autotune)
+    # ------------------------------------------------------------------
+
+    def _build_ball_pd_column(self) -> QVBoxLayout:
         layout = QVBoxLayout()
-
-        self._demo_list = QComboBox()
-        self._demo_list.addItem(ROUTINE_PLACEHOLDER)
-        for name in ROUTINES.keys():
-            self._demo_list.addItem(name)
-        self._demo_list.currentIndexChanged.connect(self._on_routine_changed)
-        layout.addWidget(QLabel("Demo Routines:"))
-        layout.addWidget(self._demo_list)
-
-        self._cancel_routine_btn = QPushButton("❌ Cancel Routine")
-        self._cancel_routine_btn.clicked.connect(self.routine_cancelled.emit)
-        self._cancel_routine_btn.setEnabled(False)
-        layout.addWidget(self._cancel_routine_btn)
-
-        layout.addWidget(QLabel("Ball Balancing Control"))
-
-        self._vision_button = QPushButton("Enable Vision Mode")
-        self._vision_button.clicked.connect(self._on_vision_button)
-        layout.addWidget(self._vision_button)
-
-        self._cancel_vision_btn = QPushButton("\U0001f6d1 Cancel Vision Mode")
-        self._cancel_vision_btn.clicked.connect(
-            lambda: self.vision_toggled.emit(False)
-        )
-        self._cancel_vision_btn.setEnabled(False)
-        layout.addWidget(self._cancel_vision_btn)
-
-        self._kp_label = QLabel(f"Kp: {PD_DEFAULT_KP:.3f}")
-        self._kp_slider = QSlider(QtCore.Qt.Horizontal)
-        self._kp_slider.setMinimum(0)
-        self._kp_slider.setMaximum(300)  # supports PD_AUTOTUNE_MAX_KP = 0.250
-        self._kp_slider.setValue(int(PD_DEFAULT_KP * 1000))
-        self._kp_slider.valueChanged.connect(self._on_kp_changed)
-        layout.addWidget(self._kp_label)
-        layout.addWidget(self._kp_slider)
-
-        self._kd_label = QLabel(f"Kd: {PD_DEFAULT_KD:.3f}")
-        self._kd_slider = QSlider(QtCore.Qt.Horizontal)
-        self._kd_slider.setMinimum(0)
-        self._kd_slider.setMaximum(100)
-        self._kd_slider.setValue(int(PD_DEFAULT_KD * 1000))
-        self._kd_slider.valueChanged.connect(self._on_kd_changed)
-        layout.addWidget(self._kd_label)
-        layout.addWidget(self._kd_slider)
-
-        self._send_button = QPushButton("SEND TO ARDUINO")
-        self._send_button.clicked.connect(self.send_clicked.emit)
-        layout.addWidget(self._send_button)
-
-        self._preview_output = QTextEdit()
-        self._preview_output.setReadOnly(True)
-        self._preview_output.setPlaceholderText(
-            "Command preview will appear here..."
-        )
-        layout.addWidget(QLabel("Command Preview:"))
-        layout.addWidget(self._preview_output)
-
-        self._raw_serial_input = QLineEdit()
-        self._raw_serial_input.setPlaceholderText(
-            "Type raw serial command here, e.g. S,90,90,90,90,90,90"
-        )
-        layout.addWidget(QLabel("Direct Serial Command:"))
-        layout.addWidget(self._raw_serial_input)
-
-        self._raw_serial_send_btn = QPushButton("Send Command")
-        self._raw_serial_send_btn.clicked.connect(self._on_raw_send)
-        layout.addWidget(self._raw_serial_send_btn)
-
-        self._aux_layout = QVBoxLayout()
-        layout.addLayout(self._aux_layout)
-
-        return layout
-
-    def _build_vision_column(self) -> QVBoxLayout:
-        layout = QVBoxLayout()
+        layout.setSpacing(4)
 
         # --- Ball Target ---
         target_group = QGroupBox("Ball Target")
         tg = QVBoxLayout()
+        tg.setSpacing(2)
+        tg.setContentsMargins(6, 10, 6, 6)
 
         self._target_x_label = QLabel(
             f"Target X: {BALL_TARGET_DEFAULT_X_MM:.0f} mm"
@@ -217,6 +194,7 @@ class ControlPanel(QWidget):
         self._target_x_slider.setMinimum(-120)
         self._target_x_slider.setMaximum(120)
         self._target_x_slider.setValue(int(BALL_TARGET_DEFAULT_X_MM))
+        self._target_x_slider.setMaximumHeight(20)
         self._target_x_slider.valueChanged.connect(self._on_target_changed)
         tg.addWidget(self._target_x_label)
         tg.addWidget(self._target_x_slider)
@@ -228,6 +206,7 @@ class ControlPanel(QWidget):
         self._target_y_slider.setMinimum(-120)
         self._target_y_slider.setMaximum(120)
         self._target_y_slider.setValue(int(BALL_TARGET_DEFAULT_Y_MM))
+        self._target_y_slider.setMaximumHeight(20)
         self._target_y_slider.valueChanged.connect(self._on_target_changed)
         tg.addWidget(self._target_y_label)
         tg.addWidget(self._target_y_slider)
@@ -238,12 +217,15 @@ class ControlPanel(QWidget):
         # --- Platform Trim ---
         trim_group = QGroupBox("Platform Trim")
         tr = QVBoxLayout()
+        tr.setSpacing(2)
+        tr.setContentsMargins(6, 10, 6, 6)
 
         self._trim_roll_label = QLabel(f"Roll Trim: {MANUAL_ROLL_TRIM_DEG:.2f}°")
         self._trim_roll_slider = QSlider(QtCore.Qt.Horizontal)
         self._trim_roll_slider.setMinimum(-1000)
         self._trim_roll_slider.setMaximum(1000)
         self._trim_roll_slider.setValue(int(MANUAL_ROLL_TRIM_DEG * 100))
+        self._trim_roll_slider.setMaximumHeight(20)
         self._trim_roll_slider.valueChanged.connect(self._on_trim_changed)
         tr.addWidget(self._trim_roll_label)
         tr.addWidget(self._trim_roll_slider)
@@ -255,6 +237,7 @@ class ControlPanel(QWidget):
         self._trim_pitch_slider.setMinimum(-1000)
         self._trim_pitch_slider.setMaximum(1000)
         self._trim_pitch_slider.setValue(int(MANUAL_PITCH_TRIM_DEG * 100))
+        self._trim_pitch_slider.setMaximumHeight(20)
         self._trim_pitch_slider.valueChanged.connect(self._on_trim_changed)
         tr.addWidget(self._trim_pitch_label)
         tr.addWidget(self._trim_pitch_slider)
@@ -274,9 +257,31 @@ class ControlPanel(QWidget):
         trim_group.setLayout(tr)
         layout.addWidget(trim_group)
 
-        # --- PD Autotune ---
-        tune_group = QGroupBox("PD Autotune")
+        # --- PD Control (sliders + autotune) ---
+        tune_group = QGroupBox("PD Control")
         tune = QVBoxLayout()
+        tune.setSpacing(2)
+        tune.setContentsMargins(6, 10, 6, 6)
+
+        self._kp_label = QLabel(f"Kp: {PD_DEFAULT_KP:.3f}")
+        self._kp_slider = QSlider(QtCore.Qt.Horizontal)
+        self._kp_slider.setMinimum(0)
+        self._kp_slider.setMaximum(300)  # supports PD_AUTOTUNE_MAX_KP = 0.250
+        self._kp_slider.setValue(int(PD_DEFAULT_KP * 1000))
+        self._kp_slider.setMaximumHeight(20)
+        self._kp_slider.valueChanged.connect(self._on_kp_changed)
+        tune.addWidget(self._kp_label)
+        tune.addWidget(self._kp_slider)
+
+        self._kd_label = QLabel(f"Kd: {PD_DEFAULT_KD:.3f}")
+        self._kd_slider = QSlider(QtCore.Qt.Horizontal)
+        self._kd_slider.setMinimum(0)
+        self._kd_slider.setMaximum(100)
+        self._kd_slider.setValue(int(PD_DEFAULT_KD * 1000))
+        self._kd_slider.setMaximumHeight(20)
+        self._kd_slider.valueChanged.connect(self._on_kd_changed)
+        tune.addWidget(self._kd_label)
+        tune.addWidget(self._kd_slider)
 
         self._autotune_enable_btn = QPushButton("AutoTune: OFF")
         self._autotune_enable_btn.clicked.connect(self._on_autotune_enable)
@@ -293,69 +298,100 @@ class ControlPanel(QWidget):
         tune_group.setLayout(tune)
         layout.addWidget(tune_group)
 
-        # --- HSV Thresholds ---
-        hsv_group = QGroupBox("HSV Thresholds")
-        hsv = QVBoxLayout()
+        layout.addStretch()
+        return layout
 
-        self._hsv_h_min_label = QLabel(f"H Min: {TRACKER_HSV_H_MIN}")
-        self._hsv_h_min_slider = QSlider(QtCore.Qt.Horizontal)
-        self._hsv_h_min_slider.setRange(0, 179)
-        self._hsv_h_min_slider.setValue(TRACKER_HSV_H_MIN)
-        self._hsv_h_min_slider.valueChanged.connect(self._on_hsv_changed)
-        hsv.addWidget(self._hsv_h_min_label)
-        hsv.addWidget(self._hsv_h_min_slider)
+    # ------------------------------------------------------------------
+    # Column 3: routines, vision mode, command I/O, serial monitor
+    # ------------------------------------------------------------------
 
-        self._hsv_h_max_label = QLabel(f"H Max: {TRACKER_HSV_H_MAX}")
-        self._hsv_h_max_slider = QSlider(QtCore.Qt.Horizontal)
-        self._hsv_h_max_slider.setRange(0, 179)
-        self._hsv_h_max_slider.setValue(TRACKER_HSV_H_MAX)
-        self._hsv_h_max_slider.valueChanged.connect(self._on_hsv_changed)
-        hsv.addWidget(self._hsv_h_max_label)
-        hsv.addWidget(self._hsv_h_max_slider)
+    def _build_command_column(self) -> QVBoxLayout:
+        layout = QVBoxLayout()
+        layout.setSpacing(4)
 
-        self._hsv_s_min_label = QLabel(f"S Min: {TRACKER_HSV_S_MIN}")
-        self._hsv_s_min_slider = QSlider(QtCore.Qt.Horizontal)
-        self._hsv_s_min_slider.setRange(0, 255)
-        self._hsv_s_min_slider.setValue(TRACKER_HSV_S_MIN)
-        self._hsv_s_min_slider.valueChanged.connect(self._on_hsv_changed)
-        hsv.addWidget(self._hsv_s_min_label)
-        hsv.addWidget(self._hsv_s_min_slider)
+        # --- Demo Routines ---
+        routine_group = QGroupBox("Demo Routines")
+        rg = QVBoxLayout()
+        rg.setSpacing(4)
+        rg.setContentsMargins(6, 10, 6, 6)
 
-        self._hsv_s_max_label = QLabel(f"S Max: {TRACKER_HSV_S_MAX}")
-        self._hsv_s_max_slider = QSlider(QtCore.Qt.Horizontal)
-        self._hsv_s_max_slider.setRange(0, 255)
-        self._hsv_s_max_slider.setValue(TRACKER_HSV_S_MAX)
-        self._hsv_s_max_slider.valueChanged.connect(self._on_hsv_changed)
-        hsv.addWidget(self._hsv_s_max_label)
-        hsv.addWidget(self._hsv_s_max_slider)
+        self._demo_list = QComboBox()
+        self._demo_list.addItem(ROUTINE_PLACEHOLDER)
+        for name in ROUTINES.keys():
+            self._demo_list.addItem(name)
+        self._demo_list.currentIndexChanged.connect(self._on_routine_changed)
+        rg.addWidget(self._demo_list)
 
-        self._hsv_v_min_label = QLabel(f"V Min: {TRACKER_HSV_V_MIN}")
-        self._hsv_v_min_slider = QSlider(QtCore.Qt.Horizontal)
-        self._hsv_v_min_slider.setRange(0, 255)
-        self._hsv_v_min_slider.setValue(TRACKER_HSV_V_MIN)
-        self._hsv_v_min_slider.valueChanged.connect(self._on_hsv_changed)
-        hsv.addWidget(self._hsv_v_min_label)
-        hsv.addWidget(self._hsv_v_min_slider)
+        self._cancel_routine_btn = QPushButton("❌ Cancel Routine")
+        self._cancel_routine_btn.clicked.connect(self.routine_cancelled.emit)
+        self._cancel_routine_btn.setEnabled(False)
+        rg.addWidget(self._cancel_routine_btn)
 
-        self._hsv_v_max_label = QLabel(f"V Max: {TRACKER_HSV_V_MAX}")
-        self._hsv_v_max_slider = QSlider(QtCore.Qt.Horizontal)
-        self._hsv_v_max_slider.setRange(0, 255)
-        self._hsv_v_max_slider.setValue(TRACKER_HSV_V_MAX)
-        self._hsv_v_max_slider.valueChanged.connect(self._on_hsv_changed)
-        hsv.addWidget(self._hsv_v_max_label)
-        hsv.addWidget(self._hsv_v_max_slider)
+        routine_group.setLayout(rg)
+        layout.addWidget(routine_group)
 
-        hsv_group.setLayout(hsv)
-        layout.addWidget(hsv_group)
+        # --- Ball Balancing (vision mode + monitor) ---
+        vision_group = QGroupBox("Ball Balancing Control")
+        vg = QVBoxLayout()
+        vg.setSpacing(4)
+        vg.setContentsMargins(6, 10, 6, 6)
 
-        # --- Vision Monitor ---
+        self._vision_button = QPushButton("Enable Vision Mode")
+        self._vision_button.clicked.connect(self._on_vision_button)
+        vg.addWidget(self._vision_button)
+
+        self._cancel_vision_btn = QPushButton("\U0001f6d1 Cancel Vision Mode")
+        self._cancel_vision_btn.clicked.connect(
+            lambda: self.vision_toggled.emit(False)
+        )
+        self._cancel_vision_btn.setEnabled(False)
+        vg.addWidget(self._cancel_vision_btn)
+
         self._open_vision_monitor_btn = QPushButton("Open Vision Monitor")
         self._open_vision_monitor_btn.clicked.connect(
             self.open_vision_monitor_clicked.emit
         )
-        layout.addWidget(self._open_vision_monitor_btn)
+        vg.addWidget(self._open_vision_monitor_btn)
 
-        layout.addStretch()
+        vision_group.setLayout(vg)
+        layout.addWidget(vision_group)
+
+        # --- Command I/O ---
+        io_group = QGroupBox("Command I/O")
+        ig = QVBoxLayout()
+        ig.setSpacing(4)
+        ig.setContentsMargins(6, 10, 6, 6)
+
+        self._send_button = QPushButton("SEND TO ARDUINO")
+        self._send_button.clicked.connect(self.send_clicked.emit)
+        ig.addWidget(self._send_button)
+
+        ig.addWidget(QLabel("Command Preview:"))
+        self._preview_output = QTextEdit()
+        self._preview_output.setReadOnly(True)
+        self._preview_output.setPlaceholderText(
+            "Command preview will appear here..."
+        )
+        self._preview_output.setMaximumHeight(80)
+        ig.addWidget(self._preview_output)
+
+        ig.addWidget(QLabel("Direct Serial Command:"))
+        self._raw_serial_input = QLineEdit()
+        self._raw_serial_input.setPlaceholderText(
+            "e.g. S,90,90,90,90,90,90"
+        )
+        ig.addWidget(self._raw_serial_input)
+
+        self._raw_serial_send_btn = QPushButton("Send Command")
+        self._raw_serial_send_btn.clicked.connect(self._on_raw_send)
+        ig.addWidget(self._raw_serial_send_btn)
+
+        io_group.setLayout(ig)
+        layout.addWidget(io_group)
+
+        self._aux_layout = QVBoxLayout()
+        layout.addLayout(self._aux_layout)
+
         return layout
 
     # ------------------------------------------------------------------

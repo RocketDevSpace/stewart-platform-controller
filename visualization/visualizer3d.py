@@ -19,6 +19,7 @@ class StewartVisualizer:
         self.fig = canvas.figure
         self.ax: Any = self.fig.add_subplot(111, projection="3d")
         self.ax.set_box_aspect([1, 1, 0.8])
+        self._apply_dark_style()
 
         self.platform_pos = {'x': 0, 'y': 0, 'z': 130, 'roll': 0, 'pitch': 0, 'yaw': 0}
 
@@ -43,6 +44,7 @@ class StewartVisualizer:
             solution = self._ik.solve(pose, self.prev_arm_points)
 
         self.ax.cla()
+        self._apply_dark_style()
 
         self.ax.scatter(
             SERVO_SHAFTS[:, 0], SERVO_SHAFTS[:, 1], SERVO_SHAFTS[:, 2],
@@ -81,16 +83,36 @@ class StewartVisualizer:
         else:
             print("FAILED IK:", solution["debug"]["failures"])
 
-        self.ax.set_xlabel("X")
-        self.ax.set_ylabel("Y")
-        self.ax.set_zlabel("Z")
         self.ax.set_xlim(-120, 120)
         self.ax.set_ylim(-120, 120)
         self.ax.set_zlim(0, 200)
-        self.ax.set_title("Stewart Platform IK Visualizer")
         self.ax.view_init(elev=20, azim=30)
-        self.ax.legend()
+        self.ax.legend(
+            facecolor="#111827", edgecolor="#2a3b59",
+            labelcolor="#d6e2ff", fontsize=7,
+        )
         self.canvas.draw()
+
+    def _apply_dark_style(self) -> None:
+        pane_bg = "#111827"
+        grid_c = "#2a3b59"
+        text_c = "#d6e2ff"
+        dim_c = "#9fb4d9"
+
+        self.fig.patch.set_facecolor("#0f1726")
+        self.ax.set_facecolor(pane_bg)
+
+        self.ax.set_xlabel("X", color=dim_c)
+        self.ax.set_ylabel("Y", color=dim_c)
+        self.ax.set_zlabel("Z", color=dim_c)
+        self.ax.set_title("Stewart Platform", color=text_c, fontsize=9)
+        self.ax.tick_params(colors=dim_c, labelsize=6)
+
+        for axis in (self.ax.xaxis, self.ax.yaxis, self.ax.zaxis):
+            axis.pane.set_facecolor(pane_bg)
+            axis.pane.set_edgecolor(grid_c)
+            axis.pane.set_alpha(0.9)
+            axis._axinfo["grid"]["color"] = grid_c  # type: ignore[attr-defined]
 
     def draw_square_platform(self, center: np.ndarray, R: np.ndarray) -> None:
         half = PLATFORM_SIZE / 2
