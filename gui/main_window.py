@@ -942,7 +942,10 @@ class MainWindow(QWidget):
 
     def _update_camera_views(self, snapshot: ControlSnapshot) -> None:
         self._vision_monitor.update_warped(
-            getattr(snapshot, "warped_bgr", None)
+            getattr(snapshot, "warped_bgr", None),
+            ball_state=snapshot.ball_state,
+            target_x_mm=self._target_x_mm,
+            target_y_mm=self._target_y_mm,
         )
         self._vision_monitor.update_camera(
             getattr(snapshot, "camera_bgr", None)
