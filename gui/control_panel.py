@@ -45,7 +45,7 @@ AXES = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_KEYS = {"X": "x", "Y": "y", "Z": "z",
              "Roll": "roll", "Pitch": "pitch", "Yaw": "yaw"}
 
-_DARK_QSS = (
+DARK_QSS = (
     "QWidget { background: #0b0f16; color: #d6e2ff;"
     " font-family: 'Segoe UI'; font-size: 10pt; }"
     " QGroupBox { border: 1px solid #1f2a3a; margin-top: 10px;"
@@ -105,7 +105,7 @@ class ControlPanel(QWidget):
         main_layout.addLayout(self._build_vision_column())
         self.setLayout(main_layout)
 
-        self.setStyleSheet(_DARK_QSS)
+        self.setStyleSheet(DARK_QSS)
 
     # ------------------------------------------------------------------
     # Layout builders

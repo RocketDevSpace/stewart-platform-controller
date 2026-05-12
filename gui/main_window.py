@@ -31,7 +31,7 @@ from control.routine_runner import RoutineRunner
 from core.ik_engine import IKEngine
 from core.platform_state import Pose
 from cv.vision_control_worker import ControlSnapshot, VisionControlWorker
-from gui.control_panel import ControlPanel, ROUTINE_PLACEHOLDER
+from gui.control_panel import ControlPanel, DARK_QSS, ROUTINE_PLACEHOLDER
 from gui.serial_monitor import SerialMonitor
 from gui.vision_monitor import VisionMonitorWindow
 from hardware.serial_manager import SerialManager
@@ -103,6 +103,7 @@ class MainWindow(QWidget):
 
     def __init__(self, ik_solver: object = None) -> None:  # noqa: ARG002
         super().__init__()
+        self.setStyleSheet(DARK_QSS)  # app-wide dark theme; cascades to all children
 
         # --- Core engines ---
         self._ik = IKEngine()
@@ -114,9 +115,10 @@ class MainWindow(QWidget):
         self._servo = ServoDriver(self._serial)
 
         # --- Visualizer ---
-        self._figure = Figure()
+        self._figure = Figure(facecolor="#0f1726")
         self._canvas = FigureCanvas(self._figure)
         self._canvas.setFixedSize(500, 500)
+        self._canvas.setStyleSheet("background: #0f1726;")
         self.visualizer = StewartVisualizer(self._canvas)
 
         # --- Timing plot ---
