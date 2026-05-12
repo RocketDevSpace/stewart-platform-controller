@@ -12,6 +12,8 @@ worker will not emit the next snapshot until that call arrives (backpressure).
 
 from __future__ import annotations
 
+from typing import Callable
+
 import time
 from dataclasses import dataclass, field
 
@@ -119,14 +121,14 @@ class VisionControlWorker(QtCore.QObject):
     def __init__(
         self,
         ik_solver: IKEngine,
-        z_provider,
+        z_provider: Callable[[], float],
         kp: float = PD_DEFAULT_KP,
         kd: float = PD_DEFAULT_KD,
         max_tilt_deg: float = 8.0,
         camera_index: int = 0,
         loop_hz: int = 50,
         snapshot_hz: int = 20,
-        command_sender=None,
+        command_sender: Callable[..., object] | None = None,
         roll_offset: float = MANUAL_ROLL_TRIM_DEG,
         pitch_offset: float = MANUAL_PITCH_TRIM_DEG,
         auto_trim_enabled: bool = AUTO_TRIM_ENABLED,
