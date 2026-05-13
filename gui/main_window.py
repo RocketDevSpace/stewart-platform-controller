@@ -1026,6 +1026,8 @@ class MainWindow(QWidget):
 
     def _trim_preview_log(self) -> None:
         doc = self.control_panel._preview_output.document()
+        if doc is None:
+            return
         cursor = QtGui.QTextCursor(doc)
         while doc.blockCount() > GUI_LOG_MAX_LINES:
             cursor.movePosition(QtGui.QTextCursor.Start)

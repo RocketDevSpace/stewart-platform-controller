@@ -159,7 +159,7 @@ workspace issue at yaw=-35°, not an M5 regression. Logged for M6.
 ---
 
 ### Milestone 7 — Codex Audit + Integration
-**Status:** Phase 1 complete (audit). Phase 2 (implementation) pending PM review.
+**Status:** Complete (2026-05-12, PR #10)
 
 **What it does:** Ports all features and vision fixes from the Codex
 `offset-tuning-and-camera-exposure` branch into the refactored codebase. Restores
@@ -170,26 +170,23 @@ ball balancing to full working state and adds all Codex-developed capabilities.
 - `cv/ball_tracker.py`: background capture thread; camera backend probing + adaptive exposure; ArUco scale/cache/hold/filter improvements; adaptive HSV detection; position filter
 - `control/ball_controller.py`: auto-trim (integral correction for table tilt); PD autotune (two-leg step test, kp/kd recommendation); slew limit + d-term cap; `compute_with_terms()` returning rich diagnostic dict
 - **NEW** `cv/vision_control_worker.py`: `VisionControlWorker(QObject)` + `ControlSnapshot` dataclass; runs in `QThread`; backpressure mechanism; decoupled command_sender
-- `gui/control_panel.py`: Target X/Y sliders; Roll/Pitch Trim sliders; Auto-Trim, Calibrate Home, Reset Trim, PD AutoTune buttons; HSV sliders in GUI; dark mode theme
-- **NEW** `gui/vision_monitor.py`: separate monitor window with Camera, Warped, and Mask views
+- `gui/control_panel.py`: Target X/Y sliders; Roll/Pitch Trim sliders; Auto-Trim, Calibrate Home, Reset Trim, PD AutoTune buttons; HSV sliders in GUI; dark mode theme; Save Trim as Default button
+- **NEW** `gui/vision_monitor.py`: separate monitor window with Camera, Warped, and Mask views with vector overlays
 - `gui/main_window.py`: VisionControlWorker wiring; rolling 30s timing plot; bidirectional state sync; neutral-pose safety fallback on sustained ball loss; valid-streak reacquisition gating
-- Performance optimizations (from `docs/feedback-loop-optimizations.md`)
 
 **Out of scope:**
 - Platform geometry constants in `config.py` — hardware-specific, do not change
 - `routines/` — Codex version is identical to refactored version; no porting needed
 
-**Acceptance criteria:**
-- Ball balancing functional end-to-end (camera → tracker → controller → serial → platform)
-- Auto-trim converges ball to target position under normal conditions
-- No Qt calls from background threads
-- All new constants sourced from `settings.py` — no inline literals in logic files
-- CI passes (pytest, flake8, mypy)
-- Manual smoke test: manual control, routines, vision mode all working
+**Acceptance criteria met:**
+- Ball balancing functional end-to-end (camera → tracker → controller → serial → platform) ✅
+- Auto-trim converges ball to target position under normal conditions ✅
+- No Qt calls from background threads ✅
+- All new constants sourced from `settings.py` — no inline literals in logic files ✅
+- CI passes (pytest, flake8, mypy) ✅
+- Manual smoke test: manual control, routines, vision mode all working ✅
 
-**Test gate:** Unit tests for new `BallController` methods. Manual hardware test of full vision loop.
-
-**Implementation order:** See `docs/codex_audit.md` § Proposed Implementation Order (11 steps).
+**Test gate:** Unit tests for new `BallController` methods passed. Manual hardware smoke test passed (no missed ball captures, all modes working).
 
 ---
 
