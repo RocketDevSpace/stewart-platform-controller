@@ -55,6 +55,7 @@ class _PDLegEvaluator:
         self.iae = 0.0
         self.sign_changes = 0
         self.last_s: float | None = None
+        self.first_crossing_elapsed_s: float | None = None
 
     def start(self, ts: float, x: float, y: float, tx: float, ty: float) -> bool:
         ex = tx - x
@@ -74,6 +75,7 @@ class _PDLegEvaluator:
         self.iae = 0.0
         self.sign_changes = 0
         self.last_s = e0
+        self.first_crossing_elapsed_s = None
         return True
 
     def observe(
@@ -108,6 +110,8 @@ class _PDLegEvaluator:
             band = max(2.0, settle_radius_mm)
             if abs(s) > band and abs(self.last_s) > band and (s * self.last_s) < 0.0:
                 self.sign_changes += 1
+            if self.first_crossing_elapsed_s is None and self.last_s > 0.0 and s <= 0.0:
+                self.first_crossing_elapsed_s = ts - self.start_ts
         self.last_s = s
 
         if err <= settle_radius_mm and speed <= settle_speed_mm_s:
@@ -135,6 +139,7 @@ class _PDLegEvaluator:
             "timed_out": 1.0 if timed_out and not settled else 0.0,
             "target_x_mm": float(tx),
             "target_y_mm": float(ty),
+            "first_crossing_elapsed_s": self.first_crossing_elapsed_s,
         }
         self.active = False
         return metrics
