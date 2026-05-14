@@ -723,7 +723,9 @@ class BallController:
             speed = math.hypot(vx, vy)
             dt = max(1e-4, min(0.1, now - self._pd_autotune_wait_settle_ts))
             self._pd_autotune_wait_settle_ts = now
-            if err <= PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM and speed <= PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S:
+            within_r = err <= PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM
+            within_v = speed <= PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S
+            if within_r and within_v:
                 self._pd_autotune_wait_settle_timer += dt
             else:
                 self._pd_autotune_wait_settle_timer = 0.0
