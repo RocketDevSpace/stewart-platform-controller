@@ -1,8 +1,10 @@
+import logging
 import math
 import time
 
 from core.platform_state import BallState
 from settings import (
+    AUTOTUNE_LOG_PATH,
     AUTO_TRIM_ERROR_LPF_ALPHA,
     AUTO_TRIM_HOME_CAL_MAX_DEG,
     AUTO_TRIM_KI_DEG_PER_MM_S,
@@ -259,6 +261,10 @@ class BallController:
         self._pd_autotune_center_y_mm = self.target_y_mm
         self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
 
+        # Per-session autotune log
+        self._autotune_log: logging.Logger = logging.getLogger(f"autotune.{id(self)}")
+        self._autotune_log.propagate = False
+
     # ---------------------------
     # Public Interface
     # ---------------------------
@@ -346,12 +352,45 @@ class BallController:
             self._pd_autotune_state = "idle"
             self._pd_leg_eval.active = False
             if self.pd_autotune_enabled:
+                self._setup_autotune_log()
+                self._autotune_log.info("AUTOTUNE SESSION START")
+                self._autotune_log.info(
+                    "  kp=%.4f  kd=%.4f", self.kp, self.kd
+                )
+                self._autotune_log.info(
+                    "  g_eff=%s  target_zeta=%s  step_mm=%s",
+                    self.pd_autotune_g_eff,
+                    self.pd_autotune_target_zeta,
+                    self.pd_autotune_step_mm,
+                )
+                self._autotune_log.info(
+                    "  max_kp=%s  max_kd=%s  min_kp=%s  min_kd=%s",
+                    self.pd_autotune_max_kp,
+                    self.pd_autotune_max_kd,
+                    self.pd_autotune_min_kp,
+                    self.pd_autotune_min_kd,
+                )
+                self._autotune_log.info(
+                    "  timeout_s=%s  settle_radius_mm=%s  wait_settle_hold_s=%s",
+                    PD_AUTOTUNE_TIMEOUT_S,
+                    PD_AUTOTUNE_SETTLE_RADIUS_MM,
+                    PD_AUTOTUNE_WAIT_SETTLE_HOLD_S,
+                )
+                self._autotune_log.info(
+                    "  min_overshoot_ratio=%s", self.pd_autotune_min_overshoot_ratio
+                )
                 self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
                 self.auto_trim_enabled = False
                 self._pd_autotune_center_x_mm = float(self._manual_target_x_mm)
                 self._pd_autotune_center_y_mm = float(self._manual_target_y_mm)
                 self._target_change_time = time.perf_counter()
             else:
+                self._autotune_log.info(
+                    "AUTOTUNE SESSION END trials=%d final_kp=%.4f final_kd=%.4f",
+                    self._pd_autotune_trial_count,
+                    self.kp,
+                    self.kd,
+                )
                 self.auto_trim_enabled = self._pd_autotune_prev_auto_trim_enabled
                 self.target_x_mm = float(self._manual_target_x_mm)
                 self.target_y_mm = float(self._manual_target_y_mm)
@@ -649,6 +688,21 @@ class BallController:
     # PD Autotune (FG-10)
     # ---------------------------
 
+    def _setup_autotune_log(self) -> None:
+        for h in list(self._autotune_log.handlers):
+            self._autotune_log.removeHandler(h)
+            h.close()
+        try:
+            fh = logging.FileHandler(AUTOTUNE_LOG_PATH, mode="w", encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S"
+            ))
+            fh.setLevel(logging.DEBUG)
+            self._autotune_log.addHandler(fh)
+            self._autotune_log.setLevel(logging.DEBUG)
+        except OSError:
+            pass
+
     def _autotune_leg_target(self, leg_index: int) -> tuple[float, float]:
         d = self.pd_autotune_step_mm
         cx = self._pd_autotune_center_x_mm
@@ -657,7 +711,9 @@ class BallController:
         ox, oy = offsets[int(leg_index) % 4]
         return cx + ox, cy + oy
 
-    def _compute_pd_from_metrics(self, metrics: dict) -> tuple[float, float, str]:
+    def _compute_pd_from_metrics(
+        self, metrics: dict
+    ) -> tuple[float, float, str, dict]:
         overshoot_ratio = float(metrics.get("overshoot_ratio", 0.0))
         settle_s = float(metrics.get("settle_time_s", 1.0))
         t_cross = metrics.get("first_crossing_elapsed_s")
@@ -667,11 +723,10 @@ class BallController:
 
         if timed_out:
             rationale = "timeout: hold gains"
-            return (
-                self._clamp(self.kp, self.pd_autotune_min_kp, self.pd_autotune_max_kp),
-                self._clamp(self.kd, self.pd_autotune_min_kd, self.pd_autotune_max_kd),
-                rationale,
-            )
+            kp_out = self._clamp(self.kp, self.pd_autotune_min_kp, self.pd_autotune_max_kp)
+            kd_out = self._clamp(self.kd, self.pd_autotune_min_kd, self.pd_autotune_max_kd)
+            dbg: dict = {"zeta_obs": 0.0, "wn": 0.0, "kp_raw": kp_out, "kd_raw": kd_out}
+            return kp_out, kd_out, rationale, dbg
 
         if overshoot_ratio >= self.pd_autotune_min_overshoot_ratio:
             ln_os = math.log(max(overshoot_ratio, 1e-9))
@@ -690,12 +745,13 @@ class BallController:
             wn = 5.8 / max(settle_s, 0.05)
             rationale = f"overdamped wn={wn:.2f} (settle fallback)"
 
-        kp_new = wn ** 2 / g
-        kd_new = 2.0 * zeta_target * wn / g
+        kp_raw = wn ** 2 / g
+        kd_raw = 2.0 * zeta_target * wn / g
 
-        kp_new = self._clamp(kp_new, self.pd_autotune_min_kp, self.pd_autotune_max_kp)
-        kd_new = self._clamp(kd_new, self.pd_autotune_min_kd, self.pd_autotune_max_kd)
-        return kp_new, kd_new, rationale
+        kp_new = self._clamp(kp_raw, self.pd_autotune_min_kp, self.pd_autotune_max_kp)
+        kd_new = self._clamp(kd_raw, self.pd_autotune_min_kd, self.pd_autotune_max_kd)
+        dbg = {"zeta_obs": zeta_obs, "wn": wn, "kp_raw": kp_raw, "kd_raw": kd_raw}
+        return kp_new, kd_new, rationale, dbg
 
     def _update_pd_autotune(self, x: float, y: float, vx: float, vy: float) -> dict | None:
         if (not self.pd_autotune_enabled) or (not self.enabled):
@@ -711,6 +767,12 @@ class BallController:
             self._pd_autotune_wait_settle_timer = 0.0
             self._pd_autotune_wait_settle_ts = now
             self._pd_autotune_leg_initialized = True
+            self._autotune_log.info(
+                "WAIT_SETTLE leg=%d center=(%.1f,%.1f)",
+                self._pd_autotune_leg_index,
+                self._pd_autotune_center_x_mm,
+                self._pd_autotune_center_y_mm,
+            )
             msg = "autotune: waiting for ball to settle at center"
             self._pd_autotune_last_message = msg
             return {"type": "wait_settle_started", "message": msg}
@@ -737,6 +799,10 @@ class BallController:
             self._target_change_time = now
             self._pd_leg_eval.start(now, x, y, tx, ty)
             self._pd_autotune_state = "measuring"
+            self._autotune_log.info(
+                "LEG %d START target=(%.1f,%.1f) ball=(%.1f,%.1f) s0=%.1fmm",
+                self._pd_autotune_leg_index, tx, ty, x, y, self._pd_leg_eval.s0,
+            )
             msg = f"autotune: leg {self._pd_autotune_leg_index} started target=({tx:.1f},{ty:.1f})"
             self._pd_autotune_last_message = msg
             return {"type": "trial_started", "message": msg}
@@ -754,7 +820,9 @@ class BallController:
             return None
 
         self._pd_autotune_trial_count += 1
-        kp_new, kd_new, rationale = self._compute_pd_from_metrics(metrics)
+        kp_old = float(self.kp)
+        kd_old = float(self.kd)
+        kp_new, kd_new, rationale, dbg = self._compute_pd_from_metrics(metrics)
         changed = (abs(kp_new - self.kp) > 1e-9) or (abs(kd_new - self.kd) > 1e-9)
 
         if changed and self.pd_autotune_auto_apply:
@@ -763,17 +831,41 @@ class BallController:
             self._pd_autotune_has_suggestion = False
             self._pd_autotune_suggested_kp = float(self.kp)
             self._pd_autotune_suggested_kd = float(self.kd)
-            action = f"applied kp={self.kp:.4f}, kd={self.kd:.4f}"
+            action = "applied"
         elif changed:
             self._pd_autotune_has_suggestion = True
             self._pd_autotune_suggested_kp = float(kp_new)
             self._pd_autotune_suggested_kd = float(kd_new)
-            action = f"suggest kp={kp_new:.4f}, kd={kd_new:.4f}"
+            action = "suggest"
         else:
             self._pd_autotune_has_suggestion = False
             self._pd_autotune_suggested_kp = float(self.kp)
             self._pd_autotune_suggested_kd = float(self.kd)
             action = "hold gains"
+
+        t_cross = metrics.get("first_crossing_elapsed_s")
+        tc_str = f"{t_cross:.3f}" if t_cross is not None else "None"
+        self._autotune_log.info(
+            "LEG %d COMPLETE",
+            self._pd_autotune_leg_index,
+        )
+        self._autotune_log.info(
+            "  settle_s=%.3f  OS=%.4f  t_cross=%s  crossings=%.0f  iae=%.1f",
+            metrics["settle_time_s"],
+            metrics["overshoot_ratio"],
+            tc_str,
+            metrics["oscillation_crossings"],
+            metrics["iae_mm_s"],
+        )
+        self._autotune_log.info(
+            "  computed: zeta_obs=%.3f  wn=%.3f  kp_raw=%.5f  kd_raw=%.5f",
+            dbg["zeta_obs"], dbg["wn"], dbg["kp_raw"], dbg["kd_raw"],
+        )
+        self._autotune_log.info(
+            "  applied:  kp %.4f->%.4f  kd %.4f->%.4f  action=%s",
+            kp_old, self.kp, kd_old, self.kd, action,
+        )
+        self._autotune_log.info("  rationale: %s", rationale)
 
         self._pd_autotune_leg_index = (self._pd_autotune_leg_index + 1) % 4
         self.target_x_mm = self._pd_autotune_center_x_mm
@@ -782,13 +874,20 @@ class BallController:
         self._pd_autotune_state = "wait_settle"
         self._pd_autotune_wait_settle_timer = 0.0
         self._pd_autotune_wait_settle_ts = now
+        self._autotune_log.info(
+            "WAIT_SETTLE leg=%d center=(%.1f,%.1f)",
+            self._pd_autotune_leg_index,
+            self._pd_autotune_center_x_mm,
+            self._pd_autotune_center_y_mm,
+        )
 
+        action_str = f"{action} kp={kp_new:.4f}, kd={kd_new:.4f}"
         msg = (
             f"trial#{self._pd_autotune_trial_count} "
             f"settle={metrics['settle_time_s']:.2f}s "
             f"overshoot={metrics['overshoot_ratio']:.2f} "
             f"cross={metrics['oscillation_crossings']:.0f} "
-            f"iae={metrics['iae_mm_s']:.1f} -> {action} ({rationale})"
+            f"iae={metrics['iae_mm_s']:.1f} -> {action_str} ({rationale})"
         )
         self._pd_autotune_last_message = msg
         return {

@@ -180,7 +180,7 @@ class TestComputePDFromMetrics:
             "first_crossing_elapsed_s": t_cross,
             "timed_out": 0.0,
         }
-        kp, kd, rationale = ctrl._compute_pd_from_metrics(metrics)
+        kp, kd, rationale, _ = ctrl._compute_pd_from_metrics(metrics)
         assert kp == pytest.approx(expected_kp, rel=0.02)
         assert kd == pytest.approx(expected_kd, rel=0.02)
         assert "crossing" in rationale
@@ -200,7 +200,7 @@ class TestComputePDFromMetrics:
             "first_crossing_elapsed_s": None,
             "timed_out": 0.0,
         }
-        kp, kd, rationale = ctrl._compute_pd_from_metrics(metrics)
+        kp, kd, rationale, _ = ctrl._compute_pd_from_metrics(metrics)
         assert kp == pytest.approx(expected_kp, rel=0.02)
         assert kd == pytest.approx(expected_kd, rel=0.02)
         assert "fallback" in rationale
@@ -215,7 +215,7 @@ class TestComputePDFromMetrics:
             "first_crossing_elapsed_s": None,
             "timed_out": 1.0,
         }
-        kp, kd, rationale = ctrl._compute_pd_from_metrics(metrics)
+        kp, kd, rationale, _ = ctrl._compute_pd_from_metrics(metrics)
         assert kp == pytest.approx(0.045)
         assert kd == pytest.approx(0.022)
         assert "timeout" in rationale
@@ -230,7 +230,7 @@ class TestComputePDFromMetrics:
             "first_crossing_elapsed_s": 0.05,
             "timed_out": 0.0,
         }
-        kp, kd, _ = ctrl._compute_pd_from_metrics(metrics)
+        kp, kd, _, _dbg = ctrl._compute_pd_from_metrics(metrics)
         assert kp <= 0.010
         assert kd <= 0.005
 

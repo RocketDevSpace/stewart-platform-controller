@@ -131,3 +131,4 @@ GUI_LOG_MAX_LINES = 500
 TIMING_PLOT_POINTS = 300
 LOG_EVERY_N = 30                        # log every N vision frames
 DEBUG_PRINTS = True
+AUTOTUNE_LOG_PATH: str = "autotune_session.log"
