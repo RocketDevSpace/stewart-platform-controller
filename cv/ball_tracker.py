@@ -142,7 +142,7 @@ class BallTracker:
         self._capture_thread.start()
 
         # --- Warp brightness cache (Opt 4) ---
-        self._warp_gray_cache_counter: int = 0
+        self._warp_gray_cache_counter: int = TRACKER_WARP_GRAY_CACHE_N
         self._cached_warp_gray_mean: float = 0.0
 
         # --- Velocity and position state ---
@@ -537,7 +537,7 @@ class BallTracker:
         ):
             return None
 
-        frame = self._frame_bufs[read_slot]
+        frame = self._frame_bufs[read_slot].copy()
         t1 = time.perf_counter()
 
         frame = cv2.flip(frame, 1)
