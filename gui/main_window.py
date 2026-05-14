@@ -737,14 +737,6 @@ class MainWindow(QWidget):
             self._update_camera_views(snapshot)
 
             if not snapshot.tracking_valid:
-                if snapshot.reason == "stale_frame_repeat":
-                    self._vision_counter += 1
-                    if self._vision_counter % LOG_EVERY_N == 0:
-                        self.control_panel.append_preview(
-                            "[TRACK] stale frame repeat; waiting for fresh frame"
-                        )
-                    return
-
                 self._valid_streak = 0
                 now = time.perf_counter()
                 miss = snapshot.miss_count
@@ -867,9 +859,8 @@ class MainWindow(QWidget):
                        roll=0.0, pitch=0.0, yaw=0.0)
         ik = self._ik.solve(neutral, None)
         if ik.get("success"):
-            safe = [
-                float(max(0, min(180, int(round(a)))))
-                for a in ik["servo_angles_deg"]
+            safe: list[float] = [
+                float(max(0, min(180, int(round(a))))) for a in ik["servo_angles_deg"]
             ]
             self._servo.send_angles(safe)
 
