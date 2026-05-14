@@ -102,14 +102,17 @@ PD_AUTOTUNE_SETTLE_SPEED_MM_S = 18.0
 PD_AUTOTUNE_SETTLE_HOLD_S = 0.35
 PD_AUTOTUNE_TIMEOUT_S = 6.0
 PD_AUTOTUNE_MIN_TRIAL_S = 0.8
-PD_AUTOTUNE_TARGET_SETTLE_S = 2.0
-PD_AUTOTUNE_KP_STEP = 0.005
-PD_AUTOTUNE_KD_STEP = 0.002
 PD_AUTOTUNE_MIN_KP = 0.005
 PD_AUTOTUNE_MAX_KP = 0.250
 PD_AUTOTUNE_MIN_KD = 0.000
 PD_AUTOTUNE_MAX_KD = 0.100
-PD_AUTOTUNE_TEST_DIAGONAL_MM = 45.0
+PD_AUTOTUNE_STEP_MM: float = 40.0          # step distance from center per leg
+PD_AUTOTUNE_G_EFF: float = 171.0           # effective platform gravity (mm/s²/°)
+PD_AUTOTUNE_TARGET_ZETA: float = 0.70      # desired closed-loop damping ratio
+PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM: float = 8.0   # pre-leg settle radius
+PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S: float = 6.0  # pre-leg settle speed
+PD_AUTOTUNE_WAIT_SETTLE_HOLD_S: float = 1.0      # pre-leg settle hold duration
+PD_AUTOTUNE_MIN_OVERSHOOT_RATIO: float = 0.02    # below this → treat as overdamped
 
 # =============================================================================
 # Loop rates
