@@ -2,7 +2,7 @@
 
 *Living document — update at the end of substantive sessions. Sync between venues if applicable.*
 
-**Last updated:** May 10, 2026 — M6 merged (PR #7); M7 Codex audit initiated; Phase 1 audit doc committed to `docs/codex_audit.md`.
+**Last updated:** May 12, 2026 — M7 implementation complete (PR #10, awaiting review/merge).
 
 ---
 
@@ -12,11 +12,11 @@ A PyQt5 desktop application that drives a hand-built 6-DOF Stewart platform via 
 
 ## Current phase
 
-**Refactor complete (M1–M6 merged). Active: M7 — Codex audit + integration.**
+**Refactor complete (M1–M7 implemented). M7 PR #10 awaiting review and merge.**
 
-M6 (Vision Loop Cleanup) merged 2026-05-10 (PR #7). Shipped: `BallTracker.update()` returns `BallState`, `BallController` accepts `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, `ball_controller.py` moved to `control/`, `comms/` retired, `gui_layout_legacy.py` and `gui_main.py` deleted. Ball balance behavior was already broken pre-M6 (vision pipeline wires cleanly; fix deferred to M7).
+M7 (Codex audit + integration) is implemented on branch `milestone/7-codex-integration` (PR #10). Shipped in two sub-PRs: PR #9 (Steps 1–6: settings constants, BallTracker background thread + camera improvements + detection improvements, BallController auto-trim + autotune + compute_with_terms) and PR #10 (Steps 7–10: VisionControlWorker, ControlPanel vision controls + dark mode, VisionMonitorWindow, MainWindow rewire + timing plot + safety fallback). Hardware smoke test passed: manual control, routines, and vision mode all working. CI restructured (mypy before PyQt5 install) and passing.
 
-M7 (Codex audit + integration) is now the active milestone. Phase 1 (full file-by-file audit of `codex/offset-tuning-and-camera-exposure`) is complete. The audit document lives at `docs/codex_audit.md`. It contains: module mapping table, commit-by-commit functional log, 22 feature groups with target files and implementation notes, required `settings.py` additions, and a proposed 11-step implementation order. Phase 2 (implementation PRs) begins after PM reviews and prioritizes the audit table.
+Post-merge, the full refactor is done. The codebase is in the clean layered architecture the refactor was targeting. Future work is feature development (second camera, ball catching, ball bouncing).
 
 ## Architectural commitments
 
@@ -72,14 +72,7 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 
 ## Open questions
 
-**Open, M7 (Codex integration):**
-- PR granularity for `cv/ball_tracker.py` rewrite: one large PR or three (background thread / camera open+adaptive exposure / detection improvements)?
-- Dark mode scope: full app or vision panels only?
-- `BallTracker.update()` signature: Codex returns dict; refactored returns `BallState`. Port should keep `BallState` return and add new internal logic. Confirm.
-- Codex `config.py` geometry constants: must NOT be ported (hardware-specific, in existing `config.py`). Confirm dev Claude treats all geometry constants as read-only during M7.
-- `comms/serial_sender.py` was deleted in M6; Codex `gui_main.py` imports it. Dev Claude must map it to `hardware/serial_manager.py` + `hardware/servo_driver.py`. Confirm mapping before implementation.
-
-**Open, future phase:**
+**Open, post-M7:**
 - Second-camera setup. Needs a real plan after M7 lands. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
 - Ball catching feasibility gated on sub-20ms loop benchmark. Benchmark on hardware before scoping.
 
@@ -90,6 +83,10 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 - `BallTracker` returning `BallState` dataclass → resolved in M6 (PR #7, Step 1).
 - Where `ball_controller.py` moves → resolved in M6 (PR #7, Step 3). Moved to `control/ball_controller.py`.
 - M7 Phase 1 (audit) → complete May 10, 2026. Audit doc at `docs/codex_audit.md`.
+- M7 Phase 2 (implementation) → complete May 12, 2026 (PR #10). All 22 feature groups ported.
+- Dark mode scope → full app via `DARK_QSS` applied at `MainWindow` level.
+- PR granularity for `cv/ball_tracker.py` → single PR (Steps 2–4 batched in PR #9).
+- `BallTracker.update()` signature → kept `BallState` return; Codex dict logic ported internally.
 
 ## Phase roadmap
 
@@ -101,7 +98,7 @@ Rough plan, will evolve. Each phase produces reviewable artifacts; each builds o
 4. **M4 — Routine Runner Extraction** ✅ (April 22, 2026)
 5. **M5 — GUI Split + cleanup items** ✅ (May 10, 2026)
 6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** ✅ (May 10, 2026)
-7. **M7 — Codex audit + integration** — Phase 1 (audit) complete. Phase 2 (implementation PRs) pending PM review of `docs/codex_audit.md`.
+7. **M7 — Codex audit + integration** ✅ (May 12, 2026, PR #10 awaiting merge)
 8. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
 9. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
 10. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.

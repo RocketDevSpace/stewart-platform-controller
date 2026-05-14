@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install lint/type-check dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pytest flake8 mypy numpy types-pyserial
@@ -31,12 +31,28 @@ jobs:
 
       - name: Type check with mypy
         run: |
-          # Runs on the whole repo. Legacy modules are excluded via setup.cfg [mypy] exclude.
+          # Runs WITHOUT PyQt5 installed so ignore_missing_imports treats Qt as Any.
+          # Installing PyQt5 before this step would pull in strict 5.15.x stubs that
+          # break on the unqualified Qt.Xxx enum style used throughout this codebase.
           # --explicit-package-bases avoids "not a valid package name" error from hyphens.
           mypy . \
             --ignore-missing-imports \
             --explicit-package-bases
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libglib2.0-0 libxkbcommon-x11-0 \
+            libdbus-1-3 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-xinerama0
+
+      - name: Install test dependencies
+        run: |
+          pip install PyQt5 opencv-python-headless
+
       - name: Run tests
         run: |
           pytest tests/ -v
+        env:
+          QT_QPA_PLATFORM: offscreen

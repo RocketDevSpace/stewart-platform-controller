@@ -10,6 +10,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Milestone-7] - 2026-05-12
+
+### Added
+- `cv/vision_control_worker.py` — `VisionControlWorker(QObject)` runs the full
+  vision loop (`BallTracker` → `BallController` → `ServoDriver`) in a `QThread`;
+  `ControlSnapshot` dataclass carries per-frame diagnostics (ball state, timing,
+  control terms, raw camera/warped/mask frames) back to the GUI thread via Qt signal.
+  Backpressure mechanism drops frames when the GUI cannot keep up.
+- `gui/vision_monitor.py` — floating debug window with three camera views: warped
+  (perspective-corrected) with vector overlays, raw camera, HSV mask. Overlays on
+  warped view: ball circle, displacement-to-target arrow (white), velocity arrow
+  (orange), PD restoration arrow (magenta), legend, position/velocity/PD text.
+- ~60 new runtime constants in `settings.py` sourced from Codex audit: camera
+  backend/resolution/FPS, adaptive exposure, software gain, ArUco detection params,
+  HSV range defaults, position filter, auto-trim, PD autotune, loop rates.
+
+### Changed
+- `cv/ball_tracker.py` — background capture thread decouples frame acquisition
+  from the control loop; camera backend probing selects the fastest available
+  backend; `configure()` sets resolution/FPS/exposure from `settings`; adaptive
+  exposure adjusts based on frame brightness; software brightness/contrast gain
+  applied when needed; ArUco detection uses scale, caching, and hold-last-good
+  logic; adaptive HSV range; position EMA filter; stores
+  `_last_camera_bgr`, `_last_warped_bgr`, `_last_mask_gray` for snapshot delivery.
+- `control/ball_controller.py` — auto-trim: running integral correction converges
+  ball to target under persistent table tilt; `compute_with_terms()` returns full
+  diagnostic dict (`position_vec_mm`, `velocity_vec_mm_s`, `pd_vec`, timing);
+  PD autotune: two-leg step test yields Kp/Kd recommendations; slew limiter caps
+  per-frame command change; d-term cap prevents derivative spike.
+- `gui/control_panel.py` — three-column layout: 6-axis sliders + HSV | ball target
+  + trim + PD | routines + vision + commands; compact sliders (max height 20 px);
+  Ball Target X/Y sliders; Roll/Pitch Trim sliders; Auto-Trim, Calibrate Home,
+  Reset Trim, PD AutoTune buttons; "Save Trim as Default" button writes current
+  trim back to `settings.py`; dark mode QSS exported as `DARK_QSS`; vision monitor
+  button grouped with enable/cancel.
+- `gui/main_window.py` — `VisionControlWorker` owns the vision thread; snapshot
+  handler routes frames to `VisionMonitorWindow` and timing plot; rolling 30-second
+  timing chart; neutral-pose safety fallback on sustained ball loss; valid-streak
+  reacquisition gating; `_on_save_trim_as_default()` rewrites trim constants in
+  `settings.py` in place; 3D visualizer canvas uses `setMinimumSize` (not fixed).
+- `visualization/visualizer3d.py` — `_apply_dark_style()` reapplied after every
+  `ax.cla()` call: pane facecolors, edgecolors, tick/label/title colors all dark.
+- `.github/workflows/ci.yml` — restructured so mypy runs before PyQt5 is
+  installed (avoids strict 5.15.x stub errors on unqualified `Qt.Xxx` enum style);
+  system Qt libs (`libgl1`, `libegl1`, xcb family) installed before pytest;
+  `PyQt5` and `opencv-python-headless` added for test step; `QT_QPA_PLATFORM:
+  offscreen` set for headless CI.
+
+### Fixed
+- `gui/main_window.py:_trim_preview_log` — added `None` guard before
+  `doc.blockCount()` to satisfy mypy `QTextDocument | None` return type.
+- `tests/test_vision_control_worker.py` — `union-attr` mypy error on
+  `snap.ball_state.x_mm` (added `is not None` guard); `no-untyped-def` on
+  `_get_app()` (added `-> object:` return annotation).
+- CI: `libgl1-mesa-glx` package renamed to `libgl1` + `libegl1` in Ubuntu 22.04.
+
+---
+
 ## [Milestone-6] - 2026-05-10
 
 ### Added
