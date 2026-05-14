@@ -34,6 +34,7 @@ from settings import (
     TRACKER_POS_FILTER_ENABLED,
     TRACKER_POS_FILTER_MAX_LAG_MM,
     TRACKER_POS_FILTER_SPEED_MM_S,
+    TRACKER_WARP_GRAY_CACHE_N,
 )
 
 
@@ -118,7 +119,14 @@ class BallTracker:
         # --- Background capture thread (FG-1) ---
         self._capture_running = True
         self._capture_lock = threading.Lock()
-        self._latest_frame = None
+        # Double-buffer: capture thread writes into _buf_write_slot; worker reads
+        # from the other slot.  No full-frame copy needed on the read path (Opt 3).
+        self._frame_bufs = [
+            np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8),
+            np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8),
+        ]
+        self._buf_write_slot: int = 0
+        self._buf_ready: bool = False
         self._latest_frame_ts = 0.0
         self._last_processed_frame_ts = 0.0
         self._capture_period_ms = 0.0
@@ -129,9 +137,13 @@ class BallTracker:
         self._last_camera_bgr = None
         self._last_warped_bgr = None
         self._last_mask_gray = None
-        self._capture_fail_streak = 0
+        self._capture_fail_streak: int = 0
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
+
+        # --- Warp brightness cache (Opt 4) ---
+        self._warp_gray_cache_counter: int = TRACKER_WARP_GRAY_CACHE_N
+        self._cached_warp_gray_mean: float = 0.0
 
         # --- Velocity and position state ---
         self.prev_ball_mm = None
@@ -379,6 +391,11 @@ class BallTracker:
             self._capture_fail_streak = 0
             now = time.perf_counter()
             gray_sample = float(np.mean(frame[:, :, 1]))
+            # Re-allocate buffers if camera returns a different resolution
+            if frame.shape != self._frame_bufs[0].shape:
+                self._frame_bufs = [np.zeros_like(frame), np.zeros_like(frame)]
+            # Copy into write slot outside the lock (the expensive pixel copy)
+            np.copyto(self._frame_bufs[self._buf_write_slot], frame)
             with self._capture_lock:
                 if self._prev_capture_ts > 0:
                     dt_ms = (now - self._prev_capture_ts) * 1000.0
@@ -397,8 +414,9 @@ class BallTracker:
                     else gray_sample
                 )
                 self._prev_capture_ts = now
-                self._latest_frame = frame
+                self._buf_write_slot ^= 1
                 self._latest_frame_ts = now
+                self._buf_ready = True
             self._evaluate_runtime_camera_policy(now)
 
     # =========================
@@ -503,13 +521,13 @@ class BallTracker:
     def update(self):
         t0 = time.perf_counter()
 
-        # Read from background thread buffer (FG-1)
+        # Read from double-buffer (FG-1 + Opt 3): grab slot index under lock,
+        # then access pixel data without holding the lock.
         with self._capture_lock:
+            if not self._buf_ready:
+                return None
             frame_ts = self._latest_frame_ts
-            latest_frame = self._latest_frame
-
-        if latest_frame is None:
-            return None
+            read_slot = 1 - self._buf_write_slot
 
         # Skip stale frames
         if (
@@ -519,7 +537,7 @@ class BallTracker:
         ):
             return None
 
-        frame = latest_frame.copy()
+        frame = self._frame_bufs[read_slot].copy()
         t1 = time.perf_counter()
 
         frame = cv2.flip(frame, 1)
@@ -654,7 +672,13 @@ class BallTracker:
             self.hsv_lower = np.array([hmin, smin, vmin], dtype=np.uint8)
             self.hsv_upper = np.array([hmax, smax, vmax], dtype=np.uint8)
 
-        gray_warp_mean = float(np.mean(cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)))
+        self._warp_gray_cache_counter += 1
+        if self._warp_gray_cache_counter >= TRACKER_WARP_GRAY_CACHE_N:
+            self._warp_gray_cache_counter = 0
+            self._cached_warp_gray_mean = float(
+                np.mean(cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY))
+            )
+        gray_warp_mean = self._cached_warp_gray_mean
         vmin_base = int(self.hsv_lower[2])
         if gray_warp_mean < 45.0:
             relax = min(70, int((45.0 - gray_warp_mean) * 2.0))
