@@ -114,6 +114,9 @@ PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM: float = 8.0   # pre-leg settle radius
 PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S: float = 6.0  # pre-leg settle speed
 PD_AUTOTUNE_WAIT_SETTLE_HOLD_S: float = 1.0      # pre-leg settle hold duration
 PD_AUTOTUNE_MIN_OVERSHOOT_RATIO: float = 0.02    # below this → treat as overdamped
+PD_AUTOTUNE_MIN_CROSS_S: float = 0.40           # ignore first_crossing faster than this
+PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC: float = 0.50   # max fractional change per trial
+AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 
 # =============================================================================
 # Loop rates
