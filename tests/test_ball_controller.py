@@ -159,6 +159,10 @@ class TestComputePDFromMetrics:
         ctrl.pd_autotune_min_kd = 0.0
         ctrl.pd_autotune_max_kd = 0.100
         ctrl.pd_autotune_min_overshoot_ratio = 0.02
+        # kp/kd chosen so neither the underdamped (~0.100) nor overdamped (~0.049)
+        # expected outputs hit the MAX_GAIN_DELTA_FRAC=0.50 fence
+        ctrl.kp = 0.075
+        ctrl.kd = 0.030
         return ctrl
 
     def test_underdamped_exact_inversion(self) -> None:
@@ -233,6 +237,34 @@ class TestComputePDFromMetrics:
         kp, kd, _ = ctrl._compute_pd_from_metrics(metrics)
         assert kp <= 0.010
         assert kd <= 0.005
+
+    def test_short_crossing_uses_settle_fallback(self) -> None:
+        ctrl = self._make_ctrl()
+        # t_cross below MIN_CROSS_S threshold — should fall through to settle fallback
+        metrics = {
+            "overshoot_ratio": 0.163,
+            "settle_time_s": 2.0,
+            "first_crossing_elapsed_s": 0.10,   # too short — ignored
+            "timed_out": 0.0,
+        }
+        kp, kd, rationale = ctrl._compute_pd_from_metrics(metrics)
+        assert "fallback" in rationale
+
+    def test_gain_delta_is_capped(self) -> None:
+        ctrl = self._make_ctrl()
+        ctrl.kp = 0.045
+        ctrl.kd = 0.022
+        # t_cross=1.0 ≥ MIN_CROSS_S; OS=0.163 → wn≈3.63 → kp_raw≈0.077 > 0.045*1.5=0.0675
+        metrics = {
+            "overshoot_ratio": 0.163,
+            "settle_time_s": 2.0,
+            "first_crossing_elapsed_s": 1.0,   # above MIN_CROSS_S
+            "timed_out": 0.0,
+        }
+        kp, kd, _ = ctrl._compute_pd_from_metrics(metrics)
+        from settings import PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC
+        assert kp <= ctrl.kp * (1.0 + PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC) + 1e-9
+        assert kp >= ctrl.kp * (1.0 - PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC) - 1e-9
 
 
 class TestAutotuneStateMachine:
