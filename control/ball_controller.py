@@ -1,3 +1,4 @@
+import logging
 import math
 import time
 
@@ -22,8 +23,10 @@ from settings import (
     PD_AUTOTUNE_AUTO_APPLY,
     PD_AUTOTUNE_ENABLED,
     PD_AUTOTUNE_G_EFF,
+    PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC,
     PD_AUTOTUNE_MAX_KD,
     PD_AUTOTUNE_MAX_KP,
+    PD_AUTOTUNE_MIN_CROSS_S,
     PD_AUTOTUNE_MIN_KD,
     PD_AUTOTUNE_MIN_KP,
     PD_AUTOTUNE_MIN_OVERSHOOT_RATIO,
@@ -681,7 +684,7 @@ class BallController:
             zeta_obs = zeta_target
             rationale = "overdamped: using target zeta"
 
-        if t_cross is not None and t_cross > 1e-3:
+        if t_cross is not None and t_cross >= PD_AUTOTUNE_MIN_CROSS_S:
             wd = math.pi / t_cross
             zeta_for_wn = self._clamp(zeta_obs, 0.05, 0.999)
             wn = wd / math.sqrt(1.0 - zeta_for_wn ** 2)
@@ -692,6 +695,11 @@ class BallController:
 
         kp_new = wn ** 2 / g
         kd_new = 2.0 * zeta_target * wn / g
+
+        # Cap gain change to MAX_GAIN_DELTA_FRAC of current value per trial
+        max_frac = float(PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC)
+        kp_new = self._clamp(kp_new, self.kp * (1.0 - max_frac), self.kp * (1.0 + max_frac))
+        kd_new = self._clamp(kd_new, self.kd * (1.0 - max_frac), self.kd * (1.0 + max_frac))
 
         kp_new = self._clamp(kp_new, self.pd_autotune_min_kp, self.pd_autotune_max_kp)
         kd_new = self._clamp(kd_new, self.pd_autotune_min_kd, self.pd_autotune_max_kd)
