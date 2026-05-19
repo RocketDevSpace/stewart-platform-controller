@@ -266,6 +266,22 @@ class TestComputePDFromMetrics:
         assert kp <= ctrl.kp * (1.0 + PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC) + 1e-9
         assert kp >= ctrl.kp * (1.0 - PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC) - 1e-9
 
+    def test_gain_delta_cap_kd_zero_can_move(self) -> None:
+        # Regression: when self.kd == 0 the multiplicative window collapsed to
+        # [0, 0], locking kd at zero forever. The absolute floor (0.001) must
+        # allow kd to move off zero.
+        ctrl = self._make_ctrl()
+        ctrl.kp = 0.045
+        ctrl.kd = 0.0
+        metrics = {
+            "overshoot_ratio": 0.163,
+            "settle_time_s": 2.0,
+            "first_crossing_elapsed_s": 1.0,
+            "timed_out": 0.0,
+        }
+        _, kd, _ = ctrl._compute_pd_from_metrics(metrics)
+        assert kd > 0.0, "kd must be able to move off zero"
+
 
 class TestAutotuneStateMachine:
     def test_enable_enters_wait_settle(self) -> None:

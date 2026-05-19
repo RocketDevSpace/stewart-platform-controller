@@ -5,6 +5,7 @@ import time
 from core.platform_state import BallState
 from settings import (
     AUTO_TRIM_ERROR_LPF_ALPHA,
+    AUTOTUNE_LOG_PATH,
     AUTO_TRIM_HOME_CAL_MAX_DEG,
     AUTO_TRIM_KI_DEG_PER_MM_S,
     AUTO_TRIM_MAX_DEG,
@@ -346,7 +347,6 @@ class BallController:
             log.removeHandler(h)
             h.close()
         try:
-            from settings import AUTOTUNE_LOG_PATH
             fh = logging.FileHandler(AUTOTUNE_LOG_PATH, mode="w", encoding="utf-8")
             fh.setFormatter(logging.Formatter(
                 "%(asctime)s.%(msecs)03d  %(message)s", datefmt="%H:%M:%S"
@@ -730,10 +730,14 @@ class BallController:
         kp_new = wn ** 2 / g
         kd_new = 2.0 * zeta_target * wn / g
 
-        # Cap gain change to MAX_GAIN_DELTA_FRAC of current value per trial
+        # Cap gain change to MAX_GAIN_DELTA_FRAC of current value per trial.
+        # Absolute floor of 0.001 prevents the window from collapsing to [0,0]
+        # when self.kp or self.kd is zero (e.g. user zeroed kd before enabling).
         max_frac = float(PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC)
-        kp_new = self._clamp(kp_new, self.kp * (1.0 - max_frac), self.kp * (1.0 + max_frac))
-        kd_new = self._clamp(kd_new, self.kd * (1.0 - max_frac), self.kd * (1.0 + max_frac))
+        kp_step = max(self.kp * max_frac, 0.001)
+        kd_step = max(self.kd * max_frac, 0.001)
+        kp_new = self._clamp(kp_new, self.kp - kp_step, self.kp + kp_step)
+        kd_new = self._clamp(kd_new, self.kd - kd_step, self.kd + kd_step)
 
         kp_new = self._clamp(kp_new, self.pd_autotune_min_kp, self.pd_autotune_max_kp)
         kd_new = self._clamp(kd_new, self.pd_autotune_min_kd, self.pd_autotune_max_kd)
@@ -847,8 +851,8 @@ class BallController:
             tc_str, metrics["oscillation_crossings"], metrics["iae_mm_s"],
         )
         self._autotune_log.info(
-            "  -> kp %.4f->%.4f  kd %.4f->%.4f  %s",
-            kp_before, kp_new, kd_before, kd_new, rationale,
+            "  -> kp %.4f->%.4f  kd %.4f->%.4f  [%s]  %s",
+            kp_before, kp_new, kd_before, kd_new, action, rationale,
         )
 
         msg = (
