@@ -79,7 +79,7 @@ BALL_TARGET_DEFAULT_Y_MM = 0.0
 MANUAL_ROLL_TRIM_DEG = -0.8
 MANUAL_PITCH_TRIM_DEG = 4.6
 
-AUTO_TRIM_ENABLED = True
+AUTO_TRIM_ENABLED = False
 AUTO_TRIM_KI_DEG_PER_MM_S = 0.008
 AUTO_TRIM_MAX_DEG = 6.0
 AUTO_TRIM_HOME_CAL_MAX_DEG = 8.0
@@ -110,10 +110,13 @@ PD_AUTOTUNE_MAX_KD = 0.100
 PD_AUTOTUNE_STEP_MM: float = 40.0          # step distance from center per leg
 PD_AUTOTUNE_G_EFF: float = 171.0           # effective platform gravity (mm/s²/°)
 PD_AUTOTUNE_TARGET_ZETA: float = 0.70      # desired closed-loop damping ratio
-PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM: float = 8.0   # pre-leg settle radius
-PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S: float = 6.0  # pre-leg settle speed
-PD_AUTOTUNE_WAIT_SETTLE_HOLD_S: float = 1.0      # pre-leg settle hold duration
+PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM: float = 20.0  # pre-leg settle radius
+PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S: float = 20.0  # pre-leg settle speed
+PD_AUTOTUNE_WAIT_SETTLE_HOLD_S: float = 0.5      # pre-leg settle hold duration
 PD_AUTOTUNE_MIN_OVERSHOOT_RATIO: float = 0.02    # below this → treat as overdamped
+PD_AUTOTUNE_MIN_CROSS_S: float = 0.40           # ignore first_crossing faster than this
+PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC: float = 0.50   # max fractional change per trial
+AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 
 # =============================================================================
 # Loop rates
