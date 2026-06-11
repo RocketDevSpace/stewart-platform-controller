@@ -2,7 +2,7 @@
 
 *Living document — update at the end of substantive sessions. Sync between venues if applicable.*
 
-**Last updated:** May 12, 2026 — M7 implementation complete (PR #10, awaiting review/merge).
+**Last updated:** June 11, 2026 — full-codebase audit; hardening roadmap M8–M12 adopted; PRs #14 (velocity low-pass) and #15 (servo 4 geometry fix) merged; M8 housekeeping in review.
 
 ---
 
@@ -12,11 +12,18 @@ A PyQt5 desktop application that drives a hand-built 6-DOF Stewart platform via 
 
 ## Current phase
 
-**Refactor complete (M1–M7 implemented). M7 PR #10 awaiting review and merge.**
+**Post-refactor hardening (M8–M12). Refactor M1–M7 fully merged.**
 
-M7 (Codex audit + integration) is implemented on branch `milestone/7-codex-integration` (PR #10). Shipped in two sub-PRs: PR #9 (Steps 1–6: settings constants, BallTracker background thread + camera improvements + detection improvements, BallController auto-trim + autotune + compute_with_terms) and PR #10 (Steps 7–10: VisionControlWorker, ControlPanel vision controls + dark mode, VisionMonitorWindow, MainWindow rewire + timing plot + safety fallback). Hardware smoke test passed: manual control, routines, and vision mode all working. CI restructured (mypy before PyQt5 install) and passing.
+M7 (Codex audit + integration) merged May 2026 via PRs #9/#10; autotune guard follow-ups merged via PR #13. A full-codebase audit on June 11, 2026 confirmed the layered architecture held, and produced a five-milestone hardening plan addressing what the refactor left behind: a reproducible IK branch-flip bug (the screw-routine servo snap at yaw=-35°), no rate limiting at the hardware boundary, three modules that regrew past 700–1000 lines (`gui/main_window.py`, `control/ball_controller.py`, `cv/ball_tracker.py`), test gaps on the riskiest code (`compute()` is tested but production calls `compute_with_terms()`; the IK solver internals and tracker math have no tests), and doc/hygiene drift.
 
-Post-merge, the full refactor is done. The codebase is in the clean layered architecture the refactor was targeting. Future work is feature development (second camera, ball catching, ball bouncing).
+Hardening milestones (see Phase roadmap below for status):
+- **M8 — Housekeeping:** untrack `__pycache__`, requirements files, doc sync, config.py comment fixes.
+- **M9 — IK correctness + safety rail:** fix branch-flip in `kinematics/ik_solver.py`; slew-rate guard in `core/safety.py` applied at `ServoDriver.send_angles`; consolidate inline clamps; reacquire gating into worker command path; continuity regression tests.
+- **M10 — Controller decomposition:** split autotune/auto-trim out of `ball_controller.py`; single PD compute path.
+- **M11 — Vision split:** camera lifecycle out of `BallTracker`; public tracker API; synthetic-frame tests; clear `cv/` excludes.
+- **M12 — GUI slimming:** user-settings overlay replaces the settings.py regex rewrite; extract timing plot + vision bridge from `main_window.py`; non-blocking serial connect.
+
+After M12, feature development resumes (second camera, ball catching, ball bouncing).
 
 ## Architectural commitments
 
@@ -49,6 +56,9 @@ These are committed and shape the project. Revisable only with explicit discussi
 | 10 | M5 implementation took the 'preserve legacy file as `gui_layout_legacy.py` for one cycle' approach instead of immediate deletion | Allows side-by-side comparison during the M5 review and first manual hardware test. Deletion happens in M6. | Committed (PR #5, 2026-04-23) |
 | 11 | M6 Step 1 also updates `gui/main_window.py` dict accesses on `ball_state` | PM plan omitted this; `_vision_control_step` accesses `ball_state["x_mm"]` and `ball_state["y_mm"]` which break at runtime once tracker returns `BallState`. Fix is in-scope for Step 1 since it's the same transition. | Committed (M6, May 10, 2026) |
 | 12 | M6 Step 5 narrows `cv/` flake8/mypy exclude to `cv/ball_tracker.py` rather than removing it | PM plan said "remove cv/ball_controller.py from excludes" but setup.cfg excludes the whole `cv/` directory. After ball_controller moves to `control/`, `cv/ball_tracker.py` remains untyped and must stay excluded. Directory-level exclude is replaced with a file-level one. | Committed (M6, May 10, 2026) |
+| 13 | Ball velocity low-pass filter lives in the tracker, weight in `settings.BALL_VEL_FILTER_ALPHA` | Filtering at source keeps BallController clean; raw frame-diff velocity noise made kd untunable. Filter state resets on tracking loss. | Committed (PR #14, merged June 11, 2026) |
+| 14 | `config.py` servo 4 shaft Y corrected −99.920 → −99.290 (digit transposition) | Shaft table is generated from the measured 0/5 mirror pair rotated ±120° about Z, so all shafts must sit at r = 100.276 mm; servo 4 was the lone outlier and the rotation predicts −99.2904 exactly. Quick hardware symmetry check (servo 4 vs servo 1) recommended on next power-up. | Committed (PR #15, June 11, 2026) |
+| 15 | The M9 slew-rate guard applies to ALL command paths — manual sends ramp through it, no bypass | Single choke point in `ServoDriver.send_angles` protects routines, vision, and manual alike; a bypass flag would reintroduce the unprotected path the guard exists to close. | Committed (June 11, 2026), implement in M9 |
 
 For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone scope and acceptance criteria, see `SPEC.md`.
 
@@ -60,7 +70,7 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 - **Hardware tests require a physical Arduino on COM4** (or whatever `settings.SERIAL_PORT` is set to). These tests are marked `[HARDWARE]` and skipped in CI.
 - **Windows-only.** Project depends on COM-port serial conventions and PyQt5; no Mac/Linux support planned.
 - **Vision pipeline currently 2D.** Single camera + ArUco corner markers + HSV blob detection. z-axis ball state is plumbed but not populated.
-- **Tracked `__pycache__/` directories exist in some folders** as legacy artifacts from before `.gitignore` was set up. They're inert; cleanup is a low-priority housekeeping task.
+- **Known IK defect (M9 target):** the solver's closest-to-neutral servo-angle pick can override the continuity-based branch choice, causing the screw-routine servo snap at yaw=-35°; until M9 lands, avoid full-range yaw routines with hardware attached.
 
 ## Things Claude has gotten wrong on this project
 
@@ -72,8 +82,10 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 
 ## Open questions
 
-**Open, post-M7:**
-- Second-camera setup. Needs a real plan after M7 lands. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
+**Open:**
+- Hardware symmetry check after the servo 4 geometry fix (PR #15): on next power-up, verify servo 4 neutral/extremes mirror servo 1.
+- Camera exposure / HSV startup conflict — long-standing, unresolved; becomes tractable after M11 isolates camera lifecycle in one class.
+- Second-camera setup. Needs a real plan after M12. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
 - Ball catching feasibility gated on sub-20ms loop benchmark. Benchmark on hardware before scoping.
 
 **Closed:**
@@ -98,13 +110,18 @@ Rough plan, will evolve. Each phase produces reviewable artifacts; each builds o
 4. **M4 — Routine Runner Extraction** ✅ (April 22, 2026)
 5. **M5 — GUI Split + cleanup items** ✅ (May 10, 2026)
 6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** ✅ (May 10, 2026)
-7. **M7 — Codex audit + integration** ✅ (May 12, 2026, PR #10 awaiting merge)
-8. **Phase 2 (post-refactor): Second-camera setup** — needs scoping after M6 lands. Adds 3D ball tracking as the foundation for ball catching and bouncing.
-9. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
-10. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.
-11. **Phase 5: Multiple ball targets** — multi-blob tracking, target assignment.
+7. **M7 — Codex audit + integration** ✅ (May 12, 2026; merged)
+8. **M8 — Housekeeping** (hardening) — in review (June 11, 2026)
+9. **M9 — IK correctness + safety rail** — next up; highest-impact hardening milestone
+10. **M10 — Controller decomposition**
+11. **M11 — Vision pipeline split + tests**
+12. **M12 — GUI slimming + settings persistence**
+13. **Phase 2: Second-camera setup** — scope after M12. Adds 3D ball tracking as the foundation for ball catching and bouncing.
+14. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
+15. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.
+16. **Phase 5: Multiple ball targets** — multi-blob tracking, target assignment.
 
-The post-refactor phases (8–11) are not committed; they're the trajectory the architecture is being built to support. Real plans get written when M6 lands and a Phase 2 SPEC update is needed.
+The feature phases (13–16) are not committed; they're the trajectory the architecture is being built to support. Real plans get written when the hardening milestones land.
 
 ## Project layout on disk
 

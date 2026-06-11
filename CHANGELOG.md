@@ -10,6 +10,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Milestone-8] - 2026-06-11
+
+Housekeeping milestone opening the post-refactor hardening phase (M8–M12).
+
+### Added
+- `requirements.txt` / `requirements-dev.txt` — runtime and dev/CI dependencies,
+  previously only implicit in `ci.yml` and CLAUDE.md.
+
+### Changed
+- `CLAUDE.md` — "Refactor state" (stale at "M6 active") replaced with "Project
+  state": refactor complete (M1–M7), hardening roadmap M8–M12; architecture tree
+  gains `cv/vision_control_worker.py` and `gui/vision_monitor.py`.
+- `PROJECT_STATE.md` — current phase, decisions log (velocity filter placement,
+  servo 4 geometry correction, M9 slew-guard applies to manual sends), phase
+  roadmap with hardening milestones, refreshed open questions.
+- `config.py` — coordinate comment blocks above `SERVO_SHAFTS_XY` and
+  `PLATFORM_POINTS_LOCAL_XY` described an older measurement iteration; replaced
+  with the actual generation methodology (measured 0/5 mirror pair rotated
+  ±120° about Z) and 2026-06-11 validation results. Comments only.
+
+### Removed
+- 11 tracked `__pycache__/*.pyc` files committed before `.gitignore` existed,
+  including binaries of long-deleted modules (`gui_layout`, `gui_main`,
+  `cv/ball_controller`).
+
+### Fixed (pre-M8 standalone PRs, same day)
+- PR #14 — tracker velocity low-pass filter (`settings.BALL_VEL_FILTER_ALPHA`),
+  replacing the hardcoded `vel_alpha` smoother; filter state resets on tracking
+  loss so stale velocity no longer kicks the d-term on reacquire.
+- PR #15 — `config.py` servo 4 shaft Y coordinate: −99.920 → −99.290 (digit
+  transposition; validated by radius + 120° rotation-symmetry check).
+
+---
+
 ## [Milestone-7] - 2026-05-12
 
 ### Added
