@@ -5,6 +5,7 @@ import threading
 
 from core.platform_state import BallState
 from settings import (
+    BALL_VEL_FILTER_ALPHA,
     CAMERA_AUTO_EXPOSURE,
     CAMERA_BUFFER_SIZE,
     CAMERA_EXPOSURE,
@@ -151,6 +152,8 @@ class BallTracker:
         self.prev_time = None
         self.vx_smooth = 0.0
         self.vy_smooth = 0.0
+        self._vx_f: float = 0.0   # low-pass filtered velocity (BALL_VEL_FILTER_ALPHA)
+        self._vy_f: float = 0.0
 
         # --- HSV state ---
         self.hsv_lower = np.array([10, 83, 125], dtype=np.uint8)
@@ -700,6 +703,8 @@ class BallTracker:
             ball = self.find_ball_center(mask)
 
         if ball is None:
+            self._vx_f = 0.0
+            self._vy_f = 0.0
             self._debug_show(frame, warped, mask)
             return None
 
@@ -730,6 +735,8 @@ class BallTracker:
 
                 # Speed outlier rejection (FG-7)
                 if self.max_speed_mm_s > 0 and raw_speed_mm_s > self.max_speed_mm_s:
+                    self._vx_f = 0.0
+                    self._vy_f = 0.0
                     self._debug_show(frame, warped, mask)
                     return None
 
@@ -756,11 +763,14 @@ class BallTracker:
         if self.prev_ball_mm is None or self.prev_time is None or dt <= 0:
             vx = 0.0
             vy = 0.0
+            self._vx_f = 0.0
+            self._vy_f = 0.0
         else:
-            self.vx_smooth = self.VEL_ALPHA * self.vx_smooth + (1 - self.VEL_ALPHA) * vx_raw_meas
-            self.vy_smooth = self.VEL_ALPHA * self.vy_smooth + (1 - self.VEL_ALPHA) * vy_raw_meas
-            vx = self.vx_smooth
-            vy = self.vy_smooth
+            alpha = BALL_VEL_FILTER_ALPHA
+            self._vx_f = alpha * vx_raw_meas + (1.0 - alpha) * self._vx_f
+            self._vy_f = alpha * vy_raw_meas + (1.0 - alpha) * self._vy_f
+            vx = self._vx_f
+            vy = self._vy_f
 
         self.prev_ball_raw_mm = (x_mm_raw, y_mm_raw)
         self.prev_ball_mm = (x_mm, y_mm)

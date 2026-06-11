@@ -65,6 +65,9 @@ TRACKER_HSV_S_MAX = 255
 TRACKER_HSV_V_MIN = 125
 TRACKER_HSV_V_MAX = 255
 
+# low-pass weight on raw velocity (0=frozen, 1=raw); ~6 Hz cutoff at 30 fps; tunable
+BALL_VEL_FILTER_ALPHA: float = 0.55
+
 # =============================================================================
 # PD controller
 # =============================================================================
