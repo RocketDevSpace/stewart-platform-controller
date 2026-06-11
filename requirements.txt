@@ -1,0 +1,8 @@
+# Runtime dependencies — install with: pip install -r requirements.txt
+# Windows-only desktop app (see CLAUDE.md). Floors match the versions the
+# app is developed and smoke-tested against.
+PyQt5>=5.15
+matplotlib>=3.8
+numpy>=1.26
+pyserial>=3.5
+opencv-contrib-python>=4.8
