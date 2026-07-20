@@ -109,6 +109,7 @@ These are non-negotiable. Violating any is grounds to reject and revert.
 4. Do not commit broken or untested code.
 5. Open ONE PR to main when the full milestone is complete. Title: `[MN] Milestone name`. Body lists each step, files changed, test results, deviations.
 6. **Reply to review comments individually.** Each review thread gets a reply: `Acknowledged. Fixing in next commit.` then after pushing: `Fixed in <commit-hash> — <one-line description>`. A silent push with no thread reply is a process violation.
+7. **PR reviewers must leave issues as separate inline or threaded comments, not one combined review body.** A combined body cannot be replied to per-thread. If a combined comment is left, address each point anyway; for future PRs use GitHub's line-level review comments so each thread can be replied to individually.
 
 ## Dev rules
 
