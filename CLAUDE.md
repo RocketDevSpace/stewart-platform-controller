@@ -11,7 +11,7 @@ PyQt5 desktop app controlling a 6-DOF Stewart platform via Arduino serial. Inclu
 **Lint/typecheck:** `flake8` and `mypy` per `setup.cfg`. Legacy modules excluded; exclusions shrink as refactor advances.
 **Imports:** repo-root-relative only. `from settings import ...`, `from core.safety import ...`. Never use `stewart_control.*` prefixes — that's an artifact of the original ChatGPT Codex codebase and is being removed.
 
-## Current architecture (in flight — see "Refactor state" below)
+## Current architecture
 
 ```
 main.py                # entry point — repo-root-relative imports. ✅
@@ -34,7 +34,8 @@ control/
   ball_controller.py   # PD controller. ✅
 
 cv/
-  ball_tracker.py      # vision pipeline. Returns BallState. ✅
+  ball_tracker.py      # vision pipeline: capture thread + ArUco + detection. Returns BallState. ✅
+  vision_control_worker.py  # owns BallTracker + BallController; vision/PD/IK loop in a QThread. ✅
 
 routines/              # pure pose-list generators.
 visualization/
@@ -43,7 +44,8 @@ gui/
   main_window.py       # top-level window. Wires all modules. ✅
   control_panel.py     # sliders, buttons, signals. ✅
   serial_monitor.py    # serial output display widget. ✅
-tests/                 # test_safety, test_servo_driver, test_ik_engine, test_routine_runner, test_ball_controller.
+  vision_monitor.py    # floating camera/warped/mask debug views. ✅
+tests/                 # test_safety, test_servo_driver, test_ik_engine, test_routine_runner, test_ball_controller, test_vision_control_worker.
 ```
 
 **Module ownership boundaries:**
@@ -61,15 +63,17 @@ tests/                 # test_safety, test_servo_driver, test_ik_engine, test_ro
 - `BallState`: x_mm, y_mm, vx_mm_s, vy_mm_s required; z_mm, vz_mm_s Optional (None if 2D-only).
 - IK result dict: `{success, platform_points, arm_points, servo_angles_deg, platform_center, platform_R, debug}`.
 
-## Refactor state
+## Project state
 
-A 6-milestone refactor is in flight, extracting logic from `gui_layout.py` into clean modules. **M1–M5 complete (M5 merged 2026-05-10). M6 active on branch `milestone/6-vision-loop-cleanup`.** Read `SPEC.md` for milestone scope and acceptance criteria. Read `CHANGELOG.md` for what each completed milestone shipped. Always check the open PR list before treating any milestone as 'pending' — implementation may be in review.
+**The original 7-milestone refactor is complete — M1–M7 all merged** (M7 merged 2026-05-12; autotune guard follow-ups via PR #13; tracker velocity low-pass via PR #14 and servo 4 geometry fix via PR #15, both merged 2026-06-11). Read `CHANGELOG.md` for what each milestone shipped. Always check the open PR list (`gh pr list`) before treating any status written here as current — implementation may be in review.
 
-**M5 status:** merged 2026-05-10. Smoke test passed — manual control, routines (parabola confirmed), visualizer, serial monitor all working. Screw routine has a pre-existing IK branch-switching issue at yaw=-35° (3 servos snap min→max ~2s in); not an M5 regression, logged for M6 investigation.
+**Current phase: post-refactor hardening (M8–M12), scoped 2026-06-11.** Full detail and decisions in PROJECT_STATE.md.
 
-**M6 scope** (the only remaining refactor milestone, branch `milestone/6-vision-loop-cleanup`):
-- Original: `BallTracker` returns `BallState` dataclass, `BallController` accepts `BallState`, debug prints gated by `settings.DEBUG_PRINTS`, vision loop ownership confirmed in `gui/main_window.py`.
-- Cleanup: move `ball_controller.py` from `cv/` to `control/`, retire `comms/`, delete `gui/gui_layout_legacy.py` and `gui/gui_main.py`.
+- **M8 — Housekeeping:** untrack `__pycache__` artifacts, requirements files, sync docs to reality, fix stale `config.py` comments.
+- **M9 — IK correctness + safety rail:** fix the IK branch-flip bug in `kinematics/ik_solver.py` — the "closest to neutral" servo-angle pick silently overrides the continuity-based elbow choice (root cause of the screw-routine servo snap at yaw=-35° logged at M5). Add a slew-rate guard in `core/safety.py` applied in `ServoDriver.send_angles`; manual sends ramp through it too (decided 2026-06-11). Consolidate the three duplicated inline 0–180 clamps. Move reacquire gating into the worker command path. Routine-sweep continuity regression tests.
+- **M10 — Controller decomposition:** split autotune + auto-trim out of the 800-line `control/ball_controller.py`; collapse `compute()` into `compute_with_terms()` (tests currently cover the unused `compute()` path; production uses `compute_with_terms()`).
+- **M11 — Vision split:** extract camera lifecycle from `BallTracker`; public tracker API (the worker currently reaches into tracker privates); synthetic-frame tests; remove `cv/ball_tracker.py` from setup.cfg excludes; remove dead velocity-smoother state left by PR #14.
+- **M12 — GUI slimming:** replace the `settings.py` regex rewrite (save-trim-as-default) with a user-settings overlay; extract timing plot + vision bridge from `gui/main_window.py`; non-blocking serial connect (currently freezes the GUI ~2 s at startup).
 
 ## What good looks like in this domain
 
