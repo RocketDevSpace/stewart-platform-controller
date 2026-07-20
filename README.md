@@ -6,7 +6,7 @@
 ## Prerequisites
 
 - Python 3.11 or newer
-- Arduino flashed with the companion firmware
+- Arduino flashed with the companion firmware (see [`firmware/`](firmware/README.md) — pin map, wiring order, protocol, and a flashable image)
 - USB camera (index 1 by default — see Configure below)
 - Windows 10 or 11
 
