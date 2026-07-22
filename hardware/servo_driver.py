@@ -34,6 +34,12 @@ class ServoDriver:
     def __init__(self, serial_manager: SerialManager) -> None:
         self._serial = serial_manager
         self._last_sent: list[float] = list(_BOOT_ANGLES)
+        # Expected firmware-side ramp duration of the LAST send (ms). The
+        # firmware acks only AFTER a ramp and buffers just 64 bytes of
+        # commands while ramping — streaming callers (RoutineRunner) must
+        # hold off sends for this long after a ramped command or the UART
+        # buffer overflows and commands get dropped/corrupted.
+        self.last_ramp_ms: float = 0.0
 
     def format_command(self, angles: list[float], speed_delay: int = 0) -> str:
         """Return the Arduino serial command string for the given angles.
@@ -84,8 +90,17 @@ class ServoDriver:
         else:
             ok = self._serial.send(cmd.encode())
         if ok:
+            self.last_ramp_ms = self._ramp_ms(clipped_angles, speed_delay)
             self._last_sent = list(clipped_angles)
         return ok
+
+    def _ramp_ms(self, target: list[float], speed_delay: int) -> float:
+        if speed_delay <= 0:
+            return 0.0
+        max_delta = max(
+            abs(t - p) for t, p in zip(target, self._last_sent)
+        )
+        return float(max_delta * speed_delay)
 
     def send_raw(self, command: str) -> bool:
         """Validate and send a hand-typed protocol command.
@@ -126,5 +141,6 @@ class ServoDriver:
         cmd = self.format_command(clipped_angles, speed_delay)
         ok = self._serial.send(cmd.encode())
         if ok:
+            self.last_ramp_ms = self._ramp_ms(clipped_angles, speed_delay)
             self._last_sent = list(clipped_angles)
         return ok

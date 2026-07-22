@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Callable
 
 import numpy as np
@@ -65,16 +66,19 @@ class RoutineRunner:
         ik_engine: IKEngine,
         serial_driver: ServoDriver,
         on_pose_update: Callable[[dict], None],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._ik = ik_engine
         self._servo = serial_driver
         self._on_pose = on_pose_update
+        self._clock = clock
         self._steps: list[dict] = []
         self._index: int = 0
         self._running: bool = False
         self._send_mode: bool = False
         self._prev_arm_points: np.ndarray | None = None
         self._ik_failures: int = 0
+        self._ramp_hold_until: float = 0.0
 
     def load(self, routine_name: str) -> bool:
         if routine_name not in ROUTINES:
@@ -103,6 +107,7 @@ class RoutineRunner:
         self._running = True
         self._send_mode = True
         self._ik_failures = 0
+        self._ramp_hold_until = 0.0
 
     def cancel(self, wind_down: bool = True) -> bool:
         """Cancel playback.
@@ -139,6 +144,15 @@ class RoutineRunner:
         pose_dict = self._steps[self._index]
 
         if self._send_mode:
+            # Firmware-ramp hold: after a large (ramped) send the firmware
+            # blocks until the ramp completes and buffers only ~2 commands
+            # of UART. Streaming ticks into that window overflows the
+            # buffer and silently drops/corrupts commands (observed on
+            # hardware 2026-07-22) — so hold this step until the ramp is
+            # expected to finish.
+            if self._clock() < self._ramp_hold_until:
+                return True
+
             pose = Pose(
                 x=float(pose_dict["x"]),
                 y=float(pose_dict["y"]),
@@ -151,6 +165,12 @@ class RoutineRunner:
             if ik_result.success:
                 self._prev_arm_points = np.asarray(ik_result.arm_points)
                 self._servo.send_angles(list(ik_result.servo_angles_deg))
+                ramp_ms = float(getattr(self._servo, "last_ramp_ms", 0.0))
+                if ramp_ms > 0.0:
+                    # +25% margin: the estimate assumes exact 1 deg/step.
+                    self._ramp_hold_until = (
+                        self._clock() + (ramp_ms / 1000.0) * 1.25
+                    )
             else:
                 self._ik_failures += 1
                 if self._ik_failures == 1:

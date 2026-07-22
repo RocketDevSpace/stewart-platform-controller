@@ -265,6 +265,44 @@ class TestIKFailureHandling:
         assert prev_arg is not None
 
 
+class TestRampHold:
+    def test_tick_holds_during_firmware_ramp(self) -> None:
+        """After a ramped send (driver.last_ramp_ms > 0) the runner must
+        hold the stream until the firmware's ramp window has passed —
+        streaming into a ramping firmware overflows its 64-byte UART
+        buffer (observed on hardware 2026-07-22)."""
+        fake_now = [0.0]
+        runner, ik, servo, _ = _make_runner()
+        runner._clock = lambda: fake_now[0]
+        servo.last_ramp_ms = 300.0  # driver reports a 300 ms firmware ramp
+        runner.load(VALID_ROUTINE)
+        runner.start_send()
+
+        assert runner.tick() is True          # sends step 0, arms the hold
+        assert servo.send_angles.call_count == 1
+        idx_after_first = runner.current_index
+
+        fake_now[0] = 0.1                     # still inside 300*1.25 ms
+        assert runner.tick() is True          # held: no send, no advance
+        assert servo.send_angles.call_count == 1
+        assert runner.current_index == idx_after_first
+
+        fake_now[0] = 0.5                     # past the hold window
+        runner.tick()
+        assert servo.send_angles.call_count == 2
+
+    def test_no_hold_for_instant_sends(self) -> None:
+        fake_now = [0.0]
+        runner, _, servo, _ = _make_runner()
+        runner._clock = lambda: fake_now[0]
+        servo.last_ramp_ms = 0.0
+        runner.load(VALID_ROUTINE)
+        runner.start_send()
+        runner.tick()
+        runner.tick()
+        assert servo.send_angles.call_count == 2
+
+
 class TestRoutineGenerators:
     """Every ROUTINES entry must produce the six-key pose contract —
     previously only the first routine ever executed under test."""
