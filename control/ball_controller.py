@@ -19,6 +19,8 @@ from collections.abc import Callable
 
 from control.auto_trim import AutoTrim
 from control.autotune import PDAutotuner
+from control.path_follower import PathFollower
+from control.patterns import Path
 from control.pd_core import PDCore
 from control.rest_gate import STATE_RESTING, RestGate
 from control.setpoint import SetpointArbiter
@@ -99,6 +101,10 @@ class BallController:
         # stash/restore coordination stays here (single owner of the flag).
         self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
 
+        # Path following (feat/path): drives the arbiter override channel
+        # (mutually exclusive with autotune, which owns the same channel).
+        self._path_follower = PathFollower(clock)
+
     # ---------------------------
     # Delegated read-only state (telemetry code reads these)
     # ---------------------------
@@ -130,6 +136,10 @@ class BallController:
     @property
     def pd_autotune_auto_apply(self) -> bool:
         return self._autotuner.auto_apply
+
+    @property
+    def path_following_active(self) -> bool:
+        return self._path_follower.active
 
     # ---------------------------
     # Gains / limits
@@ -197,6 +207,8 @@ class BallController:
             self._auto_trim.cancel_home_calibration()
 
     def start_home_calibration(self) -> None:
+        # Exclusion: calibration needs a stationary center target.
+        self.stop_path()
         self.auto_trim_enabled = True
         # Deliberate unification (M10): home-cal routes its center target
         # through the manual setpoint. The GUI already emits set_target(0,0)
@@ -218,12 +230,59 @@ class BallController:
             self._autotuner.set_center(float(x_mm), float(y_mm))
 
     # ---------------------------
+    # Path following coordination (feat/path)
+    # ---------------------------
+
+    def set_path(self, path: Path) -> None:
+        """Load/replace the path. Stops any active following first (with the
+        motion-free target transfer) so a mid-run swap cannot jump the
+        target."""
+        if self._path_follower.active:
+            self.stop_path()
+        self._path_follower.set_path(path)
+
+    def set_path_speed(self, mm_s: float) -> None:
+        self._path_follower.set_speed(float(mm_s))
+
+    def start_path(self) -> bool:
+        """Begin following the loaded path.
+
+        Mutual exclusion: the follower drives the arbiter's override
+        channel — the same channel autotune owns — so autotune and
+        home calibration are force-disabled first. No override is written
+        here; the first compute_with_terms with a valid ball seeds the
+        target at the nearest path point (the platform does not move on
+        start until the ball is seen).
+        """
+        self._auto_trim.cancel_home_calibration()
+        self.set_pd_autotune(False)
+        self._rest_gate.reset()
+        return self._path_follower.start()
+
+    def stop_path(self) -> None:
+        """Stop following, freezing the target IN PLACE (zero motion):
+        the manual target is set to the current active target before the
+        override clears, so `active` is bit-identical across the
+        transition. (Safe against clobbering autotune's override because
+        the exclusion contract guarantees autotune is off while a path
+        runs.)"""
+        self._path_follower.stop()
+        if self._arbiter.override_active:
+            fx, fy = self._arbiter.active
+            self._arbiter.set_manual(fx, fy)
+            self._arbiter.clear_override()
+        self._auto_trim.notify_target_changed()
+        self._rest_gate.reset()
+
+    # ---------------------------
     # Autotune coordination
     # ---------------------------
 
     def set_pd_autotune(self, enabled: bool, auto_apply: bool | None = None) -> None:
         if bool(enabled):
             self._auto_trim.cancel_home_calibration()
+            # Exclusion: autotune owns the override channel next.
+            self.stop_path()
         changed = self._autotuner.set_enabled(enabled, auto_apply, self.kp, self.kd)
         if changed:
             # Mode change: rest evidence gathered in the old mode is stale.
@@ -280,6 +339,16 @@ class BallController:
             x, y, vx, vy, self.kp, self.kd
         )
 
+        # Path follower (feat/path): advances the override target along the
+        # loaded path at the adaptive rate, seeded at the nearest path
+        # point on the first ball sighting. set_override stamps
+        # last_change_time every cycle, which deliberately holds auto-trim
+        # in target_hold for the whole run — pursuit lag is NOT a level
+        # error and must not be integrated into trim.
+        if self._path_follower.active:
+            ptx, pty = self._path_follower.update(x, y)
+            self._arbiter.set_override(ptx, pty)
+
         target_x, target_y = self._arbiter.active
         pos_vec_x = target_x - x
         pos_vec_y = target_y - y
@@ -304,12 +373,20 @@ class BallController:
         # a full PD command on this very call.
         rest_radius_mm = math.hypot(pos_vec_x, pos_vec_y)
         rest_speed_mm_s = math.hypot(vx, vy)
-        if self.home_calibration_active:
+        path_following = (
+            self._path_follower.active and not self._path_follower.done
+        )
+        if self.home_calibration_active or path_following:
             # Home calibration needs ACTIVE PD driving the ball to center
             # while auto-trim absorbs the bias — resting at level+trim with
             # the ball parked off-center would leave centering to the slow
             # trim walk alone (observed on the rig: calibration far less
             # reliable with rest engaged).
+            # Path following likewise: a slow segment (taper, low speed)
+            # can satisfy the rest entry gates while the target crawls,
+            # producing a rest/wake limbo — suppress. When an OPEN path is
+            # done (ball parked at the endpoint) suppression lifts and
+            # rest may engage exactly like a manual target hold.
             self._rest_gate.reset()
             rest_state = "active"
             resting = False
@@ -347,6 +424,7 @@ class BallController:
             "kp": self.kp,
             "kd": self.kd,
             **self._autotuner.telemetry(),
+            **self._path_follower.telemetry(),
             "target_x_mm": self.target_x_mm,
             "target_y_mm": self.target_y_mm,
         }
