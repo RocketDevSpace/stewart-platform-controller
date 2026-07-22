@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from cv.ball_tracker import BallTracker
-from settings import BALL_VEL_FILTER_ALPHA
+from settings import BALL_VEL_FILTER_ALPHA, TRACKER_AB_BETA_MAX
 
 WARP = 480          # warp_size_px used in tests (matches production setting)
 MARKER_PX = 60
@@ -92,14 +92,28 @@ class TestVelocity:
         assert state is not None
         assert state.vx_mm_s == 0.0
 
-    def test_velocity_low_pass(self) -> None:
+    def test_velocity_low_pass_legacy_mode(self) -> None:
+        # Pins the LEGACY velocity semantics (regression reference); the
+        # production default is now mode="alpha_beta".
         t = _tracker()
+        t.measurement.mode = "legacy"
         t.process(_scene((0.0, 0.0)), frame_ts=1.0)
         dt = 1.0 / 30.0
         state = t.process(_scene((6.0, 0.0)), frame_ts=1.0 + dt)
         assert state is not None
         # raw vx ~ 6mm / dt = 180 mm/s; first filtered sample = alpha * raw
         expected = BALL_VEL_FILTER_ALPHA * (6.0 / dt)
+        assert state.vx_mm_s == pytest.approx(expected, rel=0.25)
+
+    def test_velocity_alpha_beta_second_frame(self) -> None:
+        t = _tracker()   # default mode from settings
+        assert t.measurement.mode == "alpha_beta"
+        t.process(_scene((0.0, 0.0)), frame_ts=1.0)
+        dt = 1.0 / 30.0
+        state = t.process(_scene((6.0, 0.0)), frame_ts=1.0 + dt)
+        assert state is not None
+        # innovation ~6 mm >= INNOV_FULL -> beta = BETA_MAX; v = (beta/dt)*r
+        expected = (TRACKER_AB_BETA_MAX / dt) * 6.0
         assert state.vx_mm_s == pytest.approx(expected, rel=0.25)
 
     def test_velocity_resets_on_loss(self) -> None:
@@ -115,6 +129,7 @@ class TestVelocity:
 class TestPositionFilterReset:
     def test_reacquired_ball_not_blended_toward_stale_position(self) -> None:
         t = _tracker()
+        t.measurement.mode = "legacy"   # the pos low-pass is a legacy-path feature
         t.pos_filter_enabled = True
         t.process(_scene((0.0, 0.0)), frame_ts=1.0)
         t.process(_scene(None), frame_ts=1.0 + 1 / 30)      # loss
@@ -123,6 +138,18 @@ class TestPositionFilterReset:
         # With stale prev_ball_mm the filter would drag this toward (0,0).
         assert state.x_mm == pytest.approx(30.0, abs=2.0)
         assert state.y_mm == pytest.approx(-20.0, abs=2.0)
+
+    def test_alpha_beta_reacquire_seeds_at_new_position(self) -> None:
+        t = _tracker()   # default mode alpha_beta
+        t.process(_scene((0.0, 0.0)), frame_ts=1.0)
+        t.process(_scene(None), frame_ts=1.0 + 1 / 30)      # loss -> AB reset
+        state = t.process(_scene((30.0, -20.0)), frame_ts=1.0 + 2 / 30)
+        assert state is not None
+        # Re-seeded at the new position with zero velocity, no stale blend.
+        assert state.x_mm == pytest.approx(30.0, abs=2.0)
+        assert state.y_mm == pytest.approx(-20.0, abs=2.0)
+        assert state.vx_mm_s == 0.0
+        assert state.vy_mm_s == 0.0
 
 
 class TestStaleHomographyBound:
@@ -157,6 +184,31 @@ class TestStaleHomographyBound:
         assert state.x_mm == pytest.approx(10.0, abs=2.0)
 
 
+class TestPreFlipped:
+    def test_pre_flipped_matches_internal_flip(self) -> None:
+        # Handing in an already-mirrored frame with pre_flipped=True must
+        # give the same detection as the internal-flip path.
+        t1 = _tracker()
+        t2 = _tracker()
+        scene = _scene((25.0, 15.0))
+        s1 = t1.process(scene, frame_ts=1.0)
+        s2 = t2.process(cv2.flip(scene, 1), frame_ts=1.0, pre_flipped=True)
+        assert s1 is not None and s2 is not None
+        assert s2.x_mm == pytest.approx(s1.x_mm, abs=0.5)
+        assert s2.y_mm == pytest.approx(s1.y_mm, abs=0.5)
+
+    def test_gain_buffer_reused_across_frames(self) -> None:
+        # Software gain > 1.02 routes through the preallocated dst buffer;
+        # two frames must reuse the same member buffer (no per-frame alloc).
+        t = _tracker()
+        scene = _scene((0.0, 0.0))
+        t.process(scene, frame_ts=1.0, brightness_gain=1.5)
+        buf1 = t._gain_buf
+        t.process(scene.copy(), frame_ts=1.0 + 1 / 30, brightness_gain=1.5)
+        assert buf1 is not None
+        assert t._gain_buf is buf1
+
+
 class TestFindBallCenter:
     def test_small_blob_rejected(self) -> None:
         t = _tracker()
@@ -189,3 +241,96 @@ class TestMmToWarpPx:
         t = _tracker()
         px = t.mm_to_warp_px(60.0, 60.0)
         assert px == [360.0, 120.0]
+
+
+class TestMarkerCenterFilter:
+    """Drives _filter_marker_center directly: deadband freeze, slow-alpha
+    convergence, fast-alpha ramp tracking, and the >40 px snap reset."""
+
+    def _seed(self, t: BallTracker) -> np.ndarray:
+        return t._filter_marker_center(0, np.array([100.0, 100.0], dtype=np.float32))
+
+    def test_deadband_step_returns_prev_unchanged(self) -> None:
+        t = _tracker()
+        seeded = self._seed(t)
+        out = t._filter_marker_center(0, np.array([100.25, 100.0], dtype=np.float32))
+        assert np.array_equal(out, seeded)   # frozen, bit-identical
+
+    def test_small_steps_converge_with_slow_alpha(self) -> None:
+        t = _tracker()
+        self._seed(t)
+        target = np.array([100.6, 100.0], dtype=np.float32)
+        out = None
+        for _ in range(10):
+            out = t._filter_marker_center(0, target)
+        assert out is not None
+        # Converges to within the deadband of the target, then freezes.
+        assert abs(float(out[0]) - 100.6) <= t.aruco_center_deadband_px + 1e-5
+        assert float(out[0]) > 100.0
+
+    def test_ramp_lag_below_1_5px_after_3_frames(self) -> None:
+        t = _tracker()
+        self._seed(t)
+        out = None
+        for k in range(1, 4):   # 3 px/frame ramp
+            cur = np.array([100.0 + 3.0 * k, 100.0], dtype=np.float32)
+            out = t._filter_marker_center(0, cur)
+        assert out is not None
+        assert abs(float(out[0]) - 109.0) < 1.5
+
+    def test_41px_jump_snaps_to_current(self) -> None:
+        t = _tracker()
+        self._seed(t)
+        out = t._filter_marker_center(0, np.array([141.0, 100.0], dtype=np.float32))
+        assert float(out[0]) == pytest.approx(141.0)
+        assert float(out[1]) == pytest.approx(100.0)
+
+
+class TestHomographyStability:
+    def test_same_scene_twice_yields_identical_h(self) -> None:
+        # At rest the marker-center deadband freezes the filtered centers,
+        # so the per-frame getPerspectiveTransform solve is deterministic.
+        t = _tracker()
+        scene = _scene((0.0, 0.0))
+        assert t.process(scene, frame_ts=1.0) is not None
+        assert t._last_H is not None
+        h1 = t._last_H.copy()
+        assert t.process(scene.copy(), frame_ts=1.0 + 1 / 30) is not None
+        h2 = t._last_H
+        assert h2 is not None
+        assert np.array_equal(h1, h2)
+
+
+class TestSubpixelPipeline:
+    def test_detection_works_with_both_subpix_flags_on(self) -> None:
+        # Accuracy claims need real imagery; this pins "no crash + the mm
+        # mapping stays within the existing tolerances" with the detector
+        # SUBPIX refinement AND the full-res cornerSubPix pass enabled.
+        t = _tracker()
+        assert t.aruco_fullres_subpix is True
+        assert t.aruco_params.cornerRefinementMethod == cv2.aruco.CORNER_REFINE_SUBPIX
+        state = t.process(_scene((25.0, 15.0)), frame_ts=1.0)
+        assert state is not None
+        assert state.x_mm == pytest.approx(25.0, abs=2.0)
+        assert state.y_mm == pytest.approx(15.0, abs=2.0)
+
+    def test_find_ball_center_returns_floats_when_subpixel(self) -> None:
+        t = _tracker()
+        assert t.ball_subpixel is True
+        mask = np.zeros((WARP, WARP), dtype=np.uint8)
+        cv2.circle(mask, (300, 200), 14, 255, -1)
+        found = t.find_ball_center(mask)
+        assert found is not None
+        (x, y), radius = found
+        assert isinstance(x, float) and isinstance(y, float)
+        assert isinstance(radius, float)
+
+    def test_find_ball_center_int_casts_when_subpixel_disabled(self) -> None:
+        t = _tracker()
+        t.ball_subpixel = False
+        mask = np.zeros((WARP, WARP), dtype=np.uint8)
+        cv2.circle(mask, (300, 200), 14, 255, -1)
+        found = t.find_ball_center(mask)
+        assert found is not None
+        (x, y), radius = found
+        assert x == int(x) and y == int(y) and radius == int(radius)

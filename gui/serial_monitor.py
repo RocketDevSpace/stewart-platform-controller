@@ -34,6 +34,11 @@ class SerialMonitor(QWidget):
         self.setLayout(layout)
 
     def append_line(self, line: str) -> None:
+        # Firmware v2 acks every streamed T command with a bare "k" — at up
+        # to 30/s that floods the monitor with noise. The acks are consumed
+        # by the RTT telemetry; the display drops them.
+        if line == "k":
+            return
         self._text.append(line)
 
     def append_command(self, cmd: str) -> None:

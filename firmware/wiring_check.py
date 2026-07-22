@@ -11,8 +11,10 @@ Standalone rig utility: deliberately imports NO app code (works from a bare
 clone next to a bench Arduino), so it builds the "S,..." string inline — a
 documented exemption from CLAUDE.md hard constraint 4 (see setup.cfg note).
 
-Usage:  python firmware/wiring_check.py [PORT]
+Usage:  python firmware/wiring_check.py [PORT] [BAUD]
         PORT defaults to COM8 (this dev machine's Uno; check Device Manager).
+        BAUD defaults to 250000 (firmware v2); pass 115200 for v1 firmware.
+        Uses the legacy S protocol, which both firmware versions speak.
 """
 import sys
 import time
@@ -20,7 +22,7 @@ import time
 import serial
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "COM8"
-BAUD = 115200
+BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 250000
 NEUTRAL = 90
 DELTA = 2                # max excursion, degrees
 WIGGLES = 3              # back-and-forth cycles per servo

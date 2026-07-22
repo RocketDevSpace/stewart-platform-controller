@@ -253,6 +253,57 @@ adjustment is an open physical-design decision.
 
 ---
 
+### 2026-07-22 Performance Pass — Latency, Jitter, Smoothness
+**Status:** Implemented (branch `perf/latency-jitter`, stacked on the
+overhaul); firmware v2 flashed and validated on the rig; merge gated on the
+live tuning session
+
+**What it does:** Six measured steps eliminating servo dither, sensor
+jitter, and pipeline latency, with a hard requirement that smoothing never
+degrades genuine fast response (all smoothing is speed/innovation-scheduled).
+
+**Firmware v2 serial protocol (see `firmware/README.md` for full detail):**
+- `T,d0,d1,d2,d3,d4,d5\n` — tenth-degree units 0..1800, instant
+  `writeMicroseconds`, terse ack `k\n` (`e\n` on malformed input).
+- Legacy `S,a0..a5,speedDelay\n` retained bit-compatible (whole degrees,
+  firmware ramp, verbose ack). Position state shared between protocols.
+- 250000 baud; boot banner `[READY v2]`. The host auto-detects the version
+  from the banner and falls back to 115200 when none appears (v1 boards).
+- Host hybrid dispatch: v2 + instant move → `T` (Schmitt hysteresis on the
+  0.1° grid); large jumps and v1/forced-legacy → `S` + firmware ramp.
+
+**Rest-mode contract (`control/rest_gate.py`):**
+- Enter (via a 0.5 s sustained hold): radius ≤ 6 mm AND LPF speed ≤ 12 mm/s.
+- Exit (checked first, same-cycle, raw values, no filter/timer):
+  radius > 10 mm OR speed > 25 mm/s.
+- Resting output = level + live trim offsets, slew-limited on transition;
+  auto-trim keeps integrating during rest (its gates are strictly wider),
+  so trim updates still walk the ball toward center.
+- Exit latency is exactly one control cycle; verified equal-command vs a
+  never-resting controller on a disturbance frame.
+
+**Tracker measurement filtering (`cv/measurement_filter.py`):**
+- Modes: `alpha_beta` (default; constant-velocity filter, gains scheduled
+  from quiet 0.30/0.05 to fast 0.90/0.50 by max(innovation 1→4 mm, speed
+  60→150 mm/s)), `legacy` (pre-pass EMA behavior, regression-pinned),
+  `raw` (bench comparison).
+- ArUco: every-frame detection, sub-pixel corner refinement (detector-level
+  + full-res `cornerSubPix`), marker-center deadband 0.3 px / fast-track
+  1.5 px per frame. Sub-pixel ball centroid.
+
+**Acceptance criteria:**
+- 294 unit tests pass; flake8/mypy clean ✅
+- Bench (through the real filter→PD→IK→servo chain): quiescent servo
+  activity 6125 → 0 integer flips/min with rest engaged (one send per
+  30 s); impulse response ≥ 85% of unsmoothed command within one cycle
+  (measured 100%) ✅
+- Serial RTT p50: 57 ms → 9.7 ms (host read fix, v1) → 4.4 ms (v2) ✅
+- Camera: 60 fps experiment closed — hardware capped at ~31 fps; 30 fps
+  retained ✅
+- Live ball-balancing tuning session — pending (gates the PR)
+
+---
+
 ## Future Features (not scheduled)
 
 ### Multi-Camera Ball Tracking

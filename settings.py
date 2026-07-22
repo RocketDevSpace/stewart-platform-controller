@@ -12,12 +12,17 @@ _OV = _settings_store.load_user_overrides()
 # Serial
 # =============================================================================
 SERIAL_PORT = str(_OV.get("SERIAL_PORT", "COM4"))
-SERIAL_BAUD = 115200
+# Firmware v2 runs 250000 baud (0% UART timer error at 16 MHz). connect()
+# automatically retries at the legacy 115200 when no boot banner appears
+# (v1 firmware), so this default is safe on either firmware.
+SERIAL_BAUD = 250000
 
 # =============================================================================
 # Safety limits
 # =============================================================================
-MAX_TILT_DEG = 8.0                      # maximum platform tilt in vision mode
+# Max platform tilt PER AXIS in vision mode. IK verified solvable at the
+# 10/10 combined corner (14 deg total); 12/12 has no real solution.
+MAX_TILT_DEG = 10.0
 
 SAFETY_LIMITS = {
     "max_angle": 180,       # global ceiling, all servos (enforced in core/safety.py)
@@ -32,6 +37,23 @@ SAFETY_LIMITS = {
 # clamps speedDelay to 0-20 and acks only after the ramp — see firmware/README.md).
 SERVO_SLEW_INSTANT_MAX_DEG = 12.0
 SERVO_LARGE_MOVE_SPEED_DELAY_MS = 5     # -> 200 deg/s hardware ramp on big moves
+
+# Anti-dither command quantization (perf pass). The protocol carries whole
+# degrees; without hysteresis, PD noise near a rounding boundary flaps the
+# servos +/-1 deg continuously (measured: ~6100 integer flips/min at rest).
+# A servo's committed integer only changes when the commanded float crosses
+# the boundary by this margin (Schmitt trigger); identical quantized command
+# tuples are not re-sent at all (the firmware holds its last command; it has
+# no watchdog).
+SERVO_QUANT_HYST_DEG = 0.4
+SERVO_DEDUP_ENABLED = True
+# With firmware v2's tenth-degree T protocol the command grid is 0.1 deg, so
+# the Schmitt margin shrinks accordingly (still > half a grid step).
+SERVO_QUANT_HYST_FINE_DEG = 0.25
+# "auto": use the tenth-degree T protocol when the connected firmware is v2
+# (small streaming moves; large moves still go via legacy S + firmware ramp).
+# "legacy": force whole-degree S commands regardless of firmware.
+SERVO_PROTOCOL = "auto"
 
 # =============================================================================
 # Camera
@@ -57,12 +79,27 @@ CAMERA_RUNTIME_SOFT_GAIN_MAX = 2.4
 # =============================================================================
 TRACKER_WARP_SIZE_PX = 480
 TRACKER_ARUCO_DETECT_SCALE = 0.5
-TRACKER_ARUCO_REDETECT_EVERY_N = 10
+# Every-frame marker detection (perf pass): the old freeze/re-solve cadence
+# (N=10) was injecting a ~3 Hz position stairstep as H snapped to each fresh
+# solve; solving from filtered centers every frame keeps the warp smooth.
+TRACKER_ARUCO_REDETECT_EVERY_N = 1
 TRACKER_WARP_GRAY_CACHE_N: int = 5   # recompute warp gray mean every N frames
 TRACKER_MIN_RADIUS_PX = 4.0
 TRACKER_MIN_CONTOUR_AREA = 150.0
-TRACKER_ARUCO_CENTER_FILTER_ALPHA = 0.70
-TRACKER_MAX_ARUCO_HOLD_FRAMES = 3
+# Marker-center filter (perf pass): deadband + scheduled alpha. Motion below
+# DEADBAND_PX freezes the filtered center (H fully static at rest); motion
+# past FAST_PX uses the fast alpha so real platform tilt tracks in 1-2
+# frames; in between the slow alpha smooths drift.
+TRACKER_ARUCO_CENTER_DEADBAND_PX = 0.3
+TRACKER_ARUCO_CENTER_FAST_PX = 1.5
+TRACKER_ARUCO_CENTER_ALPHA_SLOW = 0.70
+TRACKER_ARUCO_CENTER_ALPHA_FAST = 0.2
+# 6 hold attempts at every-frame detection = the same wall-clock stale-H
+# budget the old 3-attempts policy allowed at N=10 loss cadence.
+TRACKER_MAX_ARUCO_HOLD_FRAMES = 6
+TRACKER_ARUCO_SUBPIX_REFINE = True    # detector-level SUBPIX corner refinement
+TRACKER_ARUCO_FULLRES_SUBPIX = True   # re-refine used corners on full-res gray
+TRACKER_BALL_SUBPIXEL = True          # float (sub-pixel) ball centroid
 TRACKER_POS_FILTER_ENABLED = False
 TRACKER_POS_FILTER_ALPHA_SLOW = 0.88
 TRACKER_POS_FILTER_ALPHA_FAST = 0.25
@@ -84,15 +121,58 @@ TRACKER_HSV_V_MAX = int(_OV.get("TRACKER_HSV_V_MAX", 255))
 # low-pass weight on raw velocity (0=frozen, 1=raw); ~6 Hz cutoff at 30 fps; tunable
 BALL_VEL_FILTER_ALPHA: float = 0.55
 
+# Measurement-filter mode (cv/measurement_filter.py):
+#   "alpha_beta" — adaptive alpha-beta tracker: gains scheduled between MIN
+#                  (quiet, near-static) and MAX (fast acquisition) by
+#                  innovation magnitude and predicted speed.
+#   "legacy"     — original position low-pass + velocity EMA (regression ref).
+#   "raw"        — passthrough position + raw finite-difference velocity
+#                  (bench comparison only).
+TRACKER_FILTER_MODE = "alpha_beta"
+TRACKER_AB_ALPHA_MIN = 0.40
+TRACKER_AB_ALPHA_MAX = 0.90
+# BETA_MIN raised 0.05 -> 0.25 (live tuning 2026-07-22): at 0.05 the
+# quiet-mode velocity estimate lagged ~660 ms - near 180 deg of phase
+# at the observed 0.77 Hz small-amplitude oscillation - turning the
+# D-term from damping into excitation (self-sustaining rock that also
+# blocked auto-trim's settle gate). 0.25 keeps ~<40 deg lag there.
+TRACKER_AB_BETA_MIN = 0.25
+TRACKER_AB_BETA_MAX = 0.60
+TRACKER_AB_INNOV_OPEN_MM = 1.5       # innovation below this: gains stay MIN
+TRACKER_AB_INNOV_FULL_MM = 4.0       # innovation above this: gains at MAX
+TRACKER_AB_SPEED_OPEN_MM_S = 60.0    # predicted speed below this: no opening
+TRACKER_AB_SPEED_FULL_MM_S = 150.0   # predicted speed above this: gains at MAX
+
 # =============================================================================
 # PD controller
 # =============================================================================
 PD_DEFAULT_KP = float(_OV.get("PD_DEFAULT_KP", 0.045))
 PD_DEFAULT_KD = float(_OV.get("PD_DEFAULT_KD", 0.022))
 PD_MAX_TILT_RATE_DEG_S = 300.0          # slew ("tilt rate") limit on commanded tilt
-PD_D_TERM_LIMIT_DEG = 2.5               # derivative-term contribution cap
+# Derivative-term contribution cap. Was 2.5 as a velocity-NOISE guard;
+# with the alpha-beta filter the velocity is clean, and live data showed
+# the cap saturating on every fast event (a 300 mm/s flick wants
+# kd*300 ~ 6.6 deg of braking) - the weak early flick response.
+PD_D_TERM_LIMIT_DEG = 6.0
 BALL_TARGET_DEFAULT_X_MM = 0.0
 BALL_TARGET_DEFAULT_Y_MM = 0.0
+
+# =============================================================================
+# Near-target rest mode (control/rest_gate.py)
+# =============================================================================
+# When the ball has sat within REST_ENTER_RADIUS_MM with low-passed speed
+# under REST_ENTER_SPEED_MM_S continuously for REST_ENTER_HOLD_S, the
+# controller rests: it commands level + trim offsets instead of chasing PD
+# noise (the sends dedup away and the servos go quiet). Exit is hysteretic
+# and INSTANT — raw radius or raw instantaneous speed past the wider exit
+# thresholds restores full PD on the same control cycle.
+REST_MODE_ENABLED = True
+REST_ENTER_RADIUS_MM = 8.0              # enter: raw radius at/under this
+REST_EXIT_RADIUS_MM = 12.0              # exit: raw radius above this (same cycle)
+REST_ENTER_SPEED_MM_S = 15.0            # enter: LPF speed at/under this
+REST_EXIT_SPEED_MM_S = 30.0             # exit: raw speed above this (same cycle)
+REST_ENTER_HOLD_S = 0.5                 # entry conditions must hold this long
+REST_SPEED_LPF_ALPHA = 0.6              # RestGate's own speed EMA (weight on prev)
 
 # =============================================================================
 # Manual trim / Auto-trim
@@ -146,6 +226,14 @@ ROUTINE_RETURN_HOME_S = 1.0             # ease-back-to-neutral duration after ro
 VISION_LOOP_HZ = 120
 VISUALIZER_HZ = 25
 GUI_SNAPSHOT_HZ = 30
+
+# =============================================================================
+# Vision session recording
+# =============================================================================
+# When non-empty, the vision worker appends "t,x,y" lines (perf_counter
+# seconds, ball x/y in mm) for every valid frame — input for
+# tools/jitter_bench.py --csv replay. Empty string = disabled.
+VISION_POSITION_LOG_PATH: str = ""
 
 # =============================================================================
 # Vision neutral-pose fallback (safety action on sustained ball loss)

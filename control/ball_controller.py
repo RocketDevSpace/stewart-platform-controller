@@ -13,12 +13,14 @@ The public method surface and the compute_with_terms terms-dict contract
 are unchanged from the pre-decomposition monolith (the GUI reads those
 keys — they are frozen, see tests/test_ball_controller_characterization).
 """
+import math
 import time
 from collections.abc import Callable
 
 from control.auto_trim import AutoTrim
 from control.autotune import PDAutotuner
 from control.pd_core import PDCore
+from control.rest_gate import STATE_RESTING, RestGate
 from control.setpoint import SetpointArbiter
 from core.platform_state import BallState
 from settings import (
@@ -28,6 +30,7 @@ from settings import (
     PD_DEFAULT_KP,
     PD_D_TERM_LIMIT_DEG,
     PD_MAX_TILT_RATE_DEG_S,
+    REST_MODE_ENABLED,
 )
 
 
@@ -54,6 +57,7 @@ class BallController:
         roll_offset: float = 0.0,
         pitch_offset: float = 0.0,
         auto_trim_enabled: bool = False,
+        rest_mode_enabled: bool | None = None,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.enabled = True
@@ -76,6 +80,17 @@ class BallController:
         # Trim offsets + integrator + home-cal state (FG-9)
         self._auto_trim = AutoTrim(roll_offset, pitch_offset, clock)
         self.auto_trim_enabled = bool(auto_trim_enabled)
+
+        # Near-target rest mode (perf pass) — parks the platform at
+        # level + trim once the ball has sat quietly at the target.
+        self._rest_gate = RestGate(
+            clock=clock,
+            enabled=(
+                bool(REST_MODE_ENABLED)
+                if rest_mode_enabled is None
+                else bool(rest_mode_enabled)
+            ),
+        )
 
         # PD autotune state machine (FG-10)
         self._autotuner = PDAutotuner(self._arbiter, clock)
@@ -197,6 +212,8 @@ class BallController:
     def set_target(self, x_mm: float, y_mm: float) -> None:
         self._arbiter.set_manual(float(x_mm), float(y_mm))
         self._auto_trim.notify_target_changed()
+        # Target moved: any "parked at the target" evidence is stale.
+        self._rest_gate.reset()
         if self._autotuner.enabled:
             self._autotuner.set_center(float(x_mm), float(y_mm))
 
@@ -209,6 +226,8 @@ class BallController:
             self._auto_trim.cancel_home_calibration()
         changed = self._autotuner.set_enabled(enabled, auto_apply, self.kp, self.kd)
         if changed:
+            # Mode change: rest evidence gathered in the old mode is stale.
+            self._rest_gate.reset()
             # Autotune sessions stash the auto-trim flag on enable and
             # restore it on disable (the arbiter override restore of the
             # manual target lives inside PDAutotuner.set_enabled).
@@ -231,6 +250,8 @@ class BallController:
 
     def reset_motion_state(self) -> None:
         self._pd.reset_motion_state()
+        # Tracking loss / reacquire: the ball may be anywhere now.
+        self._rest_gate.reset()
 
     def compute_with_terms(
         self, ball_state: BallState | None
@@ -271,8 +292,36 @@ class BallController:
             target_change_time=self._arbiter.last_change_time,
         )
 
+        # Near-target rest gate (perf pass). Evaluated from the same error
+        # vector / velocity the PD sees. While resting, the final command is
+        # level + trim (the trim offsets ARE the current best estimate of
+        # level, and auto-trim keeps integrating — its 35 mm / 25 mm/s gates
+        # are wider than rest's — so trim updates still move the platform).
+        # The PD pipeline ALWAYS runs (telemetry + slew-state continuity);
+        # resting only redirects the slew limiter's target, so both the
+        # entry hop and the exit back to full PD are rate-limited and
+        # continuous. Exit is same-cycle: an "active" verdict here computes
+        # a full PD command on this very call.
+        rest_radius_mm = math.hypot(pos_vec_x, pos_vec_y)
+        rest_speed_mm_s = math.hypot(vx, vy)
+        if self.home_calibration_active:
+            # Home calibration needs ACTIVE PD driving the ball to center
+            # while auto-trim absorbs the bias — resting at level+trim with
+            # the ball parked off-center would leave centering to the slow
+            # trim walk alone (observed on the rig: calibration far less
+            # reliable with rest engaged).
+            self._rest_gate.reset()
+            rest_state = "active"
+            resting = False
+        else:
+            rest_state = self._rest_gate.update(rest_radius_mm, rest_speed_mm_s)
+            resting = rest_state == STATE_RESTING
+
         res = self._pd.compute(
-            pos_vec_x, pos_vec_y, vx, vy, self.roll_offset, self.pitch_offset
+            pos_vec_x, pos_vec_y, vx, vy, self.roll_offset, self.pitch_offset,
+            slew_target_override=(
+                (self.roll_offset, self.pitch_offset) if resting else None
+            ),
         )
 
         terms: dict = {
@@ -290,6 +339,11 @@ class BallController:
             "roll_offset": self.roll_offset,
             "pitch_offset": self.pitch_offset,
             **self._auto_trim.telemetry(self.auto_trim_enabled),
+            "rest_state": rest_state,
+            "rest_mode_active": resting,
+            "rest_radius_mm": rest_radius_mm,
+            "rest_speed_lpf_mm_s": self._rest_gate.speed_lpf_mm_s,
+            "rest_hold_elapsed_s": self._rest_gate.hold_elapsed_s,
             "kp": self.kp,
             "kd": self.kd,
             **self._autotuner.telemetry(),

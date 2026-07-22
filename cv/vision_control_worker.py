@@ -12,7 +12,7 @@ worker will not emit the next snapshot until that call arrives (backpressure).
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, TextIO
 
 import time
 from dataclasses import dataclass, field
@@ -98,6 +98,12 @@ class VisionControlWorker(QtCore.QObject):
     error = QtCore.pyqtSignal(str)
     stopped = QtCore.pyqtSignal()
 
+    # Internal bridge: emitted from the CAPTURE thread by
+    # _on_frame_available; auto connection delivers it queued onto the
+    # worker thread, where _tick runs. The 120 Hz QTimer stays as a
+    # fallback heartbeat (the stale-frame skip dedups double ticks).
+    _frame_arrived = QtCore.pyqtSignal()
+
     def __init__(
         self,
         ik_solver: IKEngine,
@@ -111,6 +117,8 @@ class VisionControlWorker(QtCore.QObject):
         roll_offset: float = MANUAL_ROLL_TRIM_DEG,
         pitch_offset: float = MANUAL_PITCH_TRIM_DEG,
         auto_trim_enabled: bool = AUTO_TRIM_ENABLED,
+        rtt_provider: Callable[[], tuple[float, float, int]] | None = None,
+        position_log_path: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -122,6 +130,14 @@ class VisionControlWorker(QtCore.QObject):
         self._snapshot_hz = max(1, int(snapshot_hz))
         self._command_sender = command_sender
         self._camera_index = int(camera_index)
+        # Serial RTT telemetry source (a plain callable, like
+        # command_sender — the worker never touches SerialManager).
+        self._rtt_provider = rtt_provider
+        # Optional per-frame position log ("t,x,y" lines) for
+        # tools/jitter_bench.py --csv replay.
+        self._position_log_path = position_log_path or None
+        self._position_log_file: TextIO | None = None
+        self._position_log_lines = 0
 
         # Cached init params — applied to controller on start()
         self._kp_init = float(kp)
@@ -145,6 +161,18 @@ class VisionControlWorker(QtCore.QObject):
         self._last_frame_ts = 0.0
         self._last_error_emit = 0.0
         self._last_neutral_send = 0.0
+
+        # Two reusable flipped-frame buffers, alternated per tick: the
+        # tracker stores a reference to the processed frame for its debug
+        # views, so the frame from tick N-1 must stay intact while tick N
+        # writes into the other buffer. Emitted snapshots additionally
+        # copy the debug views (see _copied_debug_views).
+        self._frame_buf: np.ndarray | None = None
+        self._frame_buf_alt: np.ndarray | None = None
+
+        # Event-driven tick: the camera's frame callback (capture thread)
+        # emits _frame_arrived, which lands here queued.
+        self._frame_arrived.connect(self._tick)
 
         self.camera: CameraSource | None = None
         self.ball_tracker: BallTracker | None = None
@@ -214,6 +242,12 @@ class VisionControlWorker(QtCore.QObject):
                 "gray": cam_stats.gray_mean,
             })
 
+        # Event-driven tick: every published frame nudges _tick via the
+        # queued _frame_arrived bridge (the QTimer below stays as the
+        # fallback heartbeat).
+        if self.camera is not None:
+            self.camera.set_frame_callback(self._on_frame_available)
+
         self._running = True
         self._counter = 0
         self._miss_count = 0
@@ -224,6 +258,16 @@ class VisionControlWorker(QtCore.QObject):
         self._prev_arm_points = None
         self._last_frame_ts = 0.0
         self._last_neutral_send = 0.0
+
+        if self._position_log_path and self._position_log_file is None:
+            try:
+                self._position_log_file = open(
+                    self._position_log_path, "a", encoding="utf-8"
+                )
+                self._position_log_lines = 0
+            except OSError as exc:
+                self._position_log_file = None
+                self.error.emit(f"position log open failed: {exc}")
 
         self._timer = QtCore.QTimer(self)
         self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
@@ -237,14 +281,26 @@ class VisionControlWorker(QtCore.QObject):
             self._timer.stop()
             self._timer.deleteLater()
             self._timer = None
-        try:
-            if self.camera is not None:
+        if self.camera is not None:
+            # Clear the frame callback BEFORE closing: no _frame_arrived
+            # emission may race the teardown from the capture thread.
+            try:
+                self.camera.set_frame_callback(None)
+            except Exception:
+                pass
+            try:
                 self.camera.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
         self.camera = None
         self.ball_tracker = None
         self.ball_controller = None
+        if self._position_log_file is not None:
+            try:
+                self._position_log_file.close()
+            except OSError:
+                pass
+            self._position_log_file = None
         self.stopped.emit()
 
     @QtCore.pyqtSlot()
@@ -336,6 +392,15 @@ class VisionControlWorker(QtCore.QObject):
     # Inner loop
     # ------------------------------------------------------------------
 
+    def _on_frame_available(self) -> None:
+        """CameraSource frame callback — runs on the CAPTURE thread.
+
+        Must NOT touch worker state: it only emits the queued
+        _frame_arrived signal, which delivers _tick on the worker thread.
+        This closes the 0-8 ms polling gap between frame arrival and the
+        next QTimer tick."""
+        self._frame_arrived.emit()
+
     @QtCore.pyqtSlot()
     def _tick(self) -> None:
         if (
@@ -355,27 +420,45 @@ class VisionControlWorker(QtCore.QObject):
             if not self.camera.has_new_frame(self._last_frame_ts):
                 return
 
-            grabbed = self.camera.read_latest()
+            # Single-pass read+flip into a reusable buffer. The two
+            # buffers alternate per tick so the tracker's stored debug
+            # reference from the PREVIOUS tick stays intact while this
+            # tick overwrites the other buffer.
+            grabbed = self.camera.read_latest_flipped(self._frame_buf)
             if grabbed is None:
                 return
             frame, latest_ts = grabbed
+            self._frame_buf = self._frame_buf_alt
+            self._frame_buf_alt = frame
             self._last_frame_ts = latest_ts
 
             t0 = time.perf_counter()
             ball_state = self.ball_tracker.process(
                 frame, latest_ts,
                 brightness_gain=self.camera.stats().software_gain,
+                pre_flipped=True,
             )
             t1 = time.perf_counter()
 
             now_perf = time.perf_counter()
-            should_emit = (
-                self._last_snapshot_emit_perf <= 0.0
-                or (now_perf - self._last_snapshot_emit_perf)
-                >= (1.0 / float(self._snapshot_hz))
+            emit_now = (
+                not self._snapshot_inflight
+                and (
+                    self._last_snapshot_emit_perf <= 0.0
+                    or (now_perf - self._last_snapshot_emit_perf)
+                    >= (1.0 / float(self._snapshot_hz))
+                )
             )
 
-            cam_view, warped_view, mask_view = self.ball_tracker.debug_views()
+            # Debug views are COPIED, and only when a snapshot will
+            # actually be emitted (<= snapshot_hz): the tracker's stored
+            # views reference the worker's reusable frame buffers, which
+            # later ticks overwrite — an emitted snapshot must own its
+            # pixel data.
+            if emit_now:
+                cam_view, warped_view, mask_view = self._copied_debug_views()
+            else:
+                cam_view = warped_view = mask_view = None
 
             if ball_state is None:
                 self._miss_count += 1
@@ -409,13 +492,14 @@ class VisionControlWorker(QtCore.QObject):
                     mask_gray=mask_view,
                     worker_emit_perf_ts=time.perf_counter(),
                 )
-                if should_emit and not self._snapshot_inflight:
+                if emit_now:
                     self._snapshot_inflight = True
                     self._last_snapshot_emit_perf = now_perf
                     self.snapshot_ready.emit(snapshot)
                 return
 
             # Valid detection.
+            self._log_position(ball_state)
             if self._was_missing:
                 self.ball_controller.reset_motion_state()
                 self._was_missing = False
@@ -492,7 +576,7 @@ class VisionControlWorker(QtCore.QObject):
                 mask_gray=mask_view,
                 worker_emit_perf_ts=time.perf_counter(),
             )
-            if should_emit and not self._snapshot_inflight:
+            if emit_now:
                 self._snapshot_inflight = True
                 self._last_snapshot_emit_perf = now_perf
                 self.snapshot_ready.emit(snapshot)
@@ -504,6 +588,28 @@ class VisionControlWorker(QtCore.QObject):
             if (now - self._last_error_emit) >= 1.0:
                 self._last_error_emit = now
                 self.error.emit(str(exc))
+
+    # ------------------------------------------------------------------
+    # Debug-view snapshotting
+    # ------------------------------------------------------------------
+
+    def _copied_debug_views(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        """Owned copies of the tracker's debug views (emission-time only).
+
+        The tracker stores REFERENCES to the frames it processed; with the
+        worker's reusable frame buffers those get overwritten on later
+        ticks, so a snapshot crossing to the GUI thread must copy. Called
+        at most snapshot_hz times per second."""
+        if self.ball_tracker is None:
+            return None, None, None
+        cam, warped, mask = self.ball_tracker.debug_views()
+        return (
+            None if cam is None else cam.copy(),
+            None if warped is None else warped.copy(),
+            None if mask is None else mask.copy(),
+        )
 
     # ------------------------------------------------------------------
     # Neutral-pose fallback
@@ -537,8 +643,39 @@ class VisionControlWorker(QtCore.QObject):
                 self.error.emit(f"neutral send failed: {exc}")
 
     # ------------------------------------------------------------------
+    # Position log (jitter_bench --csv replay input)
+    # ------------------------------------------------------------------
+
+    def _log_position(self, ball_state: BallState) -> None:
+        """Append one "t,x,y" line for a valid frame (no-op when disabled)."""
+        f = self._position_log_file
+        if f is None:
+            return
+        try:
+            f.write(
+                f"{time.perf_counter():.6f},"
+                f"{ball_state.x_mm:.3f},{ball_state.y_mm:.3f}\n"
+            )
+            self._position_log_lines += 1
+            if self._position_log_lines % 30 == 0:
+                f.flush()
+        except OSError as exc:
+            self._position_log_file = None
+            self.error.emit(f"position log write failed: {exc}")
+
+    # ------------------------------------------------------------------
     # Timing helpers
     # ------------------------------------------------------------------
+
+    def _serial_rtt_ms(self) -> float:
+        """Current serial RTT EMA in ms (0.0 when no provider/samples)."""
+        if self._rtt_provider is None:
+            return 0.0
+        try:
+            ema_ms, _last_ms, samples = self._rtt_provider()
+        except Exception:
+            return 0.0
+        return float(ema_ms) if samples > 0 else 0.0
 
     def _capture_stats_pair(self) -> tuple[float, float]:
         if self.camera is None:
@@ -565,6 +702,7 @@ class VisionControlWorker(QtCore.QObject):
             ),
             "worker_to_gui_ms": 0.0,
             "frame_to_cmd": 0.0,
+            "serial_rtt_ms": self._serial_rtt_ms(),
             "trk_cap_period": period_ms,
             "trk_gray_mean": gray_mean,
         }
@@ -597,6 +735,7 @@ class VisionControlWorker(QtCore.QObject):
             "frame_to_worker_ms": frame_to_worker,
             "worker_to_gui_ms": 0.0,
             "frame_to_cmd": frame_to_cmd,
+            "serial_rtt_ms": self._serial_rtt_ms(),
             "trk_cap_period": period_ms,
             "trk_gray_mean": gray_mean,
         }

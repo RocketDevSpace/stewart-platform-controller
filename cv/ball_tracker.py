@@ -12,12 +12,20 @@ gone — production always ran with them disabled).
 
 Stale-homography policy (fixes the serve-stale-H-forever defect): the
 cached homography from the last successful marker solve is reused between
-scheduled redetects (every TRACKER_ARUCO_REDETECT_EVERY_N frames). Once a
-redetect FAILS, the tracker switches to attempting detection EVERY frame,
-serves the cached H for at most TRACKER_MAX_ARUCO_HOLD_FRAMES of those
-attempts, then INVALIDATES the cache and reports loss. Marker loss can
-therefore fabricate positions for a bounded ~(redetect_every_n +
-hold_frames) frames, never indefinitely.
+scheduled redetects (every TRACKER_ARUCO_REDETECT_EVERY_N frames; the
+perf-pass default is 1 — every frame — because the freeze/re-solve cadence
+injected a ~3 Hz position stairstep). Once a redetect FAILS, the tracker
+attempts detection EVERY frame, serves the cached H for at most
+TRACKER_MAX_ARUCO_HOLD_FRAMES of those attempts, then INVALIDATES the
+cache and reports loss. Marker loss can therefore fabricate positions for
+a bounded ~(redetect_every_n + hold_frames) frames, never indefinitely.
+
+Homography smoothness (perf pass): marker corners get detector-level
+SUBPIX refinement plus an optional full-resolution cornerSubPix re-refine
+(detection runs on the downscaled gray); marker centers pass through a
+deadband + scheduled-alpha filter so H is fully static at rest yet tracks
+real tilt in 1-2 frames. H is solved fresh every frame from the filtered
+centers — no H-matrix blending.
 """
 
 from __future__ import annotations
@@ -28,22 +36,22 @@ import cv2
 import numpy as np
 
 from core.platform_state import BallState
+from cv.measurement_filter import MeasurementFilter
 from settings import (
-    BALL_VEL_FILTER_ALPHA,
-    TRACKER_ARUCO_CENTER_FILTER_ALPHA,
+    TRACKER_ARUCO_CENTER_ALPHA_FAST,
+    TRACKER_ARUCO_CENTER_ALPHA_SLOW,
+    TRACKER_ARUCO_CENTER_DEADBAND_PX,
+    TRACKER_ARUCO_CENTER_FAST_PX,
     TRACKER_ARUCO_DETECT_SCALE,
+    TRACKER_ARUCO_FULLRES_SUBPIX,
     TRACKER_ARUCO_REDETECT_EVERY_N,
+    TRACKER_ARUCO_SUBPIX_REFINE,
+    TRACKER_BALL_SUBPIXEL,
     TRACKER_MAX_ARUCO_HOLD_FRAMES,
-    TRACKER_MAX_SPEED_MM_S,
     TRACKER_MIN_CIRCULARITY,
     TRACKER_MIN_CONTOUR_AREA,
     TRACKER_MIN_FILL_RATIO,
     TRACKER_MIN_RADIUS_PX,
-    TRACKER_POS_FILTER_ALPHA_FAST,
-    TRACKER_POS_FILTER_ALPHA_SLOW,
-    TRACKER_POS_FILTER_ENABLED,
-    TRACKER_POS_FILTER_MAX_LAG_MM,
-    TRACKER_POS_FILTER_SPEED_MM_S,
     TRACKER_WARP_GRAY_CACHE_N,
 )
 
@@ -61,6 +69,11 @@ class BallTracker:
         # --- ArUco setup ---
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
+        if TRACKER_ARUCO_SUBPIX_REFINE:
+            self.aruco_params.cornerRefinementMethod = (
+                cv2.aruco.CORNER_REFINE_SUBPIX
+            )
+            self.aruco_params.cornerRefinementWinSize = 3
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
         self.CORNER_IDS = [0, 1, 2, 3]
@@ -79,9 +92,15 @@ class BallTracker:
         self._frame_counter = 0
         self.aruco_detect_scale = float(TRACKER_ARUCO_DETECT_SCALE)
         self.aruco_redetect_every_n = max(1, int(TRACKER_ARUCO_REDETECT_EVERY_N))
-        self.aruco_center_filter_alpha = float(
-            np.clip(TRACKER_ARUCO_CENTER_FILTER_ALPHA, 0.0, 0.98)
+        self.aruco_center_alpha_slow = float(
+            np.clip(TRACKER_ARUCO_CENTER_ALPHA_SLOW, 0.0, 0.98)
         )
+        self.aruco_center_alpha_fast = float(
+            np.clip(TRACKER_ARUCO_CENTER_ALPHA_FAST, 0.0, 0.98)
+        )
+        self.aruco_center_deadband_px = float(TRACKER_ARUCO_CENTER_DEADBAND_PX)
+        self.aruco_center_fast_px = float(TRACKER_ARUCO_CENTER_FAST_PX)
+        self.aruco_fullres_subpix = bool(TRACKER_ARUCO_FULLRES_SUBPIX)
         self.max_aruco_hold_frames = int(TRACKER_MAX_ARUCO_HOLD_FRAMES)
 
         # --- Ball detection params ---
@@ -89,31 +108,19 @@ class BallTracker:
         self.min_contour_area = float(TRACKER_MIN_CONTOUR_AREA)
         self.min_circularity = float(TRACKER_MIN_CIRCULARITY)
         self.min_fill_ratio = float(TRACKER_MIN_FILL_RATIO)
-        self.max_speed_mm_s = float(TRACKER_MAX_SPEED_MM_S)
+        self.ball_subpixel = bool(TRACKER_BALL_SUBPIXEL)
         self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-        # --- Position filter state ---
-        self.pos_filter_enabled = bool(TRACKER_POS_FILTER_ENABLED)
-        self.pos_filter_alpha_slow = float(
-            np.clip(TRACKER_POS_FILTER_ALPHA_SLOW, 0.0, 0.98)
-        )
-        self.pos_filter_alpha_fast = float(
-            np.clip(TRACKER_POS_FILTER_ALPHA_FAST, 0.0, 0.98)
-        )
-        self.pos_filter_speed_mm_s = max(1.0, float(TRACKER_POS_FILTER_SPEED_MM_S))
-        self.pos_filter_max_lag_mm = max(0.1, float(TRACKER_POS_FILTER_MAX_LAG_MM))
-        self._last_pos_filter_alpha = self.pos_filter_alpha_fast
+        # --- Measurement filtering (position + velocity) ---
+        # Extracted to cv/measurement_filter.py (perf pass): outlier gate,
+        # adaptive position low-pass, velocity EMA. State + params live
+        # there; the delegating properties below preserve the old
+        # attribute surface.
+        self.measurement = MeasurementFilter()
 
         # --- Warp brightness cache ---
         self._warp_gray_cache_counter: int = TRACKER_WARP_GRAY_CACHE_N
         self._cached_warp_gray_mean: float = 0.0
-
-        # --- Velocity and position state ---
-        self.prev_ball_mm: tuple[float, float] | None = None
-        self.prev_ball_raw_mm: tuple[float, float] | None = None
-        self.prev_time: float | None = None
-        self._vx_f: float = 0.0   # low-pass filtered velocity
-        self._vy_f: float = 0.0
 
         # --- HSV state (defaults from settings; live updates via setter) ---
         from settings import (
@@ -130,11 +137,50 @@ class BallTracker:
             dtype=np.uint8,
         )
 
+        # --- Reusable software-gain output buffer (perf pass) ---
+        self._gain_buf: np.ndarray | None = None
+
         # --- Debug views (read via debug_views()) ---
         self._last_camera_bgr: np.ndarray | None = None
         self._last_warped_bgr: np.ndarray | None = None
         self._last_mask_gray: np.ndarray | None = None
         self._last_processed_ts = 0.0
+
+    # =========================
+    # Measurement-filter delegation (old attribute surface preserved)
+    # =========================
+
+    @property
+    def pos_filter_enabled(self) -> bool:
+        return self.measurement.pos_filter_enabled
+
+    @pos_filter_enabled.setter
+    def pos_filter_enabled(self, value: bool) -> None:
+        self.measurement.pos_filter_enabled = bool(value)
+
+    @property
+    def max_speed_mm_s(self) -> float:
+        return self.measurement.max_speed_mm_s
+
+    @max_speed_mm_s.setter
+    def max_speed_mm_s(self, value: float) -> None:
+        self.measurement.max_speed_mm_s = float(value)
+
+    @property
+    def _vx_f(self) -> float:
+        return self.measurement._vx_f
+
+    @property
+    def _vy_f(self) -> float:
+        return self.measurement._vy_f
+
+    @property
+    def prev_ball_mm(self) -> tuple[float, float] | None:
+        return self.measurement.prev_ball_mm
+
+    @property
+    def prev_time(self) -> float | None:
+        return self.measurement.prev_time
 
     # =========================
     # Public API
@@ -160,6 +206,7 @@ class BallTracker:
         frame_bgr: np.ndarray,
         frame_ts: float,
         brightness_gain: float = 1.0,
+        pre_flipped: bool = False,
     ) -> BallState | None:
         """Run the full detection pipeline on one frame.
 
@@ -167,12 +214,32 @@ class BallTracker:
         velocity dt. Returns None when no ball (or no marker geometry) is
         found; velocity and position-filter state reset on loss so a
         reacquired ball never blends toward its stale pre-loss position.
+
+        pre_flipped=True skips the internal mirror flip (the caller already
+        delivered a flipped frame, e.g. via CameraSource.read_latest_flipped).
+        NOTE: the tracker then keeps a REFERENCE to the caller's buffer in
+        _last_camera_bgr — callers reusing frame buffers must keep that
+        buffer intact until they have copied the debug views (the vision
+        worker double-buffers per tick and copies at snapshot emission).
         """
         self._last_processed_ts = frame_ts
-        frame = cv2.flip(frame_bgr, 1)
+        frame = frame_bgr if pre_flipped else cv2.flip(frame_bgr, 1)
         if brightness_gain > 1.02:
             try:
-                frame = cv2.convertScaleAbs(frame, alpha=float(brightness_gain), beta=0)
+                # Preallocated dst: convertScaleAbs runs every frame while
+                # software gain is active — avoid a fresh allocation each
+                # tick (buffer reallocated only on shape change).
+                if (
+                    self._gain_buf is None
+                    or self._gain_buf.shape != frame.shape
+                    or self._gain_buf.dtype != frame.dtype
+                ):
+                    self._gain_buf = np.empty_like(frame)
+                cv2.convertScaleAbs(
+                    frame, dst=self._gain_buf,
+                    alpha=float(brightness_gain), beta=0,
+                )
+                frame = self._gain_buf
             except Exception:
                 pass
         self._last_camera_bgr = frame
@@ -230,55 +297,13 @@ class BallTracker:
 
         current_time = frame_ts if frame_ts > 0 else time.perf_counter()
 
-        # ---- Velocity measurement ----
-        dt = 0.0
-        vx_raw_meas = 0.0
-        vy_raw_meas = 0.0
-        raw_speed_mm_s = 0.0
-        if self.prev_time is not None and self.prev_ball_raw_mm is not None:
-            dt = current_time - self.prev_time
-            if dt > 0:
-                vx_raw_meas = (x_mm_raw - self.prev_ball_raw_mm[0]) / dt
-                vy_raw_meas = (y_mm_raw - self.prev_ball_raw_mm[1]) / dt
-                raw_speed_mm_s = float(np.hypot(vx_raw_meas, vy_raw_meas))
-                if self.max_speed_mm_s > 0 and raw_speed_mm_s > self.max_speed_mm_s:
-                    return self._miss()
-
-        # ---- Position filter ----
-        if self.pos_filter_enabled and self.prev_ball_mm is not None:
-            speed_ratio = min(1.0, raw_speed_mm_s / self.pos_filter_speed_mm_s)
-            filter_alpha = (
-                self.pos_filter_alpha_slow
-                + (self.pos_filter_alpha_fast - self.pos_filter_alpha_slow)
-                * speed_ratio
-            )
-            x_mm = filter_alpha * self.prev_ball_mm[0] + (1.0 - filter_alpha) * x_mm_raw
-            y_mm = filter_alpha * self.prev_ball_mm[1] + (1.0 - filter_alpha) * y_mm_raw
-            lag = float(np.hypot(x_mm_raw - x_mm, y_mm_raw - y_mm))
-            if lag > self.pos_filter_max_lag_mm:
-                scale = self.pos_filter_max_lag_mm / max(lag, 1e-6)
-                x_mm = x_mm_raw - (x_mm_raw - x_mm) * scale
-                y_mm = y_mm_raw - (y_mm_raw - y_mm) * scale
-            self._last_pos_filter_alpha = float(filter_alpha)
-        else:
-            x_mm = x_mm_raw
-            y_mm = y_mm_raw
-
-        if self.prev_ball_mm is None or self.prev_time is None or dt <= 0:
-            vx = 0.0
-            vy = 0.0
-            self._vx_f = 0.0
-            self._vy_f = 0.0
-        else:
-            alpha = BALL_VEL_FILTER_ALPHA
-            self._vx_f = alpha * vx_raw_meas + (1.0 - alpha) * self._vx_f
-            self._vy_f = alpha * vy_raw_meas + (1.0 - alpha) * self._vy_f
-            vx = self._vx_f
-            vy = self._vy_f
-
-        self.prev_ball_raw_mm = (x_mm_raw, y_mm_raw)
-        self.prev_ball_mm = (x_mm, y_mm)
-        self.prev_time = current_time
+        # ---- Measurement filtering (cv/measurement_filter.py) ----
+        # Outlier gate + position filter + velocity EMA. None means the
+        # raw-speed gate rejected the sample -> treat as a miss.
+        filtered = self.measurement.update(x_mm_raw, y_mm_raw, current_time)
+        if filtered is None:
+            return self._miss()
+        x_mm, y_mm, vx, vy = filtered
 
         return BallState(x_mm=x_mm, y_mm=y_mm, vx_mm_s=vx, vy_mm_s=vy)
 
@@ -293,9 +318,7 @@ class BallTracker:
         next detection — a reacquired ball must never be blended toward
         its stale pre-loss position (that was a live landmine whenever
         TRACKER_POS_FILTER_ENABLED was turned on)."""
-        self._vx_f = 0.0
-        self._vy_f = 0.0
-        self.prev_ball_mm = None
+        self.measurement.reset()
         return None
 
     # =========================
@@ -355,13 +378,29 @@ class BallTracker:
             return None
 
         ids = ids.flatten()
-        marker_centers_px: dict[int, np.ndarray] = {}
+        used_corners: list[tuple[int, np.ndarray]] = []
         for i, marker_id in enumerate(ids):
             if marker_id in self.CORNER_IDS:
-                center_px = self.get_marker_center(corners[i]) * scale_inv
-                marker_centers_px[int(marker_id)] = self._filter_marker_center(
-                    marker_id, center_px
+                pts = (
+                    np.asarray(corners[i], dtype=np.float32).reshape(4, 2)
+                    * scale_inv
                 )
+                used_corners.append((int(marker_id), pts))
+
+        # Full-res corner re-refinement: detection ran on the downscaled
+        # gray, so the scaled-up corners carry that quantization into H.
+        # One cornerSubPix pass on the ALREADY-COMPUTED full-res gray
+        # (seeded with the scaled-up corners) recovers the accuracy; the
+        # marker centers are computed from the refined corners.
+        if self.aruco_fullres_subpix and used_corners:
+            used_corners = self._refine_corners_fullres(gray, used_corners)
+
+        marker_centers_px: dict[int, np.ndarray] = {}
+        for marker_id, pts in used_corners:
+            center_px = np.asarray(np.mean(pts, axis=0))
+            marker_centers_px[marker_id] = self._filter_marker_center(
+                marker_id, center_px
+            )
 
         if len(marker_centers_px) < 3:
             return None
@@ -402,19 +441,71 @@ class BallTracker:
         pts = corners[0]
         return np.asarray(np.mean(pts, axis=0))
 
+    def _refine_corners_fullres(
+        self, gray: np.ndarray, used_corners: list[tuple[int, np.ndarray]]
+    ) -> list[tuple[int, np.ndarray]]:
+        """cornerSubPix the used markers' corners on the full-res gray.
+
+        Only corners of CORNER_IDS markers arrive here (max 16 points),
+        batched into a single cornerSubPix call. Markers whose refinement
+        window would leave the image are kept unrefined."""
+        h, w = gray.shape[:2]
+        margin = 6.0   # winSize 4 + gradient border
+        refinable: list[int] = []
+        for k, (_, pts) in enumerate(used_corners):
+            if (
+                float(pts[:, 0].min()) >= margin
+                and float(pts[:, 1].min()) >= margin
+                and float(pts[:, 0].max()) < w - margin
+                and float(pts[:, 1].max()) < h - margin
+            ):
+                refinable.append(k)
+        if not refinable:
+            return used_corners
+
+        stacked = np.ascontiguousarray(
+            np.concatenate(
+                [used_corners[k][1] for k in refinable]
+            ).reshape(-1, 1, 2),
+            dtype=np.float32,
+        )
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.03)
+        try:
+            cv2.cornerSubPix(gray, stacked, (4, 4), (-1, -1), criteria)
+        except cv2.error:
+            return used_corners
+
+        refined = stacked.reshape(-1, 4, 2)
+        out = list(used_corners)
+        for j, k in enumerate(refinable):
+            out[k] = (used_corners[k][0], refined[j])
+        return out
+
     def _filter_marker_center(
         self, marker_id: int, center_px: np.ndarray
     ) -> np.ndarray:
+        """Deadband + scheduled-alpha low-pass on one marker center.
+
+        Motion below the deadband returns the previous filtered center
+        UNCHANGED (H fully static at rest); motion past the fast threshold
+        blends with the fast alpha (real tilt tracks in 1-2 frames);
+        in between the slow alpha smooths drift. A >40 px jump snaps
+        (camera reopen / platform moved)."""
         current = np.asarray(center_px, dtype=np.float32)
         prev = self._marker_centers_lp.get(int(marker_id))
         if prev is None:
             filt = current
         else:
-            # Reset on sudden jump (camera reopen / platform moved)
-            if float(np.hypot(*(current - prev))) > 40.0:
-                filt = current
+            d = float(np.hypot(*(current - prev)))
+            if d > 40.0:
+                filt = current                      # jump: reset
+            elif d <= self.aruco_center_deadband_px:
+                filt = prev                         # deadband: freeze
             else:
-                alpha = self.aruco_center_filter_alpha
+                if d >= self.aruco_center_fast_px:
+                    alpha = self.aruco_center_alpha_fast
+                else:
+                    alpha = self.aruco_center_alpha_slow
                 filt = alpha * prev + (1.0 - alpha) * current
         self._marker_centers_lp[int(marker_id)] = filt
         return filt
@@ -425,7 +516,7 @@ class BallTracker:
 
     def find_ball_center(
         self, mask: np.ndarray
-    ) -> tuple[tuple[int, int], int] | None:
+    ) -> tuple[tuple[float, float], float] | None:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel)
 
@@ -455,7 +546,9 @@ class BallTracker:
             if circle_area > 1e-6 and (area / circle_area) < self.min_fill_ratio:
                 return None
 
-        return (int(x), int(y)), int(radius)
+        if self.ball_subpixel:
+            return (float(x), float(y)), float(radius)
+        return (int(x), int(y)), int(radius)   # legacy integer centroid
 
     # =========================
     # Helpers

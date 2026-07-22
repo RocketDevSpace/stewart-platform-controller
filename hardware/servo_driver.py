@@ -19,7 +19,13 @@ import logging
 
 from core.safety import NUM_SERVOS, clip_servo_angles, select_speed_delay
 from hardware.serial_manager import SerialManager
-from settings import DEBUG_PRINTS
+from settings import (
+    DEBUG_PRINTS,
+    SERVO_DEDUP_ENABLED,
+    SERVO_PROTOCOL,
+    SERVO_QUANT_HYST_DEG,
+    SERVO_QUANT_HYST_FINE_DEG,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +40,42 @@ class ServoDriver:
     def __init__(self, serial_manager: SerialManager) -> None:
         self._serial = serial_manager
         self._last_sent: list[float] = list(_BOOT_ANGLES)
+        # Schmitt-trigger quantizer state: the grid unit each servo is
+        # currently committed to. On the legacy whole-degree protocol the
+        # grid is 1 deg; on firmware v2's T protocol it is 0.1 deg
+        # (committed values are stored in GRID UNITS: degrees or
+        # tenth-degrees respectively).
+        self._committed: list[int] = [int(a) for a in _BOOT_ANGLES]
+        self._committed_grid = 1.0  # deg per grid unit of _committed
+        # Last quantized command actually sent (grid units), for dedup.
+        # Seeded with the boot pose (firmware boots at 90s on grid 1.0).
+        self._last_sent_units: list[int] | None = [int(a) for a in _BOOT_ANGLES]
+        self.quant_hyst_deg = float(SERVO_QUANT_HYST_DEG)
+        self.quant_hyst_fine_deg = float(SERVO_QUANT_HYST_FINE_DEG)
+        self.protocol = str(SERVO_PROTOCOL)
+        self.dedup_enabled = bool(SERVO_DEDUP_ENABLED)
+        # Telemetry: sends actually suppressed by dedup.
+        self.dedup_skips = 0
+
+    def _use_tenth_protocol(self) -> bool:
+        return (
+            self.protocol == "auto"
+            and getattr(self._serial, "firmware_version", "") == "v2"
+        )
         # Expected firmware-side ramp duration of the LAST send (ms). The
         # firmware acks only AFTER a ramp and buffers just 64 bytes of
         # commands while ramping — streaming callers (RoutineRunner) must
         # hold off sends for this long after a ramped command or the UART
         # buffer overflows and commands get dropped/corrupted.
         self.last_ramp_ms: float = 0.0
+
+    def rtt_stats(self) -> tuple[float, float, int]:
+        """(ema_ms, last_ms, samples) of the serial command->ack round trip.
+
+        Thin delegation to SerialManager.rtt_stats() so consumers (the
+        vision worker's timing telemetry) never reach through to the
+        serial layer directly."""
+        return self._serial.rtt_stats()
 
     def format_command(self, angles: list[float], speed_delay: int = 0) -> str:
         """Return the Arduino serial command string for the given angles.
@@ -82,17 +118,92 @@ class ServoDriver:
                     "[SAFETY CLIP] Servo %d: %s -> %s", idx, original, clipped
                 )
 
-        speed_delay = select_speed_delay(self._last_sent, clipped_angles)
-        cmd = self.format_command(clipped_angles, speed_delay)
+        # Hybrid dispatch. The large-move firmware ramp applies ONLY to
+        # non-streaming sends (manual pose sends, routine starts): the
+        # vision loop's streaming commands are already rate-bounded by the
+        # PD slew limiter, and firmware-ramping them throttles emergency
+        # corrections to 200 deg/s while BLOCKING the firmware command
+        # loop mid-crisis (observed on the rig: hard flicks recovered
+        # noticeably worse than pre-ramp behavior). A save needs its full
+        # authority instantly.
+        ramp_needed = (
+            not streaming
+            and select_speed_delay(self._last_sent, clipped_angles) > 0
+        )
+        use_tenth = self._use_tenth_protocol() and not ramp_needed
+
+        if use_tenth:
+            grid, hyst = 0.1, self.quant_hyst_fine_deg
+        else:
+            grid, hyst = 1.0, self.quant_hyst_deg
+        self._ensure_grid(grid)
+        quantized = self._quantize(clipped_angles, grid, hyst)
+
+        if self.dedup_enabled and quantized == self._last_sent_units:
+            # The hardware already holds exactly this command — sending it
+            # again is pure serial noise. (Safe: no firmware watchdog; the
+            # Servo library holds the last pulse width indefinitely.)
+            self.dedup_skips += 1
+            self.last_ramp_ms = 0.0
+            return True
+
+        target = [q * grid for q in quantized]
+        if use_tenth:
+            cmd = self.format_command_tenth(quantized)
+            speed_delay = 0
+        else:
+            # Streaming sends are never firmware-ramped (see dispatch note).
+            speed_delay = (
+                0 if streaming else select_speed_delay(self._last_sent, target)
+            )
+            cmd = self.format_command(target, speed_delay)
 
         if streaming:
             ok = self._serial.send_latest(cmd.encode())
         else:
             ok = self._serial.send(cmd.encode())
         if ok:
-            self.last_ramp_ms = self._ramp_ms(clipped_angles, speed_delay)
-            self._last_sent = list(clipped_angles)
+            self.last_ramp_ms = self._ramp_ms(target, speed_delay)
+            self._last_sent = target
+            self._last_sent_units = list(quantized)
         return ok
+
+    def format_command_tenth(self, tenths: list[int]) -> str:
+        """Firmware v2 T command: tenth-degree units, instant write,
+        terse "k" ack."""
+        if len(tenths) != NUM_SERVOS:
+            raise ValueError(
+                f"expected {NUM_SERVOS} servo values, got {len(tenths)}"
+            )
+        return "T," + ",".join(str(int(t)) for t in tenths) + "\n"
+
+    def _ensure_grid(self, grid: float) -> None:
+        """Convert the committed Schmitt state when the command grid
+        changes (protocol switch between whole-degree and tenth-degree)."""
+        if grid == self._committed_grid:
+            return
+        self._committed = [
+            int(round(c * self._committed_grid / grid)) for c in self._committed
+        ]
+        self._committed_grid = grid
+        self._last_sent_units = None  # grids differ; force a real send
+
+    def _quantize(self, angles: list[float], grid: float, hyst_deg: float) -> list[int]:
+        """Schmitt-trigger rounding in grid units: each servo keeps its
+        committed value until the commanded angle crosses the grid boundary
+        by the hysteresis margin. A large jump commits directly to its
+        final value in one call — zero added latency for genuine motion;
+        boundary noise commits nothing."""
+        margin = 0.5 + hyst_deg / grid
+        out: list[int] = []
+        for i, a in enumerate(angles):
+            units = a / grid
+            c = self._committed[i]
+            if abs(units - c) > margin:
+                c = int(round(units))
+                self._committed[i] = c
+            out.append(c)
+        return out
 
     def _ramp_ms(self, target: list[float], speed_delay: int) -> float:
         if speed_delay <= 0:
@@ -143,4 +254,9 @@ class ServoDriver:
         if ok:
             self.last_ramp_ms = self._ramp_ms(clipped_angles, speed_delay)
             self._last_sent = list(clipped_angles)
+            # Raw commands bypass the Schmitt (explicit operator intent)
+            # but must keep the quantizer's committed state truthful.
+            self._committed_grid = 1.0
+            self._committed = [int(round(a)) for a in clipped_angles]
+            self._last_sent_units = list(self._committed)
         return ok

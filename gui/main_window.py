@@ -57,6 +57,7 @@ from settings import (
     SERIAL_BAUD,
     SERIAL_PORT,
     VISION_LOOP_HZ,
+    VISION_POSITION_LOG_PATH,
     VISUALIZER_HZ,
 )
 from visualization.visualizer3d import StewartVisualizer
@@ -619,6 +620,11 @@ class MainWindow(QWidget):
             roll_offset=self._trim_roll_deg,
             pitch_offset=self._trim_pitch_deg,
             auto_trim_enabled=self._auto_trim_enabled,
+            # Serial RTT telemetry (EMA) for the timing plot — a plain
+            # callable, like command_sender.
+            rtt_provider=self._servo.rtt_stats,
+            # Optional "t,x,y" per-frame log for jitter_bench --csv replay.
+            position_log_path=VISION_POSITION_LOG_PATH or None,
         )
         self._vision_worker.moveToThread(self._vision_thread)
         self._vision_thread.started.connect(self._vision_worker.start)
