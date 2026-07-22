@@ -12,6 +12,8 @@ Two bodies of work on branch `overhaul/safety-ik-vision-gui`, merging as one
 PR: the 2026-07-20 firmware capture and the 2026-07-22 six-step overhaul
 (absorbs milestones M9–M12; driven by the five-agent full-repo review — see
 `docs/code-review-2026-07-22.md` for the finding-by-finding record).
+The 2026-07-22 performance pass (branch `perf/latency-jitter`, stacked on
+the overhaul) is recorded in its own subsection at the end of [Unreleased].
 
 ### Added
 - `firmware/` — captured Uno firmware (2026-07-20): byte-for-byte flash dump
@@ -108,6 +110,78 @@ PR: the 2026-07-20 firmware capture and the 2026-07-22 six-step overhaul
   production actually ran; its 16 headline tests migrated to the real path,
   tautological tests deleted (step 5).
 - Dead `ServoAngles` contract and `solve_ik()` wrapper (step 3).
+
+### Performance pass (branch `perf/latency-jitter`, 2026-07-22)
+
+Six measured steps stacked on the overhaul; every change gated by
+`tools/jitter_bench.py` A/B numbers. Headlines: rest-state servo commands
+6125 integer flips/min → 0 (one send per 30 s at rest); serial RTT
+57 → 4.4 ms p50; camera stays 30 fps (hardware-capped).
+
+#### Added
+- `tools/jitter_bench.py` — headless A/B bench driving the real
+  MeasurementFilter → BallController → IK → ServoDriver chain on synthetic
+  profiles (quiescent/step3hz/ramp/impulse) or a recorded CSV; reports
+  integer flip rate, send rate, command std, d-term saturation (step 1).
+- `tools/latency_bench.py` (on-rig command→ack RTT percentiles) and
+  `tools/camera_probe.py` (fps × exposure sweep with recommendation); both
+  exit gracefully without hardware. `VISION_POSITION_LOG_PATH` session
+  recorder dumps `t,x,y` per valid frame for bench replay (step 1).
+- Serial RTT telemetry: write-stamp/ack matching in `SerialManager`,
+  `rtt_stats()` EMA surfaced through the worker timing dict into the
+  timing plot (step 1).
+- `cv/measurement_filter.py` — tracker filtering extracted into a pure
+  module; new adaptive alpha-beta filter (constant-velocity model, gains
+  scheduled by innovation 1→4 mm and predicted speed 60→150 mm/s) with
+  modes `alpha_beta` (default) / `legacy` (regression reference, pinned
+  byte-identical) / `raw` (bench only) (steps 1+3).
+- `control/rest_gate.py` — near-target rest mode: ball within 6 mm with
+  LPF speed ≤ 12 mm/s sustained 0.5 s → hold LEVEL + trim; exit hysteretic
+  and same-cycle (radius > 10 mm OR raw speed > 25 mm/s → full PD, no
+  filter, no timer). Auto-trim stays live during rest and keeps walking
+  the ball toward center (step 4).
+- `firmware/stewart_platform_uno_v2/` + `flash_dump_v2_2026-07-22.hex`
+  (new ground truth; v1 dump retained as rollback): tenth-degree `T`
+  protocol via `writeMicroseconds` with terse `k`/`e` acks, legacy `S`
+  protocol bit-compatible with shared position state, 250000 baud,
+  `[READY v2]` banner, no-String non-blocking parser (step 5).
+
+#### Changed
+- `hardware/servo_driver.py` — Schmitt-trigger quantizer
+  (`SERVO_QUANT_HYST_DEG`) + identical-command dedup: rounding-boundary
+  noise commits nothing, large jumps land in one call; `send_raw` bypasses
+  the Schmitt but keeps committed state truthful (step 2). Hybrid dispatch:
+  v2 + small streaming move → `T` on the 0.1° grid (hysteresis 0.15°);
+  large jumps and v1/forced-legacy → `S` with the firmware ramp (step 5).
+- `hardware/serial_manager.py` — parses the firmware version from the boot
+  banner; auto-falls back to 115200 when no banner appears at the
+  configured rate, so `SERIAL_BAUD = 250000` is safe on either firmware
+  (step 5).
+- `cv/ball_tracker.py` — ArUco detection every frame (the old freeze-10/
+  re-solve cadence injected a ~3 Hz position stairstep); detector-level +
+  full-res sub-pixel corner refinement; deadband + scheduled-alpha
+  marker-center filter (H bit-identical frame to frame at rest); sub-pixel
+  ball centroid (~0.2 mm noise floor, was 0.5 mm steps) (step 3).
+- `cv/camera_source.py` + `cv/vision_control_worker.py` — event-driven
+  tick: a frame callback fires processing the moment a frame arrives
+  (saves 0–8 ms, mean ~4 ms, vs the 8 ms poll grid; the 120 Hz QTimer
+  stays as fallback heartbeat); single-pass copy+chirality-flip into
+  reusable buffers; software gain into a preallocated buffer (step 6).
+- Measured decisions recorded: rig webcam hard-capped ~31 fps at 640×480
+  MJPG under DSHOW and MSMF — staying at 30 fps; IK vectorization skipped
+  by its measure gate (0.29 ms/call < 1.0 ms threshold) (step 6).
+
+#### Fixed
+- Serial read latency: the reader thread's `ser.read(128)` waited for
+  128 bytes or the 100 ms timeout, delaying every received line by up to
+  100 ms. Now blocks for 1 byte and drains `in_waiting` — v1 RTT fell
+  57 → 9.7 ms p50 from this fix alone (step 5).
+- Latent mutate-after-emit race on debug frames: per-tick references
+  leaked into snapshots; debug views are now copied only at snapshot
+  emission (≤ 30 Hz) (step 6).
+- D-term derivative kick on target steps pinned by tests: D acts on
+  measured velocity, not the error derivative; cap still clamps at
+  `PD_D_TERM_LIMIT_DEG` (step 4).
 
 ---
 

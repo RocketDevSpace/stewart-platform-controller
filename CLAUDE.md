@@ -39,10 +39,12 @@ control/
   autotune.py          # PDAutotuner — autotune state machine + per-leg step evaluator. ✅
   pd_core.py           # PDCore — pure PD math: d-term cap, tilt clamp, slew limiter. ✅
   pose_commander.py    # PoseCommander — GUI-facing Pose→IK→servo facade (zero IK in gui/). ✅
+  rest_gate.py         # RestGate — near-target rest mode: hold level+trim when ball is centered and slow; hysteretic same-cycle exit. ✅
 
 cv/
-  camera_source.py     # camera lifecycle: backend probe, capture thread, exposure policy, software gain. ✅
+  camera_source.py     # camera lifecycle: backend probe, capture thread, exposure policy, software gain, frame callback. ✅
   ball_tracker.py      # pure detection: ArUco homography + HSV blob → BallState. No camera, no threads. ✅
+  measurement_filter.py  # pure position/velocity filtering (modes: adaptive alpha_beta / legacy / raw); bench-importable. ✅
   vision_control_worker.py  # owns CameraSource + BallTracker + BallController; vision/PD/IK loop in a QThread. ✅
 
 routines/              # pure pose-list generators.
@@ -54,18 +56,23 @@ gui/
   serial_monitor.py    # serial output display widget. ✅
   vision_monitor.py    # floating camera/warped/mask debug views. ✅
   timing_plot.py       # TimingPlotWidget — vision-loop timing strip, persistent Line2D artists. ✅
-firmware/              # Arduino side: flash dump (ground truth), reconstructed sketch, wiring_check.py bench utility, README (pin map + protocol).
+firmware/              # Arduino side: v2 sketch + v2 flash dump (current ground truth), v1 dump (rollback) + reconstructed v1 sketch, wiring_check.py bench utility, README (pin map + protocols).
+  stewart_platform_uno_v2/  # firmware v2 source: T tenth-degree protocol + bit-compatible legacy S, 250000 baud, "[READY v2]" banner.
+tools/
+  jitter_bench.py      # headless A/B bench: synthetic/CSV ball motion through the real filter→PD→IK→servo chain; flip/send/d-term metrics.
+  latency_bench.py     # on-rig serial command→ack RTT percentiles through the real ServoDriver path.
+  camera_probe.py      # on-rig fps × exposure sweep; measures real frame period/brightness, recommends a config.
 docs/
   codex_audit.md       # historical M7 audit of the original Codex branch.
   code-review-2026-07-22.md  # five-agent full-repo review record; maps findings → overhaul fixes.
-tests/                 # test_safety, test_serial_manager, test_servo_driver, test_ik_engine, test_ik_solver, test_routine_runner, test_ball_controller (+ characterization), test_ball_tracker, test_camera_source, test_vision_control_worker, test_settings_store, test_settings_overlay.
+tests/                 # test_safety, test_serial_manager, test_servo_driver, test_ik_engine, test_ik_solver, test_routine_runner, test_ball_controller (+ characterization), test_ball_tracker, test_camera_source, test_vision_control_worker, test_settings_store, test_settings_overlay, test_measurement_filter, test_rest_gate, test_jitter_bench.
 ```
 
 **Module ownership boundaries:**
 - `config.py` owns physical geometry. NOT runtime settings.
 - `settings.py` owns runtime config. NOT geometry.
 - `core/ik_engine.py` is the ONLY caller of `kinematics/ik_solver.solve_pose()`.
-- `hardware/servo_driver.py` is the ONLY place `"S,..."` command strings are built.
+- `hardware/servo_driver.py` is the ONLY place `"S,..."` / `"T,..."` command strings are built.
 - `gui/*` files contain view and wiring only. NEVER control logic, IK calls, or serial command building.
 - `control/routine_runner.py` has NO Qt imports. It accepts `tick()` calls from a GUI-owned QTimer.
 - `visualization/visualizer3d.py` does NOT call IK directly. Accepts pre-solved geometry; uses `IKEngine` only as a fallback.
@@ -80,6 +87,8 @@ tests/                 # test_safety, test_serial_manager, test_servo_driver, te
 **The original 7-milestone refactor is complete — M1–M7 all merged** (M7 merged 2026-05-12; autotune guard follow-ups via PR #13; tracker velocity low-pass via PR #14 and servo 4 geometry fix via PR #15, both merged 2026-06-11). Read `CHANGELOG.md` for what each milestone shipped. Always check the open PR list (`gh pr list`) before treating any status written here as current — implementation may be in review.
 
 **The post-refactor hardening phase (M8–M12, scoped 2026-06-11) is done.** M8 (housekeeping) merged earlier via PR #16. The remaining milestones — M9 (IK correctness), M10 (controller decomposition), M11 (vision split), M12 (settings overlay + GUI slimming) — were all absorbed into the **2026-07-22 overhaul** (branch `overhaul/safety-ik-vision-gui`, one PR), which grew out of a five-agent full-repo review that same day. The overhaul also shipped safety work that was never on the roadmap: serial-link hardening (write lock, crash-surviving read loop, disconnect reporting, latest-wins streaming writer, [READY] handshake), mode mutual exclusion in the GUI, and the `closeEvent` deadlock / `sys.excepthook` emergency-shutdown fixes. See `docs/code-review-2026-07-22.md` for the finding-by-finding record and `CHANGELOG.md` for what shipped.
+
+**2026-07-22 performance pass** (branch `perf/latency-jitter`, stacked on the overhaul): six measured steps against control-chain latency and servo jitter, every change gated by `tools/jitter_bench.py` A/B numbers. Shipped: Schmitt-trigger quantizer + command dedup in `servo_driver`; adaptive alpha-beta measurement filter (`cv/measurement_filter.py`) + every-frame sub-pixel ArUco homography; near-target rest mode (`control/rest_gate.py`); firmware v2 (tenth-degree `T` protocol at 250000 baud, terse ack, hybrid T/S host dispatch); event-driven frame processing (capture callback instead of the poll grid). Headline numbers: rest-state servo commands 6125 integer flips/min → 0 (one send per 30 s at rest); serial RTT 57 → 4.4 ms p50; camera stays at 30 fps (hardware-capped ~31 fps — the 60 fps experiment is closed). See `firmware/README.md` for the v2 protocol and the `[Perf]` commits for step-by-step evidence.
 
 **Still open after the overhaul:**
 - Hardware smoke tests gate the PR — the overhaul is not merged until manual tests with the Arduino pass.
@@ -104,7 +113,7 @@ These are non-negotiable. Violating any is grounds to reject and revert.
 1. Do not modify `config.py` geometry without explicit approval — those are physical measurements.
 2. Do not add runtime config to `config.py`. Use `settings.py`.
 3. Do not call `ik_solver.solve_pose()` directly. Use `core/ik_engine.py`.
-4. Do not build `"S,..."` command strings inline. Use `hardware/servo_driver.py`.
+4. Do not build `"S,..."` or `"T,..."` command strings inline. Use `hardware/servo_driver.py`. (Documented exemption: `firmware/wiring_check.py`, a standalone rig utility that imports no app code.)
 5. Do not put control logic, IK calls, or serial command building in any `gui/` file.
 6. Do not use `stewart_control.*` import prefixes. Repo-root-relative only.
 7. Hardware tests requiring a physical Arduino must be marked `[HARDWARE]` and skipped in CI via `pytest.mark.skip(reason="requires hardware")`.
