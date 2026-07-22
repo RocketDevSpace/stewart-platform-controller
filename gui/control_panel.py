@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from control.patterns import PATTERNS
 from routines.routines import ROUTINES
 from settings import (
     BALL_TARGET_DEFAULT_X_MM,
@@ -33,6 +34,9 @@ from settings import (
     GUI_LOG_MAX_LINES,
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
+    PATH_SPEED_MAX_MM_S,
+    PATH_SPEED_MIN_MM_S,
+    PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KP,
     TRACKER_HSV_H_MAX,
@@ -44,6 +48,7 @@ from settings import (
 )
 
 ROUTINE_PLACEHOLDER = "(Choose a routine...)"
+PATTERN_PLACEHOLDER = "(Choose a pattern...)"
 AXES = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
 AXIS_KEYS = {"X": "x", "Y": "y", "Z": "z",
              "Roll": "roll", "Pitch": "pitch", "Yaw": "yaw"}
@@ -91,6 +96,9 @@ class ControlPanel(QWidget):
     autotune_auto_apply_clicked = pyqtSignal(bool)
     hsv_changed = pyqtSignal(int, int, int, int, int, int)  # hmin,hmax,smin,smax,vmin,vmax
     open_vision_monitor_clicked = pyqtSignal()
+    path_pattern_selected = pyqtSignal(str)          # "" = placeholder
+    path_toggled = pyqtSignal(bool)
+    path_speed_changed = pyqtSignal(float)           # mm/s
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -102,6 +110,7 @@ class ControlPanel(QWidget):
         self._calibrating_home = False
         self._autotune_enabled = False
         self._autotune_auto_apply = False
+        self._path_following = False
 
         main_layout = QHBoxLayout()
         main_layout.addLayout(self._build_slider_column())
@@ -379,6 +388,38 @@ class ControlPanel(QWidget):
         vision_group.setLayout(vg)
         layout.addWidget(vision_group)
 
+        # --- Path Following ---
+        path_group = QGroupBox("Path Following")
+        pg = QVBoxLayout()
+        pg.setSpacing(4)
+        pg.setContentsMargins(6, 10, 6, 6)
+
+        self._path_pattern_list = QComboBox()
+        self._path_pattern_list.addItem(PATTERN_PLACEHOLDER)
+        for name in PATTERNS.keys():
+            self._path_pattern_list.addItem(name)
+        self._path_pattern_list.currentIndexChanged.connect(
+            self._on_path_pattern_changed
+        )
+        pg.addWidget(self._path_pattern_list)
+
+        self._path_follow_btn = self._make_toggle_button(
+            "Follow Path", self._on_path_toggled
+        )
+        pg.addWidget(self._path_follow_btn)
+
+        self._path_speed_label, self._path_speed_slider = self._make_scaled_slider(
+            pg, "Path Speed: {:.0f} mm/s",
+            int(PATH_SPEED_MIN_MM_S), int(PATH_SPEED_MAX_MM_S),
+            float(PATH_SPEED_MM_S), 1.0, self._on_path_speed_changed,
+        )
+
+        self._path_status_label = QLabel("path: idle")
+        pg.addWidget(self._path_status_label)
+
+        path_group.setLayout(pg)
+        layout.addWidget(path_group)
+
         # --- Command I/O ---
         io_group = QGroupBox("Command I/O")
         ig = QVBoxLayout()
@@ -501,6 +542,24 @@ class ControlPanel(QWidget):
         )
         self.autotune_auto_apply_clicked.emit(self._autotune_auto_apply)
 
+    def _on_path_pattern_changed(self) -> None:
+        name = self._path_pattern_list.currentText()
+        self.path_pattern_selected.emit(
+            "" if name == PATTERN_PLACEHOLDER else name
+        )
+
+    def _on_path_toggled(self) -> None:
+        self._path_following = not self._path_following
+        self._set_toggle_text(
+            self._path_follow_btn, "Follow Path", self._path_following
+        )
+        self.path_toggled.emit(self._path_following)
+
+    def _on_path_speed_changed(self) -> None:
+        mm_s = float(self._path_speed_slider.value())
+        self._path_speed_label.setText(f"Path Speed: {mm_s:.0f} mm/s")
+        self.path_speed_changed.emit(mm_s)
+
     def _on_hsv_changed(self) -> None:
         hmin = self._hsv_h_min_slider.value()
         hmax = self._hsv_h_max_slider.value()
@@ -594,6 +653,11 @@ class ControlPanel(QWidget):
         """Return the current dropdown selection (placeholder if none)."""
         return str(self._demo_list.currentText())
 
+    def current_pattern(self) -> str:
+        """Current path-pattern selection ("" when the placeholder)."""
+        name = str(self._path_pattern_list.currentText())
+        return "" if name == PATTERN_PLACEHOLDER else name
+
     def append_preview(self, text: str) -> None:
         self._preview_output.append(text)
 
@@ -669,6 +733,15 @@ class ControlPanel(QWidget):
         self._set_toggle_text(
             self._autotune_auto_apply_btn, "Auto-Apply", auto_apply
         )
+
+    def sync_path_button(self, active: bool) -> None:
+        self._path_following = active
+        self._path_follow_btn.blockSignals(True)
+        self._set_toggle_text(self._path_follow_btn, "Follow Path", active)
+        self._path_follow_btn.blockSignals(False)
+
+    def set_path_status(self, text: str) -> None:
+        self._path_status_label.setText(text)
 
     def sync_hsv(
         self,
