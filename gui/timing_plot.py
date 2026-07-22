@@ -5,7 +5,7 @@ TimingPlotWidget: the vision-loop timing diagnostics strip (summary label
 over a matplotlib canvas). Extracted from MainWindow so the top-level
 window only wires modules together.
 
-Rendering: the 9 Line2D artists and the legend are created ONCE in
+Rendering: the 10 Line2D artists and the legend are created ONCE in
 __init__; each redraw only calls set_data / set_ylim and draw_idle().
 No per-update cla()/replot/legend rebuild (the old approach rebuilt the
 whole axes on every refresh, which dominated GUI-thread time).
@@ -37,6 +37,7 @@ _TIMING_KEYS = [
     "frame_to_worker_ms",
     "worker_to_gui_ms",
     "frame_to_cmd",
+    "serial_rtt_ms",
     "total",
 ]
 _TIMING_COLORS = {
@@ -48,6 +49,7 @@ _TIMING_COLORS = {
     "frame_to_worker_ms": "#0ea5e9",
     "worker_to_gui_ms":  "#64748b",
     "frame_to_cmd":      "#22d3ee",
+    "serial_rtt_ms":     "#fb7185",
     "total":             "#e2e8f0",
 }
 _TIMING_WINDOW_S = 30.0

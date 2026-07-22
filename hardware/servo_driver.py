@@ -41,6 +41,14 @@ class ServoDriver:
         # buffer overflows and commands get dropped/corrupted.
         self.last_ramp_ms: float = 0.0
 
+    def rtt_stats(self) -> tuple[float, float, int]:
+        """(ema_ms, last_ms, samples) of the serial command->ack round trip.
+
+        Thin delegation to SerialManager.rtt_stats() so consumers (the
+        vision worker's timing telemetry) never reach through to the
+        serial layer directly."""
+        return self._serial.rtt_stats()
+
     def format_command(self, angles: list[float], speed_delay: int = 0) -> str:
         """Return the Arduino serial command string for the given angles.
 

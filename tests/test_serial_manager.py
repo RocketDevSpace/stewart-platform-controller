@@ -212,3 +212,58 @@ class TestSend:
         self, manager: sm.SerialManager
     ) -> None:
         assert manager.send_latest(b"x\n") is False
+
+
+class TestRttStats:
+    CMD = b"S,90,90,90,90,90,90,0\n"
+
+    def test_stats_zero_before_any_sample(self, manager: sm.SerialManager) -> None:
+        manager.connect()
+        assert manager.rtt_stats() == (0.0, 0.0, 0)
+
+    def test_write_then_ok_ack_records_one_sample(
+        self, manager: sm.SerialManager
+    ) -> None:
+        manager.connect()
+        assert manager.send(self.CMD) is True
+        FakeSerial.instances[0].feed(b"[OK] moved\n")
+        assert _wait_until(lambda: manager.rtt_stats()[2] == 1)
+        ema_ms, last_ms, samples = manager.rtt_stats()
+        assert samples == 1
+        assert ema_ms > 0.0
+        assert last_ms > 0.0
+        assert ema_ms == pytest.approx(last_ms)  # first sample seeds the EMA
+
+    def test_terse_k_ack_also_counts(self, manager: sm.SerialManager) -> None:
+        manager.connect()
+        assert manager.send(self.CMD) is True
+        FakeSerial.instances[0].feed(b"k\n")
+        assert _wait_until(lambda: manager.rtt_stats()[2] == 1)
+
+    def test_two_writes_before_ack_discards_sample(
+        self, manager: sm.SerialManager
+    ) -> None:
+        manager.connect()
+        assert manager.send(self.CMD) is True
+        assert manager.send(self.CMD) is True     # 2 outstanding: ambiguous
+        received: list[str] = []
+        manager.set_receive_callback(received.append)
+        FakeSerial.instances[0].feed(b"[OK] moved\n")
+        assert _wait_until(lambda: len(received) == 1)
+        assert manager.rtt_stats() == (0.0, 0.0, 0)  # unmatched -> discarded
+        # The ack reset the outstanding count: the next single
+        # write/ack pair matches again.
+        assert manager.send(self.CMD) is True
+        FakeSerial.instances[0].feed(b"[OK] moved\n")
+        assert _wait_until(lambda: manager.rtt_stats()[2] == 1)
+
+    def test_non_command_write_does_not_go_outstanding(
+        self, manager: sm.SerialManager
+    ) -> None:
+        manager.connect()
+        assert manager.send(b"hello\n") is True   # not S,/T, -> no pairing
+        received: list[str] = []
+        manager.set_receive_callback(received.append)
+        FakeSerial.instances[0].feed(b"[OK] chatter\n")
+        assert _wait_until(lambda: len(received) == 1)
+        assert manager.rtt_stats()[2] == 0

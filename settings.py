@@ -148,6 +148,14 @@ VISUALIZER_HZ = 25
 GUI_SNAPSHOT_HZ = 30
 
 # =============================================================================
+# Vision session recording
+# =============================================================================
+# When non-empty, the vision worker appends "t,x,y" lines (perf_counter
+# seconds, ball x/y in mm) for every valid frame — input for
+# tools/jitter_bench.py --csv replay. Empty string = disabled.
+VISION_POSITION_LOG_PATH: str = ""
+
+# =============================================================================
 # Vision neutral-pose fallback (safety action on sustained ball loss)
 # =============================================================================
 VISION_MISS_NEUTRAL_AFTER_FRAMES = 20   # consecutive misses before neutral send

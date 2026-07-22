@@ -28,22 +28,16 @@ import cv2
 import numpy as np
 
 from core.platform_state import BallState
+from cv.measurement_filter import MeasurementFilter
 from settings import (
-    BALL_VEL_FILTER_ALPHA,
     TRACKER_ARUCO_CENTER_FILTER_ALPHA,
     TRACKER_ARUCO_DETECT_SCALE,
     TRACKER_ARUCO_REDETECT_EVERY_N,
     TRACKER_MAX_ARUCO_HOLD_FRAMES,
-    TRACKER_MAX_SPEED_MM_S,
     TRACKER_MIN_CIRCULARITY,
     TRACKER_MIN_CONTOUR_AREA,
     TRACKER_MIN_FILL_RATIO,
     TRACKER_MIN_RADIUS_PX,
-    TRACKER_POS_FILTER_ALPHA_FAST,
-    TRACKER_POS_FILTER_ALPHA_SLOW,
-    TRACKER_POS_FILTER_ENABLED,
-    TRACKER_POS_FILTER_MAX_LAG_MM,
-    TRACKER_POS_FILTER_SPEED_MM_S,
     TRACKER_WARP_GRAY_CACHE_N,
 )
 
@@ -89,31 +83,18 @@ class BallTracker:
         self.min_contour_area = float(TRACKER_MIN_CONTOUR_AREA)
         self.min_circularity = float(TRACKER_MIN_CIRCULARITY)
         self.min_fill_ratio = float(TRACKER_MIN_FILL_RATIO)
-        self.max_speed_mm_s = float(TRACKER_MAX_SPEED_MM_S)
         self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-        # --- Position filter state ---
-        self.pos_filter_enabled = bool(TRACKER_POS_FILTER_ENABLED)
-        self.pos_filter_alpha_slow = float(
-            np.clip(TRACKER_POS_FILTER_ALPHA_SLOW, 0.0, 0.98)
-        )
-        self.pos_filter_alpha_fast = float(
-            np.clip(TRACKER_POS_FILTER_ALPHA_FAST, 0.0, 0.98)
-        )
-        self.pos_filter_speed_mm_s = max(1.0, float(TRACKER_POS_FILTER_SPEED_MM_S))
-        self.pos_filter_max_lag_mm = max(0.1, float(TRACKER_POS_FILTER_MAX_LAG_MM))
-        self._last_pos_filter_alpha = self.pos_filter_alpha_fast
+        # --- Measurement filtering (position + velocity) ---
+        # Extracted to cv/measurement_filter.py (perf pass): outlier gate,
+        # adaptive position low-pass, velocity EMA. State + params live
+        # there; the delegating properties below preserve the old
+        # attribute surface.
+        self.measurement = MeasurementFilter()
 
         # --- Warp brightness cache ---
         self._warp_gray_cache_counter: int = TRACKER_WARP_GRAY_CACHE_N
         self._cached_warp_gray_mean: float = 0.0
-
-        # --- Velocity and position state ---
-        self.prev_ball_mm: tuple[float, float] | None = None
-        self.prev_ball_raw_mm: tuple[float, float] | None = None
-        self.prev_time: float | None = None
-        self._vx_f: float = 0.0   # low-pass filtered velocity
-        self._vy_f: float = 0.0
 
         # --- HSV state (defaults from settings; live updates via setter) ---
         from settings import (
@@ -135,6 +116,42 @@ class BallTracker:
         self._last_warped_bgr: np.ndarray | None = None
         self._last_mask_gray: np.ndarray | None = None
         self._last_processed_ts = 0.0
+
+    # =========================
+    # Measurement-filter delegation (old attribute surface preserved)
+    # =========================
+
+    @property
+    def pos_filter_enabled(self) -> bool:
+        return self.measurement.pos_filter_enabled
+
+    @pos_filter_enabled.setter
+    def pos_filter_enabled(self, value: bool) -> None:
+        self.measurement.pos_filter_enabled = bool(value)
+
+    @property
+    def max_speed_mm_s(self) -> float:
+        return self.measurement.max_speed_mm_s
+
+    @max_speed_mm_s.setter
+    def max_speed_mm_s(self, value: float) -> None:
+        self.measurement.max_speed_mm_s = float(value)
+
+    @property
+    def _vx_f(self) -> float:
+        return self.measurement._vx_f
+
+    @property
+    def _vy_f(self) -> float:
+        return self.measurement._vy_f
+
+    @property
+    def prev_ball_mm(self) -> tuple[float, float] | None:
+        return self.measurement.prev_ball_mm
+
+    @property
+    def prev_time(self) -> float | None:
+        return self.measurement.prev_time
 
     # =========================
     # Public API
@@ -230,55 +247,13 @@ class BallTracker:
 
         current_time = frame_ts if frame_ts > 0 else time.perf_counter()
 
-        # ---- Velocity measurement ----
-        dt = 0.0
-        vx_raw_meas = 0.0
-        vy_raw_meas = 0.0
-        raw_speed_mm_s = 0.0
-        if self.prev_time is not None and self.prev_ball_raw_mm is not None:
-            dt = current_time - self.prev_time
-            if dt > 0:
-                vx_raw_meas = (x_mm_raw - self.prev_ball_raw_mm[0]) / dt
-                vy_raw_meas = (y_mm_raw - self.prev_ball_raw_mm[1]) / dt
-                raw_speed_mm_s = float(np.hypot(vx_raw_meas, vy_raw_meas))
-                if self.max_speed_mm_s > 0 and raw_speed_mm_s > self.max_speed_mm_s:
-                    return self._miss()
-
-        # ---- Position filter ----
-        if self.pos_filter_enabled and self.prev_ball_mm is not None:
-            speed_ratio = min(1.0, raw_speed_mm_s / self.pos_filter_speed_mm_s)
-            filter_alpha = (
-                self.pos_filter_alpha_slow
-                + (self.pos_filter_alpha_fast - self.pos_filter_alpha_slow)
-                * speed_ratio
-            )
-            x_mm = filter_alpha * self.prev_ball_mm[0] + (1.0 - filter_alpha) * x_mm_raw
-            y_mm = filter_alpha * self.prev_ball_mm[1] + (1.0 - filter_alpha) * y_mm_raw
-            lag = float(np.hypot(x_mm_raw - x_mm, y_mm_raw - y_mm))
-            if lag > self.pos_filter_max_lag_mm:
-                scale = self.pos_filter_max_lag_mm / max(lag, 1e-6)
-                x_mm = x_mm_raw - (x_mm_raw - x_mm) * scale
-                y_mm = y_mm_raw - (y_mm_raw - y_mm) * scale
-            self._last_pos_filter_alpha = float(filter_alpha)
-        else:
-            x_mm = x_mm_raw
-            y_mm = y_mm_raw
-
-        if self.prev_ball_mm is None or self.prev_time is None or dt <= 0:
-            vx = 0.0
-            vy = 0.0
-            self._vx_f = 0.0
-            self._vy_f = 0.0
-        else:
-            alpha = BALL_VEL_FILTER_ALPHA
-            self._vx_f = alpha * vx_raw_meas + (1.0 - alpha) * self._vx_f
-            self._vy_f = alpha * vy_raw_meas + (1.0 - alpha) * self._vy_f
-            vx = self._vx_f
-            vy = self._vy_f
-
-        self.prev_ball_raw_mm = (x_mm_raw, y_mm_raw)
-        self.prev_ball_mm = (x_mm, y_mm)
-        self.prev_time = current_time
+        # ---- Measurement filtering (cv/measurement_filter.py) ----
+        # Outlier gate + position filter + velocity EMA. None means the
+        # raw-speed gate rejected the sample -> treat as a miss.
+        filtered = self.measurement.update(x_mm_raw, y_mm_raw, current_time)
+        if filtered is None:
+            return self._miss()
+        x_mm, y_mm, vx, vy = filtered
 
         return BallState(x_mm=x_mm, y_mm=y_mm, vx_mm_s=vx, vy_mm_s=vy)
 
@@ -293,9 +268,7 @@ class BallTracker:
         next detection — a reacquired ball must never be blended toward
         its stale pre-loss position (that was a live landmine whenever
         TRACKER_POS_FILTER_ENABLED was turned on)."""
-        self._vx_f = 0.0
-        self._vy_f = 0.0
-        self.prev_ball_mm = None
+        self.measurement.reset()
         return None
 
     # =========================

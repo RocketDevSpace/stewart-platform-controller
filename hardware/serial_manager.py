@@ -44,6 +44,12 @@ _READY_WAIT_S = 3.0
 _WRITE_TIMEOUT_S = 0.5
 _THREAD_JOIN_TIMEOUT_S = 2.0
 
+# RTT telemetry: EMA smoothing weight for new round-trip samples.
+_RTT_EMA_ALPHA = 0.2
+# Byte prefixes that count as firmware commands for RTT matching (the
+# firmware acks each with "[OK] ..." — or "k" for the future terse ack).
+_RTT_COMMAND_PREFIXES = (b"S,", b"T,")
+
 
 class SerialManager:
     """Manages a single serial connection, a reader thread, and a
@@ -63,6 +69,16 @@ class SerialManager:
         self._latest_cond = threading.Condition()
         self._latest_data: bytes | None = None
         self._disconnect_reported = False
+        # --- RTT telemetry (write -> firmware ack round trip) ---
+        # A sample is only trusted when EXACTLY one command was outstanding
+        # at ack time; overlapping commands make the pairing ambiguous and
+        # the sample is discarded (unmatched).
+        self._rtt_lock = threading.Lock()
+        self._rtt_last_write_ts: float | None = None
+        self._rtt_outstanding = 0
+        self._rtt_ema_ms = 0.0
+        self._rtt_last_ms = 0.0
+        self._rtt_samples = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -149,6 +165,7 @@ class SerialManager:
         try:
             with self._write_lock:
                 self._ser.write(data)
+            self._note_write(data)
             return True
         except Exception as exc:
             logger.error("Send failed: %s", exc)
@@ -182,6 +199,17 @@ class SerialManager:
         link dies unexpectedly (USB unplug, I/O error). Called on a
         background thread."""
         self._disconnect_callback = callback
+
+    def rtt_stats(self) -> tuple[float, float, int]:
+        """Return (ema_ms, last_ms, samples) for the command->ack round trip.
+
+        ema_ms is an exponential moving average (alpha 0.2) of matched
+        samples; last_ms is the most recent matched sample; samples is the
+        matched-sample count. All zeros until the first matched ack.
+        Thread-safe.
+        """
+        with self._rtt_lock:
+            return self._rtt_ema_ms, self._rtt_last_ms, self._rtt_samples
 
     def is_connected(self) -> bool:
         """Return True if the serial port is currently open."""
@@ -229,6 +257,40 @@ class SerialManager:
             "No %s banner within %.1f s — assuming old firmware "
             "(boot delay elapsed)", _READY_BANNER, _READY_WAIT_S,
         )
+
+    def _note_write(self, data: bytes) -> None:
+        """Stamp a completed write for RTT pairing (called after every
+        successful write, from send() — which is also the _write_loop
+        path). Command payloads additionally bump the outstanding count."""
+        now = time.perf_counter()
+        with self._rtt_lock:
+            self._rtt_last_write_ts = now
+            if data.startswith(_RTT_COMMAND_PREFIXES):
+                self._rtt_outstanding += 1
+
+    def _note_ack(self, line: str) -> None:
+        """Fold a firmware ack line into the RTT stats (reader thread).
+
+        Only lines starting with "[OK]" (or exactly "k") are acks. The
+        sample is kept only when exactly one command was outstanding —
+        otherwise the write->ack pairing is ambiguous and it is discarded.
+        The outstanding count resets on every ack either way."""
+        if not (line.startswith("[OK]") or line == "k"):
+            return
+        now = time.perf_counter()
+        with self._rtt_lock:
+            if self._rtt_outstanding == 1 and self._rtt_last_write_ts is not None:
+                sample_ms = (now - self._rtt_last_write_ts) * 1000.0
+                self._rtt_last_ms = sample_ms
+                if self._rtt_samples == 0:
+                    self._rtt_ema_ms = sample_ms
+                else:
+                    self._rtt_ema_ms = (
+                        _RTT_EMA_ALPHA * sample_ms
+                        + (1.0 - _RTT_EMA_ALPHA) * self._rtt_ema_ms
+                    )
+                self._rtt_samples += 1
+            self._rtt_outstanding = 0
 
     def _handle_link_error(self, reason: str) -> None:
         """Mark the link dead and notify the disconnect callback (once)."""
@@ -285,6 +347,7 @@ class SerialManager:
                 line = line.strip()
                 if not line:
                     continue
+                self._note_ack(line)
                 if self._callback is None:
                     logger.debug("RX %s", line)
                     continue

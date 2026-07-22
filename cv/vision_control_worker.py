@@ -12,7 +12,7 @@ worker will not emit the next snapshot until that call arrives (backpressure).
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, TextIO
 
 import time
 from dataclasses import dataclass, field
@@ -111,6 +111,8 @@ class VisionControlWorker(QtCore.QObject):
         roll_offset: float = MANUAL_ROLL_TRIM_DEG,
         pitch_offset: float = MANUAL_PITCH_TRIM_DEG,
         auto_trim_enabled: bool = AUTO_TRIM_ENABLED,
+        rtt_provider: Callable[[], tuple[float, float, int]] | None = None,
+        position_log_path: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -122,6 +124,14 @@ class VisionControlWorker(QtCore.QObject):
         self._snapshot_hz = max(1, int(snapshot_hz))
         self._command_sender = command_sender
         self._camera_index = int(camera_index)
+        # Serial RTT telemetry source (a plain callable, like
+        # command_sender — the worker never touches SerialManager).
+        self._rtt_provider = rtt_provider
+        # Optional per-frame position log ("t,x,y" lines) for
+        # tools/jitter_bench.py --csv replay.
+        self._position_log_path = position_log_path or None
+        self._position_log_file: TextIO | None = None
+        self._position_log_lines = 0
 
         # Cached init params — applied to controller on start()
         self._kp_init = float(kp)
@@ -225,6 +235,16 @@ class VisionControlWorker(QtCore.QObject):
         self._last_frame_ts = 0.0
         self._last_neutral_send = 0.0
 
+        if self._position_log_path and self._position_log_file is None:
+            try:
+                self._position_log_file = open(
+                    self._position_log_path, "a", encoding="utf-8"
+                )
+                self._position_log_lines = 0
+            except OSError as exc:
+                self._position_log_file = None
+                self.error.emit(f"position log open failed: {exc}")
+
         self._timer = QtCore.QTimer(self)
         self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._tick)
@@ -245,6 +265,12 @@ class VisionControlWorker(QtCore.QObject):
         self.camera = None
         self.ball_tracker = None
         self.ball_controller = None
+        if self._position_log_file is not None:
+            try:
+                self._position_log_file.close()
+            except OSError:
+                pass
+            self._position_log_file = None
         self.stopped.emit()
 
     @QtCore.pyqtSlot()
@@ -416,6 +442,7 @@ class VisionControlWorker(QtCore.QObject):
                 return
 
             # Valid detection.
+            self._log_position(ball_state)
             if self._was_missing:
                 self.ball_controller.reset_motion_state()
                 self._was_missing = False
@@ -537,8 +564,39 @@ class VisionControlWorker(QtCore.QObject):
                 self.error.emit(f"neutral send failed: {exc}")
 
     # ------------------------------------------------------------------
+    # Position log (jitter_bench --csv replay input)
+    # ------------------------------------------------------------------
+
+    def _log_position(self, ball_state: BallState) -> None:
+        """Append one "t,x,y" line for a valid frame (no-op when disabled)."""
+        f = self._position_log_file
+        if f is None:
+            return
+        try:
+            f.write(
+                f"{time.perf_counter():.6f},"
+                f"{ball_state.x_mm:.3f},{ball_state.y_mm:.3f}\n"
+            )
+            self._position_log_lines += 1
+            if self._position_log_lines % 30 == 0:
+                f.flush()
+        except OSError as exc:
+            self._position_log_file = None
+            self.error.emit(f"position log write failed: {exc}")
+
+    # ------------------------------------------------------------------
     # Timing helpers
     # ------------------------------------------------------------------
+
+    def _serial_rtt_ms(self) -> float:
+        """Current serial RTT EMA in ms (0.0 when no provider/samples)."""
+        if self._rtt_provider is None:
+            return 0.0
+        try:
+            ema_ms, _last_ms, samples = self._rtt_provider()
+        except Exception:
+            return 0.0
+        return float(ema_ms) if samples > 0 else 0.0
 
     def _capture_stats_pair(self) -> tuple[float, float]:
         if self.camera is None:
@@ -565,6 +623,7 @@ class VisionControlWorker(QtCore.QObject):
             ),
             "worker_to_gui_ms": 0.0,
             "frame_to_cmd": 0.0,
+            "serial_rtt_ms": self._serial_rtt_ms(),
             "trk_cap_period": period_ms,
             "trk_gray_mean": gray_mean,
         }
@@ -597,6 +656,7 @@ class VisionControlWorker(QtCore.QObject):
             "frame_to_worker_ms": frame_to_worker,
             "worker_to_gui_ms": 0.0,
             "frame_to_cmd": frame_to_cmd,
+            "serial_rtt_ms": self._serial_rtt_ms(),
             "trk_cap_period": period_ms,
             "trk_gray_mean": gray_mean,
         }
