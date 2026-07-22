@@ -304,8 +304,18 @@ class BallController:
         # a full PD command on this very call.
         rest_radius_mm = math.hypot(pos_vec_x, pos_vec_y)
         rest_speed_mm_s = math.hypot(vx, vy)
-        rest_state = self._rest_gate.update(rest_radius_mm, rest_speed_mm_s)
-        resting = rest_state == STATE_RESTING
+        if self.home_calibration_active:
+            # Home calibration needs ACTIVE PD driving the ball to center
+            # while auto-trim absorbs the bias — resting at level+trim with
+            # the ball parked off-center would leave centering to the slow
+            # trim walk alone (observed on the rig: calibration far less
+            # reliable with rest engaged).
+            self._rest_gate.reset()
+            rest_state = "active"
+            resting = False
+        else:
+            rest_state = self._rest_gate.update(rest_radius_mm, rest_speed_mm_s)
+            resting = rest_state == STATE_RESTING
 
         res = self._pd.compute(
             pos_vec_x, pos_vec_y, vx, vy, self.roll_offset, self.pitch_offset,

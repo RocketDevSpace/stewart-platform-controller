@@ -187,12 +187,17 @@ class TestSlewLimit:
 
 
 class TestDTermCap:
-    def test_d_term_capped_at_2_5_deg(self) -> None:
+    def test_d_term_capped_at_settings_limit(self) -> None:
+        # Pins the MECHANISM (symmetric clamp at PD_D_TERM_LIMIT_DEG), not
+        # the tunable value — the cap was deliberately raised 2.5 -> 6.0 in
+        # the 2026-07-22 live tuning session (it saturated on every fast
+        # event and starved the flick response).
+        from settings import PD_D_TERM_LIMIT_DEG as CAP
         ctrl = BallController(kp=0.0, kd=1.0, clock=FakeClock())
         _, _, terms = ctrl.compute_with_terms(_state(vx=100.0, vy=-100.0))
-        # d = kd * (-v) = (-100, +100) -> capped to +/-2.5
-        assert terms["d_term"] == pytest.approx((-2.5, 2.5))
-        assert terms["pd_vec"] == pytest.approx((-2.5, 2.5))
+        # d = kd * (-v) = (-100, +100) -> capped to +/-CAP
+        assert terms["d_term"] == pytest.approx((-CAP, CAP))
+        assert terms["pd_vec"] == pytest.approx((-CAP, CAP))
 
     def test_small_d_term_not_capped(self) -> None:
         ctrl = BallController(kp=0.0, kd=0.01, clock=FakeClock())

@@ -262,13 +262,33 @@ class TestTenthProtocol:
         assert mock_serial.send.call_args[0][0] == b"T,954,900,900,900,900,900\n"
 
     def test_large_move_falls_back_to_ramped_s(self) -> None:
-        """Jumps beyond the slew threshold still use the legacy S path so
-        the firmware ramp protects the hardware."""
+        """NON-STREAMING jumps beyond the slew threshold use the legacy S
+        path so the firmware ramp protects manual/routine moves."""
         driver, mock_serial = make_v2_driver()
         driver.send_angles([150.0, 90.0, 90.0, 90.0, 90.0, 90.0])
         sent = mock_serial.send.call_args[0][0]
         assert sent.startswith(b"S,150,")
         assert sent.endswith(b",5\n")
+
+    def test_streaming_large_move_is_never_firmware_ramped_v2(self) -> None:
+        """Vision-loop emergency corrections must go out at full authority:
+        a large STREAMING move on v2 stays on the instant T path (the
+        firmware ramp would throttle a save to 200 deg/s and block the
+        firmware loop mid-crisis)."""
+        driver, mock_serial = make_v2_driver()
+        driver.send_angles(
+            [150.0, 90.0, 90.0, 90.0, 90.0, 90.0], streaming=True
+        )
+        sent = mock_serial.send_latest.call_args[0][0]
+        assert sent.startswith(b"T,1500,")
+
+    def test_streaming_large_move_is_instant_on_v1(self) -> None:
+        driver, mock_serial = make_driver()
+        driver.send_angles(
+            [150.0, 90.0, 90.0, 90.0, 90.0, 90.0], streaming=True
+        )
+        sent = mock_serial.send_latest.call_args[0][0]
+        assert sent == b"S,150,90,90,90,90,90,0\n"    # speedDelay 0
 
     def test_v1_firmware_never_gets_t_commands(self) -> None:
         driver, mock_serial = make_driver()   # spec'd mock: no version attr
@@ -286,10 +306,10 @@ class TestTenthProtocol:
         to the tenth grid without a spurious jump."""
         driver, mock_serial = make_v2_driver()
         driver.send_angles([150.0, 90.0, 90.0, 90.0, 90.0, 90.0])   # S path
-        # 0.3 deg exceeds the fine hysteresis (0.05 + 0.15) — commits on
+        # 0.4 deg exceeds the fine hysteresis (0.05 + 0.25) — commits on
         # the tenth grid converted from the S-path committed pose.
-        driver.send_angles([150.3, 90.0, 90.0, 90.0, 90.0, 90.0])   # T path
-        assert mock_serial.send.call_args[0][0] == b"T,1503,900,900,900,900,900\n"
+        driver.send_angles([150.4, 90.0, 90.0, 90.0, 90.0, 90.0])   # T path
+        assert mock_serial.send.call_args[0][0] == b"T,1504,900,900,900,900,900\n"
 
 
 # ---------------------------------------------------------------------------

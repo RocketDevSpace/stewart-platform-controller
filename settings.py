@@ -20,7 +20,9 @@ SERIAL_BAUD = 250000
 # =============================================================================
 # Safety limits
 # =============================================================================
-MAX_TILT_DEG = 8.0                      # maximum platform tilt in vision mode
+# Max platform tilt PER AXIS in vision mode. IK verified solvable at the
+# 10/10 combined corner (14 deg total); 12/12 has no real solution.
+MAX_TILT_DEG = 10.0
 
 SAFETY_LIMITS = {
     "max_angle": 180,       # global ceiling, all servos (enforced in core/safety.py)
@@ -47,7 +49,7 @@ SERVO_QUANT_HYST_DEG = 0.4
 SERVO_DEDUP_ENABLED = True
 # With firmware v2's tenth-degree T protocol the command grid is 0.1 deg, so
 # the Schmitt margin shrinks accordingly (still > half a grid step).
-SERVO_QUANT_HYST_FINE_DEG = 0.15
+SERVO_QUANT_HYST_FINE_DEG = 0.25
 # "auto": use the tenth-degree T protocol when the connected firmware is v2
 # (small streaming moves; large moves still go via legacy S + firmware ramp).
 # "legacy": force whole-degree S commands regardless of firmware.
@@ -127,11 +129,16 @@ BALL_VEL_FILTER_ALPHA: float = 0.55
 #   "raw"        — passthrough position + raw finite-difference velocity
 #                  (bench comparison only).
 TRACKER_FILTER_MODE = "alpha_beta"
-TRACKER_AB_ALPHA_MIN = 0.30
+TRACKER_AB_ALPHA_MIN = 0.40
 TRACKER_AB_ALPHA_MAX = 0.90
-TRACKER_AB_BETA_MIN = 0.05
-TRACKER_AB_BETA_MAX = 0.50
-TRACKER_AB_INNOV_OPEN_MM = 1.0       # innovation below this: gains stay MIN
+# BETA_MIN raised 0.05 -> 0.25 (live tuning 2026-07-22): at 0.05 the
+# quiet-mode velocity estimate lagged ~660 ms - near 180 deg of phase
+# at the observed 0.77 Hz small-amplitude oscillation - turning the
+# D-term from damping into excitation (self-sustaining rock that also
+# blocked auto-trim's settle gate). 0.25 keeps ~<40 deg lag there.
+TRACKER_AB_BETA_MIN = 0.25
+TRACKER_AB_BETA_MAX = 0.60
+TRACKER_AB_INNOV_OPEN_MM = 1.5       # innovation below this: gains stay MIN
 TRACKER_AB_INNOV_FULL_MM = 4.0       # innovation above this: gains at MAX
 TRACKER_AB_SPEED_OPEN_MM_S = 60.0    # predicted speed below this: no opening
 TRACKER_AB_SPEED_FULL_MM_S = 150.0   # predicted speed above this: gains at MAX
@@ -142,7 +149,11 @@ TRACKER_AB_SPEED_FULL_MM_S = 150.0   # predicted speed above this: gains at MAX
 PD_DEFAULT_KP = float(_OV.get("PD_DEFAULT_KP", 0.045))
 PD_DEFAULT_KD = float(_OV.get("PD_DEFAULT_KD", 0.022))
 PD_MAX_TILT_RATE_DEG_S = 300.0          # slew ("tilt rate") limit on commanded tilt
-PD_D_TERM_LIMIT_DEG = 2.5               # derivative-term contribution cap
+# Derivative-term contribution cap. Was 2.5 as a velocity-NOISE guard;
+# with the alpha-beta filter the velocity is clean, and live data showed
+# the cap saturating on every fast event (a 300 mm/s flick wants
+# kd*300 ~ 6.6 deg of braking) - the weak early flick response.
+PD_D_TERM_LIMIT_DEG = 6.0
 BALL_TARGET_DEFAULT_X_MM = 0.0
 BALL_TARGET_DEFAULT_Y_MM = 0.0
 
@@ -156,10 +167,10 @@ BALL_TARGET_DEFAULT_Y_MM = 0.0
 # and INSTANT — raw radius or raw instantaneous speed past the wider exit
 # thresholds restores full PD on the same control cycle.
 REST_MODE_ENABLED = True
-REST_ENTER_RADIUS_MM = 6.0              # enter: raw radius at/under this
-REST_EXIT_RADIUS_MM = 10.0              # exit: raw radius above this (same cycle)
-REST_ENTER_SPEED_MM_S = 12.0            # enter: LPF speed at/under this
-REST_EXIT_SPEED_MM_S = 25.0             # exit: raw speed above this (same cycle)
+REST_ENTER_RADIUS_MM = 8.0              # enter: raw radius at/under this
+REST_EXIT_RADIUS_MM = 12.0              # exit: raw radius above this (same cycle)
+REST_ENTER_SPEED_MM_S = 15.0            # enter: LPF speed at/under this
+REST_EXIT_SPEED_MM_S = 30.0             # exit: raw speed above this (same cycle)
 REST_ENTER_HOLD_S = 0.5                 # entry conditions must hold this long
 REST_SPEED_LPF_ALPHA = 0.6              # RestGate's own speed EMA (weight on prev)
 

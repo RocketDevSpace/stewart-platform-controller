@@ -500,6 +500,32 @@ class TestRestModeIntegration:
         assert terms["rest_mode_active"] is False
 
 
+class TestRestHomeCalExclusion:
+    def test_never_rests_during_home_calibration(self) -> None:
+        """Home calibration needs ACTIVE PD centering the ball; rest mode
+        parking at level+trim made calibration far less reliable
+        (observed on the rig 2026-07-22)."""
+        clock = _FakeClock()
+        ctrl = BallController(kp=0.045, kd=0.022, clock=clock)
+        ctrl.start_home_calibration()
+        # Ball parked dead-center and still — prime rest-entry conditions.
+        for _ in range(60):
+            clock.advance(1.0 / 30.0)
+            _, _, terms = ctrl.compute_with_terms(
+                BallState(x_mm=1.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+            )
+        assert terms["rest_state"] == "active"
+        assert terms["rest_mode_active"] is False
+        # After calibration ends, rest can engage again.
+        ctrl.cancel_home_calibration()
+        for _ in range(60):
+            clock.advance(1.0 / 30.0)
+            _, _, terms = ctrl.compute_with_terms(
+                BallState(x_mm=1.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+            )
+        assert terms["rest_mode_active"] is True
+
+
 class TestDTermPins:
     """Pinned d-term semantics (control code unchanged by the rest work)."""
 

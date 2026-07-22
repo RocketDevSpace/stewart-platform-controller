@@ -27,11 +27,13 @@ class TestAlphaBetaQuiescence:
     def test_camera_noise_regime_yields_near_zero_velocity(self, seed: int) -> None:
         # Static point + seeded uniform +/-0.5 mm noise + a 0.75 mm step
         # every 10 frames (the jitter_bench quiescent regime), 300 frames.
-        # Several deterministic noise streams pin the quiescent velocity
-        # floor: std < 3 mm/s per axis, |v| never above 6 mm/s. (A rare
-        # worst-case noise+step alignment — e.g. seed 0 — can spike to
-        # ~7-8 mm/s with the committed gain schedule; std stays < 3 on
-        # every stream tried.)
+        # Thresholds reflect BETA_MIN = 0.25 (live tuning 2026-07-22): the
+        # quiet velocity gain was deliberately raised from 0.05 because its
+        # ~660 ms velocity lag turned the D-term into an EXCITER at the
+        # observed 0.77 Hz small-amplitude closed-loop oscillation. The
+        # noisier quiescent velocity (std < 8 vs < 3 mm/s) is the price of
+        # keeping real damping phase margin; the Schmitt quantizer + rest
+        # mode absorb it downstream (see jitter_bench).
         rng = random.Random(seed)
         f = AlphaBetaFilter2D()
         vxs: list[float] = []
@@ -47,9 +49,9 @@ class TestAlphaBetaQuiescence:
             vxs.append(vx)
             vys.append(vy)
             speeds.append(math.hypot(vx, vy))
-        assert statistics.pstdev(vxs) < 3.0
-        assert statistics.pstdev(vys) < 3.0
-        assert max(speeds) < 6.0
+        assert statistics.pstdev(vxs) < 8.0
+        assert statistics.pstdev(vys) < 8.0
+        assert max(speeds) < 18.0
 
 
 class TestAlphaBetaRamp:

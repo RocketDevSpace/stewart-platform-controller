@@ -118,11 +118,18 @@ class ServoDriver:
                     "[SAFETY CLIP] Servo %d: %s -> %s", idx, original, clipped
                 )
 
-        # Hybrid dispatch: firmware v2 gets tenth-degree T commands for
-        # ordinary (instant) moves; large jumps — and all v1/forced-legacy
-        # traffic — go via the legacy S path so the firmware ramp policy
-        # still applies.
-        ramp_needed = select_speed_delay(self._last_sent, clipped_angles) > 0
+        # Hybrid dispatch. The large-move firmware ramp applies ONLY to
+        # non-streaming sends (manual pose sends, routine starts): the
+        # vision loop's streaming commands are already rate-bounded by the
+        # PD slew limiter, and firmware-ramping them throttles emergency
+        # corrections to 200 deg/s while BLOCKING the firmware command
+        # loop mid-crisis (observed on the rig: hard flicks recovered
+        # noticeably worse than pre-ramp behavior). A save needs its full
+        # authority instantly.
+        ramp_needed = (
+            not streaming
+            and select_speed_delay(self._last_sent, clipped_angles) > 0
+        )
         use_tenth = self._use_tenth_protocol() and not ramp_needed
 
         if use_tenth:
@@ -145,7 +152,10 @@ class ServoDriver:
             cmd = self.format_command_tenth(quantized)
             speed_delay = 0
         else:
-            speed_delay = select_speed_delay(self._last_sent, target)
+            # Streaming sends are never firmware-ramped (see dispatch note).
+            speed_delay = (
+                0 if streaming else select_speed_delay(self._last_sent, target)
+            )
             cmd = self.format_command(target, speed_delay)
 
         if streaming:

@@ -112,19 +112,21 @@ class TestHysteresisBand:
     def test_band_radius_does_not_enter_from_active(self) -> None:
         clock = _FakeClock()
         gate = _make_gate(clock)
-        # 8 mm sits between enter (6) and exit (10): never enters.
+        # Mid-band radius (between enter and exit thresholds): never enters.
+        band_radius = (REST_ENTER_RADIUS_MM + REST_EXIT_RADIUS_MM) / 2.0
         for _ in range(20):
-            assert gate.update(8.0, 0.0) == "active"
+            assert gate.update(band_radius, 0.0) == "active"
             clock.advance(0.1)
 
     def test_band_radius_does_not_exit_from_resting(self) -> None:
         clock = _FakeClock()
         gate = _make_gate(clock)
         assert _drive_to_rest(gate, clock) == "resting"
-        # Ball drifts to 8 mm: still inside the exit radius -> keeps resting.
+        # Ball drifts into the hysteresis band: inside exit radius -> rests on.
+        band_radius = (REST_ENTER_RADIUS_MM + REST_EXIT_RADIUS_MM) / 2.0
         for _ in range(20):
             clock.advance(0.1)
-            assert gate.update(8.0, 0.0) == "resting"
+            assert gate.update(band_radius, 0.0) == "resting"
 
 
 class TestSameCallExit:
