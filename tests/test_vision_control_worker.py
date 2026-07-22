@@ -25,7 +25,7 @@ class TestControlSnapshot:
             servo_angles=[],
             ik_success=False,
             timings_ms={},
-            ik_result={},
+            ik_result=None,
             control_terms={},
             tracking_valid=False,
         )
@@ -48,7 +48,7 @@ class TestControlSnapshot:
             servo_angles=[90, 90, 90, 90, 90, 90],
             ik_success=True,
             timings_ms={"ball_update": 3.1, "total": 5.0},
-            ik_result={"success": True},
+            ik_result=None,
             control_terms={"kp": 0.045, "kd": 0.022},
             tracking_valid=True,
             reason="ok",
@@ -109,7 +109,7 @@ class TestBackpressure:
             servo_angles=[],
             ik_success=False,
             timings_ms={},
-            ik_result={},
+            ik_result=None,
             control_terms={},
             tracking_valid=False,
         )
@@ -138,7 +138,7 @@ class TestBackpressure:
             servo_angles=[],
             ik_success=False,
             timings_ms={},
-            ik_result={},
+            ik_result=None,
             control_terms={},
             tracking_valid=False,
         )

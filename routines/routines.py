@@ -136,6 +136,8 @@ def generate_parabola_plane_dance(
         return z_top - z_drop * (pos / max_xy) ** 2
 
     def sweep_plane(plane: str = "xz") -> None:
+        if plane not in ("xz", "yz"):
+            raise ValueError(f"plane must be 'xz' or 'yz', got {plane!r}")
         # center → +edge → center → -edge → center
         segments = [
             (0, max_xy),
@@ -144,9 +146,10 @@ def generate_parabola_plane_dance(
             (-max_xy, 0),
         ]
 
+        n = max(2, steps_per_half)
         for start, end in segments:
-            for i in range(steps_per_half):
-                t = i / (steps_per_half - 1)
+            for i in range(n):
+                t = i / (n - 1)
                 pos = start + (end - start) * t
                 z = parabola_z(pos)
 
@@ -155,8 +158,7 @@ def generate_parabola_plane_dance(
                     y = 0.0
                     pitch = -max_tilt_deg * (pos / max_xy)
                     roll = 0.0
-
-                elif plane == "yz":
+                else:  # "yz" — validated above
                     x = 0.0
                     y = pos
                     roll = max_tilt_deg * (pos / max_xy)
@@ -206,11 +208,12 @@ def generate_screw_motion(
         t_smooth = (1 - math.cos(math.pi * t)) / 2
         return a + (b - a) * t_smooth
 
+    n = max(2, steps_per_half)
     for _ in range(cycles):
 
         # Up phase
-        for i in range(steps_per_half):
-            t = i / (steps_per_half - 1)
+        for i in range(n):
+            t = i / (n - 1)
 
             z = smooth_interp(z_min, z_max, t)
             yaw = smooth_interp(yaw_min, yaw_max, t)
@@ -225,8 +228,8 @@ def generate_screw_motion(
             })
 
         # Down phase
-        for i in range(steps_per_half):
-            t = i / (steps_per_half - 1)
+        for i in range(n):
+            t = i / (n - 1)
 
             z = smooth_interp(z_max, z_min, t)
             yaw = smooth_interp(yaw_max, yaw_min, t)
@@ -243,10 +246,12 @@ def generate_screw_motion(
     return routine
 
 
+# Labels state the actual motion envelope (they populate the GUI dropdown,
+# where "r=8" vs the real r=20 is a workspace-limit question).
 ROUTINES: dict[str, Callable[[], list[dict[str, float]]]] = {
-    "Cube Vertices (32x32x32)": cube_routine_smooth,
-    "XY Circle (r=8)": xy_circle,
-    "Cone Tracing": generate_cone_orbit_routine,
+    "Cube Vertices (28x28x28)": cube_routine_smooth,
+    "XY Circle (r=20)": xy_circle,
+    "Cone Tracing (r=8, tilt 15)": generate_cone_orbit_routine,
     "Parabola Dance": generate_parabola_plane_dance,
-    "Screw": generate_screw_motion,
+    "Screw (z -12..8, yaw +/-35)": generate_screw_motion,
 }

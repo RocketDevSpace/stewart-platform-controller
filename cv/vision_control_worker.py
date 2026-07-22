@@ -17,11 +17,12 @@ from typing import Callable
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
 from PyQt5 import QtCore
 
 from control.ball_controller import BallController
 from core.ik_engine import IKEngine
-from core.platform_state import BallState, Pose
+from core.platform_state import BallState, IKResult, Pose
 from cv.ball_tracker import BallTracker
 from settings import (
     AUTO_TRIM_ENABLED,
@@ -40,6 +41,7 @@ from settings import (
     TRACKER_HSV_S_MIN,
     TRACKER_HSV_V_MAX,
     TRACKER_HSV_V_MIN,
+    TRACKER_REACQUIRE_VALID_FRAMES,
 )
 
 # tracker-internal keys we zero-fill (our BallTracker.update() returns BallState,
@@ -91,7 +93,7 @@ class ControlSnapshot:
     servo_angles: list
     ik_success: bool
     timings_ms: dict
-    ik_result: dict
+    ik_result: IKResult | None
     control_terms: dict
     tracking_valid: bool
     reason: str = ""
@@ -157,10 +159,11 @@ class VisionControlWorker(QtCore.QObject):
 
         self._miss_count = 0
         self._was_missing = False
+        self._valid_streak = 0
         self._snapshot_inflight = False
         self._last_snapshot_emit_perf = 0.0
 
-        self._prev_arm_points = None
+        self._prev_arm_points: np.ndarray | None = None
 
         self.ball_tracker: BallTracker | None = None
         self.ball_controller: BallController | None = None
@@ -217,6 +220,7 @@ class VisionControlWorker(QtCore.QObject):
         self._counter = 0
         self._miss_count = 0
         self._was_missing = False
+        self._valid_streak = 0
         self._snapshot_inflight = False
         self._last_snapshot_emit_perf = 0.0
         self._prev_arm_points = None
@@ -362,6 +366,7 @@ class VisionControlWorker(QtCore.QObject):
             if ball_state is None:
                 self._miss_count += 1
                 self._was_missing = True
+                self._valid_streak = 0
 
                 timings_ms = self._build_miss_timings(t0, t1, loop_start, latest_ts)
                 snapshot = ControlSnapshot(
@@ -375,7 +380,7 @@ class VisionControlWorker(QtCore.QObject):
                     servo_angles=[],
                     ik_success=False,
                     timings_ms=timings_ms,
-                    ik_result={},
+                    ik_result=None,
                     control_terms=_EMPTY_CONTROL_TERMS,
                     tracking_valid=False,
                     reason="no_ball_detected",
@@ -395,7 +400,9 @@ class VisionControlWorker(QtCore.QObject):
             if self._was_missing:
                 self.ball_controller.reset_motion_state()
                 self._was_missing = False
+                self._valid_streak = 0
             self._miss_count = 0
+            self._valid_streak += 1
 
             t2 = time.perf_counter()
             roll_deg, pitch_deg, control_terms = (
@@ -415,14 +422,21 @@ class VisionControlWorker(QtCore.QObject):
             t4 = time.perf_counter()
 
             servo_angles: list[float] = []
-            if ik_result.get("success", False):
-                self._prev_arm_points = ik_result.get("arm_points")
+            if ik_result.success:
+                self._prev_arm_points = ik_result.arm_points
                 # No inline clamping: the ServoDriver send path applies the
                 # single safety clip in core/safety.py.
-                servo_angles = [float(a) for a in ik_result["servo_angles_deg"]]
+                servo_angles = [float(a) for a in ik_result.servo_angles_deg]
+
+            # Reacquire gating lives HERE, on the command path, counting
+            # real processed frames — a single spurious detection after
+            # ball loss must not drive the servos. (It used to live in the
+            # GUI snapshot handler, which runs AFTER the send and sees only
+            # subsampled snapshots: it gated nothing.)
+            send_gated = self._valid_streak < TRACKER_REACQUIRE_VALID_FRAMES
 
             t_cmd0 = time.perf_counter()
-            if servo_angles and self._command_sender is not None:
+            if servo_angles and not send_gated and self._command_sender is not None:
                 try:
                     self._command_sender(servo_angles)
                 except Exception as exc:
@@ -447,12 +461,12 @@ class VisionControlWorker(QtCore.QObject):
                 ball_state=ball_state,
                 pose=pose,
                 servo_angles=servo_angles,
-                ik_success=ik_result.get("success", False),
+                ik_success=ik_result.success,
                 timings_ms=timings_ms,
                 ik_result=ik_result,
                 control_terms=control_terms,
                 tracking_valid=True,
-                reason="ok",
+                reason="reacquire_gating" if send_gated else "ok",
                 miss_count=0,
                 camera_bgr=getattr(self.ball_tracker, "_last_camera_bgr", None),
                 warped_bgr=getattr(self.ball_tracker, "_last_warped_bgr", None),

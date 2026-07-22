@@ -5,9 +5,13 @@ from typing import Any
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
+import logging
+
 from config import SERVO_SHAFTS, SERVO_AXES, PLATFORM_SIZE
 from core.ik_engine import IKEngine
-from core.platform_state import Pose
+from core.platform_state import IKResult, Pose
+
+logger = logging.getLogger(__name__)
 
 
 class StewartVisualizer:
@@ -21,16 +25,12 @@ class StewartVisualizer:
         self.ax.set_box_aspect([1, 1, 0.8])
         self._apply_dark_style()
 
-        self.platform_pos = {'x': 0, 'y': 0, 'z': 130, 'roll': 0, 'pitch': 0, 'yaw': 0}
-
     def update_platform(
         self,
         pos_dict: dict,
-        ik_result: dict | None = None,
+        ik_result: IKResult | None = None,
     ) -> None:
-        self.platform_pos = pos_dict
-
-        if ik_result is not None and ik_result.get("success"):
+        if ik_result is not None and ik_result.success:
             solution = ik_result
         else:
             pose = Pose(
@@ -56,11 +56,11 @@ class StewartVisualizer:
             line = np.array([p - axis * 10, p + axis * 10])
             self.ax.plot(line[:, 0], line[:, 1], line[:, 2], c='r')
 
-        if solution['success']:
-            platform_points = solution["platform_points"]
-            arm_points = solution["arm_points"]
+        if solution.success:
+            platform_points = solution.platform_points
+            arm_points = solution.arm_points
 
-            self.draw_square_platform(solution["platform_center"], solution["platform_R"])
+            self.draw_square_platform(solution.platform_center, solution.platform_R)
 
             self.ax.scatter(
                 platform_points[:, 0], platform_points[:, 1], platform_points[:, 2],
@@ -81,7 +81,7 @@ class StewartVisualizer:
 
             self.prev_arm_points = arm_points.copy()
         else:
-            print("FAILED IK:", solution["debug"]["failures"])
+            logger.warning("IK failed in visualizer: %s", solution.servo_status)
 
         self.ax.set_xlim(-120, 120)
         self.ax.set_ylim(-120, 120)

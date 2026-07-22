@@ -130,6 +130,7 @@ AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 # Loop rates
 # =============================================================================
 CONTROL_LOOP_INTERVAL_MS = 20
+ROUTINE_RETURN_HOME_S = 1.0             # ease-back-to-neutral duration after routines
 VISION_LOOP_HZ = 120
 VISUALIZER_HZ = 25
 GUI_SNAPSHOT_HZ = 30

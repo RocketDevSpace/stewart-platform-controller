@@ -115,3 +115,8 @@ SERVO_SIGN = np.array([+1, -1, +1, -1, +1, -1], dtype=float)
 # DEFAULT SERVO NEUTRAL ANGLES
 # =========================
 SERVO_NEUTRAL_DEG = 90.0
+
+# Math-frame angle (deg) at which each servo arm is physically horizontal.
+# Alternates with the mirrored mounting: even indices 0, odd indices 180.
+# Physical geometry, so it lives here — the IK solver consumes it.
+SERVO_MATH_HORIZONTAL = np.array([0, 180, 0, 180, 0, 180], dtype=float)

@@ -18,6 +18,7 @@ import pathlib
 import time
 from collections import deque
 
+import numpy as np
 from PyQt5 import QtCore, QtGui
 from PyQt5.QtWidgets import (
     QHBoxLayout,
@@ -54,7 +55,6 @@ from settings import (
     SERIAL_BAUD,
     SERIAL_PORT,
     TIMING_PLOT_POINTS,
-    TRACKER_REACQUIRE_VALID_FRAMES,
     VISION_LOOP_HZ,
     VISUALIZER_HZ,
 )
@@ -171,7 +171,6 @@ class MainWindow(QWidget):
         self._vision_enabled = False
         self._vision_starting = False
         self._vision_counter = 0
-        self._valid_streak = 0
         self._vision_z_setpoint = 0.0
         self._last_visualizer_update = 0.0
         self._last_neutral_send = 0.0
@@ -280,6 +279,12 @@ class MainWindow(QWidget):
         still_going = self.routine_runner.tick()
         if not still_going and not self.routine_runner.is_running:
             self._routine_timer.stop()
+            if self.routine_runner.ik_failure_count:
+                self.control_panel.append_preview(
+                    f"[WARN] Routine skipped "
+                    f"{self.routine_runner.ik_failure_count} steps "
+                    "(IK failures) — platform held previous pose there."
+                )
             # Never re-enable manual controls that vision mode has locked.
             if not self._vision_enabled:
                 self.control_panel.set_sliders_enabled(True)
@@ -300,8 +305,8 @@ class MainWindow(QWidget):
             Pose(**{k: float(v) for k, v in current.items()}),
             self.visualizer.prev_arm_points,
         )
-        if seed.get("success"):
-            self.visualizer.prev_arm_points = seed.get("arm_points")
+        if seed.success:
+            self.visualizer.prev_arm_points = np.asarray(seed.arm_points)
 
         if not self.routine_runner.load(name):
             self.control_panel.append_preview("[ERROR] Routine not found.")
@@ -317,8 +322,16 @@ class MainWindow(QWidget):
 
     def _on_routine_cancelled(self) -> None:
         if self.routine_runner.is_running:
-            self.control_panel.append_preview("[INFO] Routine preview cancelled.")
-        self.routine_runner.cancel()
+            self.control_panel.append_preview("[INFO] Routine cancelled.")
+        winding_down = self.routine_runner.cancel()
+        if winding_down:
+            # Send-mode cancel: the runner is easing the platform back to
+            # neutral; keep the timer ticking until it lands (the
+            # end-of-routine branch in _routine_tick restores the UI).
+            self.control_panel.append_preview(
+                "[INFO] Returning platform to neutral..."
+            )
+            return
         self._routine_timer.stop()
         if not self._vision_enabled:
             self.control_panel.set_sliders_enabled(True)
@@ -364,11 +377,13 @@ class MainWindow(QWidget):
             f"[PROFILE] IK solve time = {ik_ms:.2f} ms"
         )
 
-        if not ik_result.get("success"):
-            self.control_panel.append_preview("[WARN] IK solver failed.")
+        if not ik_result.success:
+            self.control_panel.append_preview(
+                f"[WARN] IK solver failed: {ik_result.servo_status}"
+            )
             return
 
-        angles = list(ik_result["servo_angles_deg"])
+        angles = list(ik_result.servo_angles_deg)
         cmd_preview = self._servo.format_command(angles).strip()
 
         if not self.control_panel.confirm(
@@ -389,7 +404,7 @@ class MainWindow(QWidget):
             f"[PROFILE] Serial send time = {send_ms:.2f} ms"
         )
         self.visualizer.update_platform(pose_dict, ik_result=ik_result)
-        self.visualizer.prev_arm_points = ik_result.get("arm_points")
+        self.visualizer.prev_arm_points = np.asarray(ik_result.arm_points)
 
     def _on_raw_command_sent(self, cmd: str) -> None:
         if self._vision_enabled:
@@ -580,14 +595,17 @@ class MainWindow(QWidget):
         if self._vision_enabled or self._vision_starting:
             return
         # Mode mutual exclusion: exactly one command source may own the
-        # hardware. Cancel any running routine, then lock out every manual
-        # command path (sliders, routines, SEND, raw box).
+        # hardware. Stop any running routine IMMEDIATELY (no wind-down —
+        # the vision loop takes over the hardware right away), then lock
+        # out every manual command path (sliders, routines, SEND, raw box).
         if self.routine_runner.is_running:
-            self._on_routine_cancelled()
+            self.routine_runner.cancel(wind_down=False)
+            self._routine_timer.stop()
+            self.control_panel.set_cancel_enabled(False)
+            self.control_panel.reset_routine_selector()
         self._vision_enabled = True
         self._vision_starting = True
         self._vision_counter = 0
-        self._valid_streak = 0
         self._last_visualizer_update = 0.0
         for k in _TIMING_KEYS:
             self._timing_history[k].clear()
@@ -790,7 +808,6 @@ class MainWindow(QWidget):
             self._update_camera_views(snapshot)
 
             if not snapshot.tracking_valid:
-                self._valid_streak = 0
                 now = time.perf_counter()
                 miss = snapshot.miss_count
                 if miss >= 20 and (now - self._last_neutral_send) > 0.5:
@@ -804,12 +821,13 @@ class MainWindow(QWidget):
                     )
                 return
 
-            self._valid_streak += 1
-            if self._valid_streak < TRACKER_REACQUIRE_VALID_FRAMES:
+            # Reacquire gating is enforced in the WORKER's command path
+            # (before any servo send); the snapshot reason is display-only.
+            if snapshot.reason == "reacquire_gating":
+                self._vision_counter += 1
                 if self._vision_counter % LOG_EVERY_N == 0:
                     self.control_panel.append_preview(
-                        f"[TRACK] reacquire gating "
-                        f"{self._valid_streak}/{TRACKER_REACQUIRE_VALID_FRAMES}"
+                        "[TRACK] reacquire gating (commands held)"
                     )
                 return
 
@@ -913,9 +931,9 @@ class MainWindow(QWidget):
         neutral = Pose(x=0.0, y=0.0, z=self._vision_z_setpoint,
                        roll=0.0, pitch=0.0, yaw=0.0)
         ik = self._ik.solve(neutral, None)
-        if ik.get("success"):
+        if ik.success:
             # Safety clamping happens inside send_angles (core/safety).
-            self._servo.send_angles(list(ik["servo_angles_deg"]))
+            self._servo.send_angles(list(ik.servo_angles_deg))
 
     # ------------------------------------------------------------------
     # Sync methods — push worker state back to GUI without feedback loops
