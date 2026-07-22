@@ -12,6 +12,10 @@ Rules under test:
 - Physics inversion produces correct kp/kd from step-response metrics
 - Autotune state machine advances from wait_settle to measuring after settling
 - Autotune session log goes to the injected path, opened fresh per session
+- Rest mode: resting output is exactly level + trim; auto-trim keeps
+  integrating during rest and the resting output follows it; a fast
+  disturbance regains near-full PD authority on the same call
+- D-term pins: no derivative kick on target steps; d-cap clamps
 """
 import math
 from pathlib import Path
@@ -22,6 +26,7 @@ from control.autotune import PDAutotuner, _PDLegEvaluator
 from control.ball_controller import BallController
 from control.setpoint import SetpointArbiter
 from core.platform_state import BallState
+from settings import PD_D_TERM_LIMIT_DEG
 
 
 class _FakeClock:
@@ -342,6 +347,186 @@ class TestAutotuneStateMachine:
             settle_hold_s=0.3, min_trial_s=0.1, timeout_s=10.0,
         )
         assert evaluator.first_crossing_elapsed_s == pytest.approx(1.0)
+
+
+class TestRestModeIntegration:
+    """Near-target rest mode wired through BallController (RestGate)."""
+
+    def _rest_controller(
+        self,
+        clock: _FakeClock,
+        kp: float = 0.045,
+        kd: float = 0.022,
+        roll_offset: float = 0.0,
+        pitch_offset: float = 0.0,
+        auto_trim_enabled: bool = False,
+        rest_mode_enabled: bool = True,
+    ) -> BallController:
+        return BallController(
+            kp=kp, kd=kd,
+            roll_offset=roll_offset, pitch_offset=pitch_offset,
+            auto_trim_enabled=auto_trim_enabled,
+            rest_mode_enabled=rest_mode_enabled,
+            clock=clock,
+        )
+
+    def test_rest_terms_keys_present(self) -> None:
+        clock = _FakeClock()
+        ctrl = self._rest_controller(clock)
+        _, _, terms = ctrl.compute_with_terms(_state(x=5.0))
+        for key in (
+            "rest_state", "rest_mode_active", "rest_radius_mm",
+            "rest_speed_lpf_mm_s", "rest_hold_elapsed_s",
+        ):
+            assert key in terms, f"missing terms key {key!r}"
+        assert terms["rest_state"] in ("active", "holding", "resting")
+        assert terms["rest_radius_mm"] == pytest.approx(5.0)
+
+    def test_resting_output_is_exactly_trim_offsets(self) -> None:
+        clock = _FakeClock(100.0)
+        ctrl = self._rest_controller(
+            clock, roll_offset=0.5, pitch_offset=-0.5)
+        state = _state(x=3.0)  # 3 mm off target: inside the enter radius
+
+        # Active PD: output carries the P contribution on top of the trim.
+        _, pitch, terms = ctrl.compute_with_terms(state)
+        assert terms["rest_state"] == "holding"
+        assert pitch == pytest.approx(0.045 * (-3.0) - 0.5)
+
+        # Dwell past the hold; slew (300 deg/s * 0.1 s = 30 deg/step) has
+        # long since settled the tiny hop to level + trim.
+        for _ in range(10):
+            clock.advance(0.1)
+            roll, pitch, terms = ctrl.compute_with_terms(state)
+        assert terms["rest_state"] == "resting"
+        assert terms["rest_mode_active"] is True
+        assert roll == pytest.approx(0.5)
+        assert pitch == pytest.approx(-0.5)
+        assert terms["roll_cmd"] == pytest.approx(0.5)
+        assert terms["pitch_cmd"] == pytest.approx(-0.5)
+
+    def test_auto_trim_keeps_integrating_during_rest_and_moves_output(self) -> None:
+        # Composition under test (deliberately no auto_trim.py changes):
+        # rest gates (6 mm / 12 mm/s) are strictly inside auto-trim's
+        # settle gates (35 mm / 25 mm/s), so a resting ball still feeds the
+        # trim integrator, and because the resting command IS the live trim
+        # offsets, every trim step keeps moving the platform.
+        clock = _FakeClock(50.0)
+        ctrl = self._rest_controller(clock, kd=0.0, auto_trim_enabled=True)
+        ctrl.set_target(0.0, 0.0)
+        state = _state(x=5.0)  # settled 5 mm off target, zero velocity
+
+        # 3 s: target hold (0.6 s) + settle hold (0.6 s) pass; rest enters
+        # after its own 0.5 s hold. Both are active together afterwards.
+        for _ in range(30):
+            clock.advance(0.1)
+            _, pitch, terms = ctrl.compute_with_terms(state)
+        assert terms["rest_mode_active"] is True
+        assert terms["auto_trim_state"] == "updating"
+        assert terms["trim_updates"] >= 1
+        assert terms["pitch_offset"] < 0.0
+        # Resting output follows the live trim offsets exactly.
+        assert pitch == pytest.approx(terms["pitch_offset"])
+        pitch_before = float(terms["pitch_offset"])
+
+        # Keep resting: the trim keeps walking and the output walks with it.
+        for _ in range(20):
+            clock.advance(0.1)
+            _, pitch, terms = ctrl.compute_with_terms(state)
+        assert terms["rest_mode_active"] is True
+        assert terms["pitch_offset"] < pitch_before
+        assert pitch == pytest.approx(terms["pitch_offset"])
+
+    def test_fast_disturbance_gets_full_pd_response_same_call(self) -> None:
+        # END-TO-END: a resting controller hit by a fast disturbance must
+        # answer on that same call with >= 85% of the command an identical
+        # never-resting controller produces for the same input history.
+        def drive(rest_mode_enabled: bool) -> tuple[float, float, dict]:
+            clock = _FakeClock(10.0)
+            ctrl = self._rest_controller(
+                clock, rest_mode_enabled=rest_mode_enabled)
+            terms: dict = {}
+            for _ in range(10):
+                _, _, terms = ctrl.compute_with_terms(_state())
+                clock.advance(0.1)
+            if rest_mode_enabled:
+                assert terms["rest_mode_active"] is True  # was resting
+            # One disturbance frame: radius 15 mm, speed 200 mm/s.
+            roll, pitch, terms = ctrl.compute_with_terms(
+                _state(x=15.0, vx=200.0))
+            return roll, pitch, terms
+
+        roll_r, pitch_r, terms_r = drive(rest_mode_enabled=True)
+        roll_n, pitch_n, terms_n = drive(rest_mode_enabled=False)
+
+        # Rest exits on the SAME call: full PD is computed this cycle.
+        assert terms_r["rest_state"] == "active"
+        assert terms_r["rest_mode_active"] is False
+        assert pitch_n < 0.0  # sanity: disturbance demands a real command
+        assert pitch_r * pitch_n > 0.0  # same direction
+        assert abs(pitch_r) >= 0.85 * abs(pitch_n)
+
+    def test_set_target_resets_rest(self) -> None:
+        clock = _FakeClock()
+        ctrl = self._rest_controller(clock)
+        for _ in range(10):
+            _, _, terms = ctrl.compute_with_terms(_state())
+            clock.advance(0.1)
+        assert terms["rest_mode_active"] is True
+
+        ctrl.set_target(0.0, 0.0)  # same coordinates — still a reset event
+        _, _, terms = ctrl.compute_with_terms(_state())
+        assert terms["rest_state"] != "resting"
+
+    def test_reset_motion_state_resets_rest(self) -> None:
+        clock = _FakeClock()
+        ctrl = self._rest_controller(clock)
+        for _ in range(10):
+            _, _, terms = ctrl.compute_with_terms(_state())
+            clock.advance(0.1)
+        assert terms["rest_mode_active"] is True
+
+        ctrl.reset_motion_state()  # tracking loss / reacquire path
+        _, _, terms = ctrl.compute_with_terms(_state())
+        assert terms["rest_state"] != "resting"
+
+    def test_rest_mode_disabled_never_rests(self) -> None:
+        clock = _FakeClock()
+        ctrl = self._rest_controller(clock, rest_mode_enabled=False)
+        for _ in range(30):
+            _, _, terms = ctrl.compute_with_terms(_state())
+            clock.advance(0.1)
+        assert terms["rest_state"] == "active"
+        assert terms["rest_mode_active"] is False
+
+
+class TestDTermPins:
+    """Pinned d-term semantics (control code unchanged by the rest work)."""
+
+    def test_target_step_does_not_kick_d_term(self) -> None:
+        # D acts on measured ball velocity, not on the error derivative:
+        # stepping the target must not change the d-term at all.
+        clock = _FakeClock()
+        ctrl = BallController(
+            kp=0.05, kd=0.02, rest_mode_enabled=False, clock=clock)
+        _, _, before = ctrl.compute_with_terms(_state(x=10.0, vx=40.0))
+
+        clock.advance(0.02)
+        ctrl.set_target(30.0, 0.0)  # 30 mm target step
+        _, _, after = ctrl.compute_with_terms(_state(x=10.0, vx=40.0))
+
+        assert after["d_term"] == pytest.approx(before["d_term"])
+        assert after["d_term"] == pytest.approx((0.02 * -40.0, 0.0))
+        # ...while the P term did see the step (the error jumped).
+        assert after["p_term"] != pytest.approx(before["p_term"])
+
+    def test_d_term_cap_clamps_extreme_velocity(self) -> None:
+        ctrl = BallController(
+            kp=0.0, kd=1.0, rest_mode_enabled=False, clock=_FakeClock())
+        _, _, terms = ctrl.compute_with_terms(
+            _state(vx=10000.0, vy=-10000.0))
+        assert terms["d_term"] == pytest.approx(
+            (-PD_D_TERM_LIMIT_DEG, PD_D_TERM_LIMIT_DEG))
 
 
 class TestAutotuneSessionLog:

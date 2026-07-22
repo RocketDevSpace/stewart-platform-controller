@@ -81,6 +81,14 @@ TERMS_KEYS = frozenset({
     "auto_trim_gate_reason",
     "home_calibration_active",
     "home_calibration_elapsed_s",
+    # Near-target rest mode (perf pass, 2026-07-22): keys ADDED to the
+    # frozen contract — additions are allowed (the GUI ignores unknown
+    # keys); removals/renames of anything above remain forbidden.
+    "rest_state",
+    "rest_mode_active",
+    "rest_radius_mm",
+    "rest_speed_lpf_mm_s",
+    "rest_hold_elapsed_s",
     "kp",
     "kd",
     "pd_autotune_enabled",

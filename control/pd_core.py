@@ -66,8 +66,19 @@ class PDCore:
         vy: float,
         roll_offset: float,
         pitch_offset: float,
+        slew_target_override: tuple[float, float] | None = None,
     ) -> PDResult:
-        """One PD step from error vector (ex, ey) and ball velocity."""
+        """One PD step from error vector (ex, ey) and ball velocity.
+
+        slew_target_override, when given, replaces the clamped PD command
+        as the SLEW LIMITER's target (roll, pitch) for this step (rest
+        mode parks the platform at level + trim through this path). The
+        full PD pipeline still runs — every intermediate term is computed
+        and reported — and the shared prev-command slew state advances
+        toward the override instead, so the transition is rate-limited
+        and a later normal step resumes continuously from the true last
+        command.
+        """
         p_x = self.kp * ex
         p_y = self.kp * ey
         d_x = self.kd * (-vx)
@@ -86,8 +97,18 @@ class PDCore:
         roll_clamped = _clamp(roll_raw, -self.max_tilt_deg, self.max_tilt_deg)
         pitch_clamped = _clamp(pitch_raw, -self.max_tilt_deg, self.max_tilt_deg)
 
-        # Slew limit (FG-11)
-        roll_cmd, pitch_cmd = self._apply_slew_limit(roll_clamped, pitch_clamped)
+        # Slew limit (FG-11) — target is the clamped PD command, or the
+        # caller's override (tilt-clamped too: nothing bypasses max_tilt).
+        if slew_target_override is None:
+            slew_roll, slew_pitch = roll_clamped, pitch_clamped
+        else:
+            slew_roll = _clamp(
+                slew_target_override[0], -self.max_tilt_deg, self.max_tilt_deg
+            )
+            slew_pitch = _clamp(
+                slew_target_override[1], -self.max_tilt_deg, self.max_tilt_deg
+            )
+        roll_cmd, pitch_cmd = self._apply_slew_limit(slew_roll, slew_pitch)
 
         return PDResult(
             p_term=(p_x, p_y),

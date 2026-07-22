@@ -25,7 +25,9 @@ class TestJitterBenchSmoke:
             seq = report[seq_key]
             assert isinstance(seq, list) and len(seq) == 6
             assert all(math.isfinite(float(v)) for v in seq)
-        assert report["rest_duty"] is None  # rest mode not implemented yet
+        rest_duty = report["rest_duty_frac"]
+        assert isinstance(rest_duty, float)
+        assert 0.0 <= rest_duty <= 1.0
 
     def test_profiles_are_deterministic(self) -> None:
         a = build_profile("quiescent", frames=60, fps=30.0, seed=42)

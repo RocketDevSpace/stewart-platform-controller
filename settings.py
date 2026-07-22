@@ -137,6 +137,23 @@ BALL_TARGET_DEFAULT_X_MM = 0.0
 BALL_TARGET_DEFAULT_Y_MM = 0.0
 
 # =============================================================================
+# Near-target rest mode (control/rest_gate.py)
+# =============================================================================
+# When the ball has sat within REST_ENTER_RADIUS_MM with low-passed speed
+# under REST_ENTER_SPEED_MM_S continuously for REST_ENTER_HOLD_S, the
+# controller rests: it commands level + trim offsets instead of chasing PD
+# noise (the sends dedup away and the servos go quiet). Exit is hysteretic
+# and INSTANT — raw radius or raw instantaneous speed past the wider exit
+# thresholds restores full PD on the same control cycle.
+REST_MODE_ENABLED = True
+REST_ENTER_RADIUS_MM = 6.0              # enter: raw radius at/under this
+REST_EXIT_RADIUS_MM = 10.0              # exit: raw radius above this (same cycle)
+REST_ENTER_SPEED_MM_S = 12.0            # enter: LPF speed at/under this
+REST_EXIT_SPEED_MM_S = 25.0             # exit: raw speed above this (same cycle)
+REST_ENTER_HOLD_S = 0.5                 # entry conditions must hold this long
+REST_SPEED_LPF_ALPHA = 0.6              # RestGate's own speed EMA (weight on prev)
+
+# =============================================================================
 # Manual trim / Auto-trim
 # =============================================================================
 MANUAL_ROLL_TRIM_DEG = float(_OV.get("MANUAL_ROLL_TRIM_DEG", 0.0))

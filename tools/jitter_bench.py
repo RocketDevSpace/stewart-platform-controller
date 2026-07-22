@@ -206,6 +206,7 @@ def run_bench(
     valid_frames = 0
     ik_failures = 0
     d_sat_frames = 0
+    rest_frames = 0
     d_cap = None if PD_D_TERM_LIMIT_DEG is None else float(PD_D_TERM_LIMIT_DEG)
 
     for t, x_raw, y_raw in samples:
@@ -223,6 +224,8 @@ def run_bench(
         if d_cap is not None and d_cap > 0:
             if abs(d_x) >= d_cap - 1e-9 or abs(d_y) >= d_cap - 1e-9:
                 d_sat_frames += 1
+        if terms.get("rest_mode_active", False):
+            rest_frames += 1
 
         result = ik.solve(
             Pose(x=0.0, y=0.0, z=0.0, roll=roll_deg, pitch=pitch_deg, yaw=0.0),
@@ -282,9 +285,11 @@ def run_bench(
         "d_term_saturation_frac": round(
             (d_sat_frames / valid_frames) if valid_frames else 0.0, 4
         ),
-        # Rest mode does not exist yet; placeholder so A/B reports keep a
-        # stable shape once the RestGate lands.
-        "rest_duty": None,
+        # Fraction of controller frames spent in near-target rest mode
+        # (terms["rest_mode_active"]; 0.0 when the key is absent).
+        "rest_duty_frac": round(
+            (rest_frames / valid_frames) if valid_frames else 0.0, 4
+        ),
     }
 
 
@@ -306,8 +311,6 @@ def format_report(report: dict[str, object]) -> str:
     for key, value in report.items():
         if key == "profile":
             continue
-        if value is None:
-            value = "n/a (rest mode not implemented)"
         lines.append(f"  {key:<26} {value}")
     return "\n".join(lines)
 
