@@ -137,6 +137,9 @@ class BallTracker:
             dtype=np.uint8,
         )
 
+        # --- Reusable software-gain output buffer (perf pass) ---
+        self._gain_buf: np.ndarray | None = None
+
         # --- Debug views (read via debug_views()) ---
         self._last_camera_bgr: np.ndarray | None = None
         self._last_warped_bgr: np.ndarray | None = None
@@ -203,6 +206,7 @@ class BallTracker:
         frame_bgr: np.ndarray,
         frame_ts: float,
         brightness_gain: float = 1.0,
+        pre_flipped: bool = False,
     ) -> BallState | None:
         """Run the full detection pipeline on one frame.
 
@@ -210,12 +214,32 @@ class BallTracker:
         velocity dt. Returns None when no ball (or no marker geometry) is
         found; velocity and position-filter state reset on loss so a
         reacquired ball never blends toward its stale pre-loss position.
+
+        pre_flipped=True skips the internal mirror flip (the caller already
+        delivered a flipped frame, e.g. via CameraSource.read_latest_flipped).
+        NOTE: the tracker then keeps a REFERENCE to the caller's buffer in
+        _last_camera_bgr — callers reusing frame buffers must keep that
+        buffer intact until they have copied the debug views (the vision
+        worker double-buffers per tick and copies at snapshot emission).
         """
         self._last_processed_ts = frame_ts
-        frame = cv2.flip(frame_bgr, 1)
+        frame = frame_bgr if pre_flipped else cv2.flip(frame_bgr, 1)
         if brightness_gain > 1.02:
             try:
-                frame = cv2.convertScaleAbs(frame, alpha=float(brightness_gain), beta=0)
+                # Preallocated dst: convertScaleAbs runs every frame while
+                # software gain is active — avoid a fresh allocation each
+                # tick (buffer reallocated only on shape change).
+                if (
+                    self._gain_buf is None
+                    or self._gain_buf.shape != frame.shape
+                    or self._gain_buf.dtype != frame.dtype
+                ):
+                    self._gain_buf = np.empty_like(frame)
+                cv2.convertScaleAbs(
+                    frame, dst=self._gain_buf,
+                    alpha=float(brightness_gain), beta=0,
+                )
+                frame = self._gain_buf
             except Exception:
                 pass
         self._last_camera_bgr = frame

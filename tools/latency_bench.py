@@ -71,6 +71,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  max = {samples[-1]:.2f} ms   (EMA {manager.rtt_stats()[0]:.2f} ms)")
     print("NOTE: vision-stage latency (frame_to_cmd) is read from the GUI "
           "timing plot while vision mode runs - this bench covers serial only.")
+    print("NOTE: ik_solve measured 0.29 ms/call on the dev machine "
+          "(2026-07-22) - below the 1.0 ms vectorization gate; "
+          "kinematics left scalar.")
     return 0
 
 

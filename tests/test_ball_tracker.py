@@ -184,6 +184,31 @@ class TestStaleHomographyBound:
         assert state.x_mm == pytest.approx(10.0, abs=2.0)
 
 
+class TestPreFlipped:
+    def test_pre_flipped_matches_internal_flip(self) -> None:
+        # Handing in an already-mirrored frame with pre_flipped=True must
+        # give the same detection as the internal-flip path.
+        t1 = _tracker()
+        t2 = _tracker()
+        scene = _scene((25.0, 15.0))
+        s1 = t1.process(scene, frame_ts=1.0)
+        s2 = t2.process(cv2.flip(scene, 1), frame_ts=1.0, pre_flipped=True)
+        assert s1 is not None and s2 is not None
+        assert s2.x_mm == pytest.approx(s1.x_mm, abs=0.5)
+        assert s2.y_mm == pytest.approx(s1.y_mm, abs=0.5)
+
+    def test_gain_buffer_reused_across_frames(self) -> None:
+        # Software gain > 1.02 routes through the preallocated dst buffer;
+        # two frames must reuse the same member buffer (no per-frame alloc).
+        t = _tracker()
+        scene = _scene((0.0, 0.0))
+        t.process(scene, frame_ts=1.0, brightness_gain=1.5)
+        buf1 = t._gain_buf
+        t.process(scene.copy(), frame_ts=1.0 + 1 / 30, brightness_gain=1.5)
+        assert buf1 is not None
+        assert t._gain_buf is buf1
+
+
 class TestFindBallCenter:
     def test_small_blob_rejected(self) -> None:
         t = _tracker()

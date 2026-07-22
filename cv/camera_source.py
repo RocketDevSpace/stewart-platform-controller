@@ -102,6 +102,10 @@ class CameraSource:
         self._slow_capture_streak = 0
         self._capture_fail_streak = 0
 
+        # Invoked (on the capture thread) after every published frame —
+        # lets consumers process event-driven instead of polling.
+        self._frame_callback: Callable[[], None] | None = None
+
         # Runtime exposure policy state
         self._software_gain = 1.0
         self._policy_mode = "bootstrap_auto"
@@ -178,6 +182,35 @@ class CameraSource:
                 return None
             read_slot = 1 - self._buf_write_slot
             return self._frame_bufs[read_slot].copy(), self._latest_frame_ts
+
+    def read_latest_flipped(
+        self, dst: np.ndarray | None = None
+    ) -> tuple[np.ndarray, float] | None:
+        """Newest frame mirror-flipped into a reusable dst buffer, + its
+        capture timestamp, or None.
+
+        Merges the reader copy and the consumer's horizontal flip into ONE
+        pass (the flip itself is required — ArUco markers are chiral).
+        dst is (re)allocated when None or shape/dtype-mismatched, so the
+        caller can hold and re-pass the returned array to avoid a fresh
+        allocation per frame. Runs under the capture lock, same torn-read
+        guarantee as read_latest().
+        """
+        with self._capture_lock:
+            if not self._buf_ready:
+                return None
+            src = self._frame_bufs[1 - self._buf_write_slot]
+            if dst is None or dst.shape != src.shape or dst.dtype != src.dtype:
+                dst = np.empty_like(src)
+            cv2.flip(src, 1, dst=dst)
+            return dst, self._latest_frame_ts
+
+    def set_frame_callback(self, cb: Callable[[], None] | None) -> None:
+        """Register a callable invoked after EVERY published frame (or None
+        to clear). Runs on the CAPTURE thread, after the frame is visible
+        to readers — it must be cheap and thread-safe (e.g. emit a queued
+        Qt signal). Exceptions are caught and logged, never propagated."""
+        self._frame_callback = cb
 
     def stats(self) -> CaptureStats:
         with self._capture_lock:
@@ -470,6 +503,15 @@ class CameraSource:
             self._buf_write_slot ^= 1
             self._latest_frame_ts = now
             self._buf_ready = True
+        # Event-driven consumer notification: fired AFTER the lock is
+        # released (frame already visible to readers). A raising callback
+        # must never kill the capture loop.
+        cb = self._frame_callback
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                logger.exception("frame callback raised")
 
     def _capture_loop(self) -> None:
         while self._capture_running:

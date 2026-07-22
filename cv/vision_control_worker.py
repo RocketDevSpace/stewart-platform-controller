@@ -98,6 +98,12 @@ class VisionControlWorker(QtCore.QObject):
     error = QtCore.pyqtSignal(str)
     stopped = QtCore.pyqtSignal()
 
+    # Internal bridge: emitted from the CAPTURE thread by
+    # _on_frame_available; auto connection delivers it queued onto the
+    # worker thread, where _tick runs. The 120 Hz QTimer stays as a
+    # fallback heartbeat (the stale-frame skip dedups double ticks).
+    _frame_arrived = QtCore.pyqtSignal()
+
     def __init__(
         self,
         ik_solver: IKEngine,
@@ -155,6 +161,18 @@ class VisionControlWorker(QtCore.QObject):
         self._last_frame_ts = 0.0
         self._last_error_emit = 0.0
         self._last_neutral_send = 0.0
+
+        # Two reusable flipped-frame buffers, alternated per tick: the
+        # tracker stores a reference to the processed frame for its debug
+        # views, so the frame from tick N-1 must stay intact while tick N
+        # writes into the other buffer. Emitted snapshots additionally
+        # copy the debug views (see _copied_debug_views).
+        self._frame_buf: np.ndarray | None = None
+        self._frame_buf_alt: np.ndarray | None = None
+
+        # Event-driven tick: the camera's frame callback (capture thread)
+        # emits _frame_arrived, which lands here queued.
+        self._frame_arrived.connect(self._tick)
 
         self.camera: CameraSource | None = None
         self.ball_tracker: BallTracker | None = None
@@ -224,6 +242,12 @@ class VisionControlWorker(QtCore.QObject):
                 "gray": cam_stats.gray_mean,
             })
 
+        # Event-driven tick: every published frame nudges _tick via the
+        # queued _frame_arrived bridge (the QTimer below stays as the
+        # fallback heartbeat).
+        if self.camera is not None:
+            self.camera.set_frame_callback(self._on_frame_available)
+
         self._running = True
         self._counter = 0
         self._miss_count = 0
@@ -257,11 +281,17 @@ class VisionControlWorker(QtCore.QObject):
             self._timer.stop()
             self._timer.deleteLater()
             self._timer = None
-        try:
-            if self.camera is not None:
+        if self.camera is not None:
+            # Clear the frame callback BEFORE closing: no _frame_arrived
+            # emission may race the teardown from the capture thread.
+            try:
+                self.camera.set_frame_callback(None)
+            except Exception:
+                pass
+            try:
                 self.camera.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
         self.camera = None
         self.ball_tracker = None
         self.ball_controller = None
@@ -362,6 +392,15 @@ class VisionControlWorker(QtCore.QObject):
     # Inner loop
     # ------------------------------------------------------------------
 
+    def _on_frame_available(self) -> None:
+        """CameraSource frame callback — runs on the CAPTURE thread.
+
+        Must NOT touch worker state: it only emits the queued
+        _frame_arrived signal, which delivers _tick on the worker thread.
+        This closes the 0-8 ms polling gap between frame arrival and the
+        next QTimer tick."""
+        self._frame_arrived.emit()
+
     @QtCore.pyqtSlot()
     def _tick(self) -> None:
         if (
@@ -381,27 +420,45 @@ class VisionControlWorker(QtCore.QObject):
             if not self.camera.has_new_frame(self._last_frame_ts):
                 return
 
-            grabbed = self.camera.read_latest()
+            # Single-pass read+flip into a reusable buffer. The two
+            # buffers alternate per tick so the tracker's stored debug
+            # reference from the PREVIOUS tick stays intact while this
+            # tick overwrites the other buffer.
+            grabbed = self.camera.read_latest_flipped(self._frame_buf)
             if grabbed is None:
                 return
             frame, latest_ts = grabbed
+            self._frame_buf = self._frame_buf_alt
+            self._frame_buf_alt = frame
             self._last_frame_ts = latest_ts
 
             t0 = time.perf_counter()
             ball_state = self.ball_tracker.process(
                 frame, latest_ts,
                 brightness_gain=self.camera.stats().software_gain,
+                pre_flipped=True,
             )
             t1 = time.perf_counter()
 
             now_perf = time.perf_counter()
-            should_emit = (
-                self._last_snapshot_emit_perf <= 0.0
-                or (now_perf - self._last_snapshot_emit_perf)
-                >= (1.0 / float(self._snapshot_hz))
+            emit_now = (
+                not self._snapshot_inflight
+                and (
+                    self._last_snapshot_emit_perf <= 0.0
+                    or (now_perf - self._last_snapshot_emit_perf)
+                    >= (1.0 / float(self._snapshot_hz))
+                )
             )
 
-            cam_view, warped_view, mask_view = self.ball_tracker.debug_views()
+            # Debug views are COPIED, and only when a snapshot will
+            # actually be emitted (<= snapshot_hz): the tracker's stored
+            # views reference the worker's reusable frame buffers, which
+            # later ticks overwrite — an emitted snapshot must own its
+            # pixel data.
+            if emit_now:
+                cam_view, warped_view, mask_view = self._copied_debug_views()
+            else:
+                cam_view = warped_view = mask_view = None
 
             if ball_state is None:
                 self._miss_count += 1
@@ -435,7 +492,7 @@ class VisionControlWorker(QtCore.QObject):
                     mask_gray=mask_view,
                     worker_emit_perf_ts=time.perf_counter(),
                 )
-                if should_emit and not self._snapshot_inflight:
+                if emit_now:
                     self._snapshot_inflight = True
                     self._last_snapshot_emit_perf = now_perf
                     self.snapshot_ready.emit(snapshot)
@@ -519,7 +576,7 @@ class VisionControlWorker(QtCore.QObject):
                 mask_gray=mask_view,
                 worker_emit_perf_ts=time.perf_counter(),
             )
-            if should_emit and not self._snapshot_inflight:
+            if emit_now:
                 self._snapshot_inflight = True
                 self._last_snapshot_emit_perf = now_perf
                 self.snapshot_ready.emit(snapshot)
@@ -531,6 +588,28 @@ class VisionControlWorker(QtCore.QObject):
             if (now - self._last_error_emit) >= 1.0:
                 self._last_error_emit = now
                 self.error.emit(str(exc))
+
+    # ------------------------------------------------------------------
+    # Debug-view snapshotting
+    # ------------------------------------------------------------------
+
+    def _copied_debug_views(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        """Owned copies of the tracker's debug views (emission-time only).
+
+        The tracker stores REFERENCES to the frames it processed; with the
+        worker's reusable frame buffers those get overwritten on later
+        ticks, so a snapshot crossing to the GUI thread must copy. Called
+        at most snapshot_hz times per second."""
+        if self.ball_tracker is None:
+            return None, None, None
+        cam, warped, mask = self.ball_tracker.debug_views()
+        return (
+            None if cam is None else cam.copy(),
+            None if warped is None else warped.copy(),
+            None if mask is None else mask.copy(),
+        )
 
     # ------------------------------------------------------------------
     # Neutral-pose fallback

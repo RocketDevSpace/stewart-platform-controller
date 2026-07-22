@@ -32,6 +32,7 @@ class FakeCamera:
         self.ts = 0.0
         self.frame = np.zeros((4, 4, 3), dtype=np.uint8)
         self.closed = False
+        self.frame_callback: Any = None
 
     def advance(self) -> None:
         self.ts += 1.0 / 30.0
@@ -41,6 +42,21 @@ class FakeCamera:
 
     def read_latest(self) -> tuple[np.ndarray, float] | None:
         return self.frame.copy(), self.ts
+
+    def read_latest_flipped(
+        self, dst: np.ndarray | None = None
+    ) -> tuple[np.ndarray, float] | None:
+        if (
+            dst is None
+            or dst.shape != self.frame.shape
+            or dst.dtype != self.frame.dtype
+        ):
+            dst = np.empty_like(self.frame)
+        np.copyto(dst, self.frame[:, ::-1])   # horizontal flip
+        return dst, self.ts
+
+    def set_frame_callback(self, cb: Any) -> None:
+        self.frame_callback = cb
 
     def latest_frame_ts(self) -> float:
         return self.ts
@@ -65,7 +81,11 @@ class FakeTracker:
         self.hsv_upper = np.array([28, 255, 255], dtype=np.uint8)
 
     def process(
-        self, frame: np.ndarray, ts: float, brightness_gain: float = 1.0
+        self,
+        frame: np.ndarray,
+        ts: float,
+        brightness_gain: float = 1.0,
+        pre_flipped: bool = False,
     ) -> BallState | None:
         if self.results:
             return self.results.pop(0)
@@ -76,6 +96,28 @@ class FakeTracker:
 
     def set_hsv_thresholds(self, *args: int) -> None:
         pass
+
+
+class ViewFakeTracker(FakeTracker):
+    """FakeTracker that mimics the real tracker's debug-view behavior:
+    stores a REFERENCE to the processed frame (no copy)."""
+
+    def __init__(self, results: list[BallState | None]) -> None:
+        super().__init__(results)
+        self.last_frame: np.ndarray | None = None
+
+    def process(
+        self,
+        frame: np.ndarray,
+        ts: float,
+        brightness_gain: float = 1.0,
+        pre_flipped: bool = False,
+    ) -> BallState | None:
+        self.last_frame = frame
+        return super().process(frame, ts, brightness_gain, pre_flipped)
+
+    def debug_views(self) -> Any:
+        return self.last_frame, None, None
 
 
 class FakeController:
@@ -372,3 +414,85 @@ class TestStopClosesCamera:
         assert camera.closed is True
         assert worker.camera is None
         assert stopped == [True]
+
+
+class TestEventDrivenTick:
+    def test_frame_callback_emits_bridge_signal(self) -> None:
+        # _on_frame_available runs on the capture thread in production; it
+        # must only emit _frame_arrived. In-test (same thread) the auto
+        # connection delivers synchronously — spy with a connected list.
+        worker, camera, _ = _make_worker([])
+        fired: list[bool] = []
+        worker._frame_arrived.connect(lambda: fired.append(True))
+        worker._on_frame_available()
+        assert fired == [True]
+
+    def test_frame_callback_drives_tick(self) -> None:
+        # Same-thread emission delivers _frame_arrived -> _tick directly:
+        # the bridge alone (no QTimer) processes the new frame.
+        worker, camera, _ = _make_worker([_ball()])
+        camera.advance()
+        worker._on_frame_available()
+        assert worker._valid_streak == 1
+
+    def test_start_sets_and_stop_clears_camera_callback(self) -> None:
+        worker, camera, _ = _make_worker([])
+        worker._running = False           # allow start() to run
+        worker.start()
+        assert camera.frame_callback == worker._on_frame_available
+        worker.stop()
+        assert camera.frame_callback is None
+        assert camera.closed is True
+
+
+class TestCopyTrim:
+    def test_emitted_camera_view_is_a_copy(self) -> None:
+        # The tracker stores a REFERENCE to the worker's reusable frame
+        # buffer; the emitted snapshot must own its pixels — mutating the
+        # worker buffers after emission must not alter the snapshot.
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([])
+        worker.ball_tracker = ViewFakeTracker([_ball()])  # type: ignore[assignment]
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.frame[:] = 7
+        camera.advance()
+        worker._tick()
+        assert len(snaps) == 1
+        view = snaps[0].camera_bgr
+        assert isinstance(view, np.ndarray)
+        assert np.all(view == 7)
+        if worker._frame_buf is not None:
+            worker._frame_buf[:] = 250
+        if worker._frame_buf_alt is not None:
+            worker._frame_buf_alt[:] = 250
+        assert np.all(view == 7)          # snapshot unaffected
+
+    def test_frame_buffers_alternate(self) -> None:
+        # Two reusable buffers, alternated per tick: the tracker's stored
+        # reference from tick N-1 stays intact while tick N runs.
+        worker, camera, _ = _make_worker([_ball(), _ball(), _ball()])
+        camera.advance()
+        worker._tick()
+        b1 = worker._frame_buf_alt
+        camera.advance()
+        worker._tick()
+        b2 = worker._frame_buf_alt
+        camera.advance()
+        worker._tick()
+        b3 = worker._frame_buf_alt
+        assert b1 is not None and b2 is not None
+        assert b1 is not b2
+        assert b3 is b1                   # steady state: two buffers cycle
+
+    def test_tick_passes_pre_flipped_frame(self) -> None:
+        # The worker reads via read_latest_flipped and passes
+        # pre_flipped=True, so the tracker sees the flipped content.
+        worker, camera, _ = _make_worker([])
+        tracker = ViewFakeTracker([_ball()])
+        worker.ball_tracker = tracker  # type: ignore[assignment]
+        camera.frame[:, 0] = 200          # asymmetric: first column bright
+        camera.advance()
+        worker._tick()
+        assert tracker.last_frame is not None
+        assert np.array_equal(tracker.last_frame, camera.frame[:, ::-1])
