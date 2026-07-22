@@ -13,7 +13,9 @@ PR: the 2026-07-20 firmware capture and the 2026-07-22 six-step overhaul
 (absorbs milestones M9–M12; driven by the five-agent full-repo review — see
 `docs/code-review-2026-07-22.md` for the finding-by-finding record).
 The 2026-07-22 performance pass (branch `perf/latency-jitter`, stacked on
-the overhaul) is recorded in its own subsection at the end of [Unreleased].
+the overhaul) and the path-following feature (branch `feat/path-following`,
+stacked on the perf pass) are recorded in their own subsections at the end
+of [Unreleased].
 
 ### Added
 - `firmware/` — captured Uno firmware (2026-07-20): byte-for-byte flash dump
@@ -182,6 +184,59 @@ Six measured steps stacked on the overhaul; every change gated by
 - D-term derivative kick on target steps pinned by tests: D acts on
   measured velocity, not the error derivative; cap still clamps at
   `PD_D_TERM_LIMIT_DEG` (step 4).
+
+### Path following (branch `feat/path-following`, 2026-07-22)
+
+The ball traces virtual patterns — circle, square, heart, star, arbitrary
+point lists — shown as overlays in the vision monitor. No physical lines,
+no camera line detection. Adaptive pacing: the moving target advances at
+the set speed only while the ball keeps up, so infeasible speeds degrade
+to slower laps, never to losing the ball.
+
+#### Added
+- `control/patterns.py` — frozen `Path` dataclass ((N,2) mm points,
+  uniform 2 mm arc-length resampling, 85 mm radial clamp) + generators
+  (circle r=65, diamond square d=140, heart ~65 mm, 5-point star r=70,
+  `from_points` for arbitrary shapes) and the `PATTERNS` label registry
+  (step 1).
+- `control/path_follower.py` — adaptive-pacing engine: `start()` only
+  arms; the first ball sighting seeds the arc position at the nearest
+  path point (never re-seeds); per-cycle advance tapers linearly from
+  full speed at ≤10 mm error to frozen at ≥20 mm (`stalled` is
+  telemetry-only — the law is continuous and auto-resumes); closed paths
+  wrap and count laps, open paths finish `done` and hold the endpoint
+  (step 2).
+- `BallController` integration (step 3): the follower drives the
+  SetpointArbiter **override channel** (autotune's channel — mutually
+  exclusive by contract) from inside `compute_with_terms`; streaming
+  `set_target` was rejected because its side effects would permanently
+  reset the rest gate and freeze auto-trim. `stop_path()` freezes the
+  active target in place bit-identically (no motion on stop). Auto-trim
+  deliberately frozen during a run (pursuit lag is not a level error);
+  rest mode force-suppressed while following, re-engaging when an open
+  path completes. Telemetry gains 8 additive `path_*` keys.
+- `tools/path_sim.py` + `tests/test_path_feasibility.py` (step 4):
+  closed-loop sim (point-mass plant, real AlphaBetaFilter2D +
+  BallController in the loop, pixel noise) pins the safety property —
+  tracking error saturates ~16 mm, inside the 20 mm capture radius, at
+  any commanded speed; the CLI speed sweep documents error vs speed.
+- GUI (steps 5–7): worker slots (`set_path_pattern` / `set_path_following`
+  / `set_path_speed`; following never auto-starts on a fresh session),
+  "Path Following" control-panel group (pattern combo, Follow Path
+  toggle, 10–80 mm/s speed slider, live status line), vision-monitor
+  teal path polyline + moving-carrot marker + progress text. Mutual
+  exclusion with autotune and home calibration wired both directions;
+  dragging the target stops the path.
+- `settings.py` path block: `PATH_SPEED_MM_S` 30 (≈2/3 of the analytic
+  ~35 mm/s stall ceiling at default gains), speed range 10–80, capture
+  radius 20 mm, full-speed radius 10 mm, max pattern radius 85 mm,
+  point spacing 2 mm.
+
+#### Fixed
+- Vision-monitor target crosshair now prefers the frame-accurate
+  `target_x_mm`/`target_y_mm` from control terms over the stale GUI
+  mirror args — moving path and autotune-leg targets render where the
+  controller actually aimed that frame (step 7).
 
 ---
 

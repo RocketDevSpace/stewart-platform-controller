@@ -304,6 +304,66 @@ degrades genuine fast response (all smoothing is speed/innovation-scheduled).
 
 ---
 
+### 2026-07-22 Path Following — Ball Traces Virtual Patterns
+**Status:** Implemented (branch `feat/path-following`, stacked on the
+performance pass); merge gated on the rig hardware session
+
+**What it does:** The ball follows virtual patterns — circle, square,
+heart, star, or arbitrary point lists — rendered as overlays in the
+vision monitor. The patterns are conceptual: no physical lines on the
+platform, no camera line detection.
+
+**Pacing contract (`control/path_follower.py`):**
+- Adaptive with a max speed: each cycle the moving target advances by
+  `speed · factor · dt` where `factor` tapers linearly from 1 at
+  ball-to-target error ≤ `PATH_FULL_SPEED_RADIUS_MM` (10 mm) to 0 at
+  ≥ `PATH_CAPTURE_RADIUS_MM` (20 mm). The taper law is continuous —
+  "stalled" is telemetry-only and auto-resumes. Consequence (pinned by
+  the `tools/path_sim.py` closed-loop feasibility tests): any commanded
+  speed degrades to slower laps, never to losing the ball.
+- `start()` only arms; the first valid ball sighting seeds the arc
+  position at the nearest path point and never re-seeds (no lobe
+  jumping on self-approaching shapes; nothing moves until the ball is
+  seen).
+- Closed paths wrap and count laps; open paths finish `done` and hold
+  the endpoint. Speed is live-adjustable 10–80 mm/s (default 30 —
+  ≈ 2/3 of the analytic ~35 mm/s stall ceiling at default gains).
+
+**Controller integration contract (`control/ball_controller.py`):**
+- The follower drives the SetpointArbiter **override channel**
+  (autotune's channel) from inside `compute_with_terms` — never
+  streaming `set_target`, whose side effects would reset the rest gate
+  and freeze auto-trim every cycle.
+- Mutual exclusion both directions: starting a path cancels home
+  calibration and autotune; enabling either stops the path. The GUI
+  mirrors the same exclusions (belt and braces).
+- `stop_path()` is motion-free: the active target freezes in place
+  bit-identically.
+- Auto-trim is deliberately frozen while following (pursuit lag is a
+  tracking error, not a level error — integrating it would corrupt
+  trim). Rest mode is force-suppressed while following and re-engages
+  when an open path completes.
+- Telemetry: 8 additive `path_*` keys in the control terms
+  (active/state/name/progress/lap/s_mm/error_mm/speed_mm_s).
+
+**Patterns (`control/patterns.py`):** frozen `Path` dataclass, uniform
+2 mm arc-length resampling, 85 mm radial clamp (inside the 84.85 mm
+marker-corner radius). Registry labels: Circle (r=65), Square (diamond,
+d=140 — rotated 45° so corners avoid marker dwell), Heart (~65 mm),
+Star (5pt, r=70 — inner corners are the stress test), plus
+`from_points` for arbitrary shapes.
+
+**Acceptance criteria:**
+- Unit/sim suite green (351 passed); flake8/mypy clean ✅
+- Sim safety property: max tracking error saturates ~16 mm < 20 mm
+  capture radius at any commanded speed (10/30/60 mm/s swept) ✅
+- Rig session (gates the PR): circle at 30 mm/s — full laps, no path
+  loss, overlay tracks; square corners; star inner corners visibly
+  slow-and-recover; Stop on an open path = no jump; target drag
+  cancels; autotune/path mutual exclusion via GUI — pending
+
+---
+
 ## Future Features (not scheduled)
 
 ### Multi-Camera Ball Tracking
