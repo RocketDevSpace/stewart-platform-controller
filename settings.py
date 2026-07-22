@@ -12,7 +12,10 @@ _OV = _settings_store.load_user_overrides()
 # Serial
 # =============================================================================
 SERIAL_PORT = str(_OV.get("SERIAL_PORT", "COM4"))
-SERIAL_BAUD = 115200
+# Firmware v2 runs 250000 baud (0% UART timer error at 16 MHz). connect()
+# automatically retries at the legacy 115200 when no boot banner appears
+# (v1 firmware), so this default is safe on either firmware.
+SERIAL_BAUD = 250000
 
 # =============================================================================
 # Safety limits
@@ -42,6 +45,13 @@ SERVO_LARGE_MOVE_SPEED_DELAY_MS = 5     # -> 200 deg/s hardware ramp on big move
 # no watchdog).
 SERVO_QUANT_HYST_DEG = 0.4
 SERVO_DEDUP_ENABLED = True
+# With firmware v2's tenth-degree T protocol the command grid is 0.1 deg, so
+# the Schmitt margin shrinks accordingly (still > half a grid step).
+SERVO_QUANT_HYST_FINE_DEG = 0.15
+# "auto": use the tenth-degree T protocol when the connected firmware is v2
+# (small streaming moves; large moves still go via legacy S + firmware ramp).
+# "legacy": force whole-degree S commands regardless of firmware.
+SERVO_PROTOCOL = "auto"
 
 # =============================================================================
 # Camera

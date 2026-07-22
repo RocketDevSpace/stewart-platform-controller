@@ -39,8 +39,11 @@ logger = logging.getLogger(__name__)
 # as soon as it arrives; if it never does (old firmware may not print
 # it), connect() falls back to the plain _ARDUINO_BOOT_DELAY_S wait.
 _ARDUINO_BOOT_DELAY_S = 2.0
-_READY_BANNER = "[READY]"
+_READY_BANNER = "[READY"   # matches both "[READY]" (v1) and "[READY v2]"
 _READY_WAIT_S = 3.0
+# v1 firmware baud; connect() retries here when the configured (v2) rate
+# produces no banner.
+_LEGACY_BAUD = 115200
 _WRITE_TIMEOUT_S = 0.5
 _THREAD_JOIN_TIMEOUT_S = 2.0
 
@@ -69,6 +72,10 @@ class SerialManager:
         self._latest_cond = threading.Condition()
         self._latest_data: bytes | None = None
         self._disconnect_reported = False
+        # Firmware version parsed from the boot banner: "v2" ([READY v2]),
+        # "v1" ([READY]), or "unknown" (no banner seen). Consumers use this
+        # to decide protocol capability (v2 = tenth-degree T commands).
+        self.firmware_version = "unknown"
         # --- RTT telemetry (write -> firmware ack round trip) ---
         # A sample is only trusted when EXACTLY one command was outstanding
         # at ack time; overlapping commands make the pairing ambiguous and
@@ -111,9 +118,30 @@ class SerialManager:
                 write_timeout=_WRITE_TIMEOUT_S,
             )
             # Arduino resets on the DTR toggle; wait for the firmware's
-            # "[READY]" banner instead of an open-loop sleep.
-            self._wait_for_ready_banner()
-            logger.info("Connected to %s at %d baud", self._port, self._baud)
+            # "[READY ...]" banner instead of an open-loop sleep.
+            active_baud = self._baud
+            banner_seen = self._wait_for_ready_banner()
+            if not banner_seen and self._baud != _LEGACY_BAUD:
+                # No banner at the configured rate — likely v1 firmware at
+                # its legacy baud. Reopen once at 115200 (costs one more
+                # boot cycle) before giving up on the banner.
+                logger.warning(
+                    "no banner at %d baud; retrying at legacy %d",
+                    self._baud, _LEGACY_BAUD,
+                )
+                self._ser.close()
+                self._ser = serial.Serial(
+                    self._port,
+                    _LEGACY_BAUD,
+                    timeout=0.1,
+                    write_timeout=_WRITE_TIMEOUT_S,
+                )
+                active_baud = _LEGACY_BAUD
+                self._wait_for_ready_banner()
+            logger.info(
+                "Connected to %s at %d baud (firmware %s)",
+                self._port, active_baud, self.firmware_version,
+            )
         except Exception as exc:
             logger.error("Could not connect: %s", exc)
             self._ser = None
@@ -224,15 +252,17 @@ class SerialManager:
     # Private
     # ------------------------------------------------------------------
 
-    def _wait_for_ready_banner(self) -> None:
-        """Poll-read for the firmware's "[READY]" boot banner.
+    def _wait_for_ready_banner(self) -> bool:
+        """Poll-read for the firmware's "[READY ...]" boot banner.
 
         Runs during connect(), BEFORE the reader thread starts, so reading
-        directly from the port here is safe (single reader). Returns as
-        soon as the banner arrives, or after _READY_WAIT_S without it
-        (old firmware may not print one — by then the plain boot delay
-        has elapsed anyway). If polling itself fails, falls back to
-        sleeping out the remainder of _ARDUINO_BOOT_DELAY_S.
+        directly from the port here is safe (single reader). Parses the
+        firmware version from the banner ("[READY v2]" -> v2, plain
+        "[READY]" -> v1) into self.firmware_version. Returns True when a
+        banner arrived, False after _READY_WAIT_S without one (old firmware
+        may not print one — by then the plain boot delay has elapsed
+        anyway). If polling itself fails, falls back to sleeping out the
+        remainder of _ARDUINO_BOOT_DELAY_S.
         """
         start = time.monotonic()
         buffer = ""
@@ -241,9 +271,28 @@ class SerialManager:
                 raw = self._ser.read(64)  # bounded by the port timeout
                 if raw:
                     buffer += raw.decode("utf-8", errors="ignore")
-                    if _READY_BANNER in buffer:
-                        logger.info("Firmware ready banner received")
-                        return
+                    idx = buffer.find(_READY_BANNER)
+                    if idx >= 0:
+                        # Wait for the banner's closing bracket so a
+                        # partially-arrived "[READY v2]" isn't misread
+                        # as v1 (the tail may be in flight).
+                        tail_deadline = time.monotonic() + 0.2
+                        while (
+                            "]" not in buffer[idx:]
+                            and time.monotonic() < tail_deadline
+                        ):
+                            more = self._ser.read(64)
+                            if more:
+                                buffer += more.decode("utf-8", errors="ignore")
+                        if "[READY v2]" in buffer:
+                            self.firmware_version = "v2"
+                        else:
+                            self.firmware_version = "v1"
+                        logger.info(
+                            "Firmware ready banner received (%s)",
+                            self.firmware_version,
+                        )
+                        return True
         except Exception as exc:
             logger.warning(
                 "Ready-banner poll failed (%s); falling back to fixed "
@@ -252,11 +301,12 @@ class SerialManager:
             remaining = _ARDUINO_BOOT_DELAY_S - (time.monotonic() - start)
             if remaining > 0:
                 time.sleep(remaining)
-            return
+            return False
         logger.warning(
             "No %s banner within %.1f s — assuming old firmware "
             "(boot delay elapsed)", _READY_BANNER, _READY_WAIT_S,
         )
+        return False
 
     def _note_write(self, data: bytes) -> None:
         """Stamp a completed write for RTT pairing (called after every
@@ -331,7 +381,15 @@ class SerialManager:
             if ser is None:
                 break
             try:
-                raw = ser.read(128)
+                # Low-latency read: block for the FIRST byte (bounded by the
+                # port timeout), then drain whatever else is waiting. A plain
+                # read(128) would sit out the full timeout waiting for 128
+                # bytes, delaying every received line by up to 100 ms.
+                raw = ser.read(1)
+                if raw:
+                    waiting = int(getattr(ser, "in_waiting", 0) or 0)
+                    if waiting:
+                        raw += ser.read(waiting)
             except Exception as exc:
                 logger.error("Read failed: %s", exc)
                 self._handle_link_error(f"read failed: {exc}")

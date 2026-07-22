@@ -31,7 +31,7 @@ def test_overlay_applies_and_reload_restores(monkeypatch: pytest.MonkeyPatch) ->
         assert settings.SERIAL_PORT == "COM99"
         assert settings.MANUAL_ROLL_TRIM_DEG == 2.5
         # Non-overridable keys are untouched by the overlay.
-        assert settings.SERIAL_BAUD == 115200
+        assert settings.SERIAL_BAUD == 250000  # firmware v2 default
     finally:
         monkeypatch.undo()
         importlib.reload(settings)
@@ -42,4 +42,4 @@ def test_overlay_applies_and_reload_restores(monkeypatch: pytest.MonkeyPatch) ->
     assert settings.MANUAL_ROLL_TRIM_DEG == float(
         real.get("MANUAL_ROLL_TRIM_DEG", 0.0)
     )
-    assert settings.SERIAL_BAUD == 115200
+    assert settings.SERIAL_BAUD == 250000  # firmware v2 default
