@@ -40,6 +40,7 @@ _DISP_COLOR = (255, 255, 255)    # white — displacement to target
 _PD_COLOR = (220, 80, 220)       # magenta — PD restoration command
 _TARGET_COLOR = (80, 80, 255)    # red-ish
 _TEXT_COLOR = (210, 255, 210)    # pale green
+_PATH_COLOR = (200, 200, 0)      # teal — path polyline + carrot
 
 # PD vec scale: px per degree of computed tilt command
 _PD_VEC_SCALE_PX_PER_DEG = 18.0
@@ -117,6 +118,8 @@ def _draw_warped_overlays(
     target_y_mm: float = 0.0,
     control_terms: dict | None = None,
     platform_size_mm: float = 240.0,
+    path_points_mm: np.ndarray | None = None,
+    path_closed: bool = True,
 ) -> np.ndarray:
     frame = bgr.copy()
     h, w = frame.shape[:2]
@@ -126,11 +129,49 @@ def _draw_warped_overlays(
 
     _put_label(frame, "WARPED")
 
-    # Target crosshair
+    # Path polyline (teal) — drawn first, beneath the other overlays.
+    if path_points_mm is not None and len(path_points_mm) >= 2:
+        px = (cx + path_points_mm[:, 0] * px_per_mm).astype(np.int32)
+        py = (cy - path_points_mm[:, 1] * px_per_mm).astype(np.int32)
+        poly = np.column_stack([px, py]).reshape(-1, 1, 2)
+        cv2.polylines(
+            frame, [poly], isClosed=bool(path_closed),
+            color=_PATH_COLOR, thickness=1, lineType=cv2.LINE_AA,
+        )
+
+    # Target crosshair — prefer the frame-accurate target from the worker's
+    # control terms: moving path/autotune targets are frame-accurate in
+    # terms; the mirror args remain the fallback for the terms-less
+    # invalid-tracking case.
+    if (
+        control_terms is not None
+        and "target_x_mm" in control_terms
+        and "target_y_mm" in control_terms
+    ):
+        target_x_mm = float(control_terms["target_x_mm"])
+        target_y_mm = float(control_terms["target_y_mm"])
     tx = int(cx + target_x_mm * px_per_mm)
     ty = int(cy - target_y_mm * px_per_mm)
     cv2.line(frame, (tx - 14, ty), (tx + 14, ty), _TARGET_COLOR, 1, cv2.LINE_AA)
     cv2.line(frame, (tx, ty - 14), (tx, ty + 14), _TARGET_COLOR, 1, cv2.LINE_AA)
+
+    # Path following: moving carrot at the follower's current target +
+    # progress text bottom-right.
+    if control_terms is not None and bool(control_terms.get("path_active")):
+        cv2.circle(frame, (tx, ty), 5, _PATH_COLOR, -1, cv2.LINE_AA)
+        path_txt = (
+            f"PATH {control_terms.get('path_state', '')} "
+            f"lap {int(control_terms.get('path_lap', 0))} "
+            f"{float(control_terms.get('path_progress', 0.0)):.0%}"
+        )
+        size, _base = cv2.getTextSize(
+            path_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1
+        )
+        org = (w - int(size[0]) - 8, h - 8)
+        cv2.putText(frame, path_txt, org,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, path_txt, org,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, _PATH_COLOR, 1, cv2.LINE_AA)
 
     if ball_state is not None:
         bx = int(cx + ball_state.x_mm * px_per_mm)
@@ -247,6 +288,23 @@ class VisionMonitorWindow(QWidget):
         grid.addWidget(self._mask_label, 1, 1)
         self.setLayout(grid)
 
+        # Path polyline (mm) drawn on the warped view; set/cleared by
+        # MainWindow via set_path_overlay(), read per-frame by
+        # update_warped().
+        self._path_points_mm: np.ndarray | None = None
+        self._path_closed = True
+
+    def set_path_overlay(
+        self, points_mm: np.ndarray | None, closed: bool = True
+    ) -> None:
+        """Store the path polyline ((N, 2) platform mm) or clear with
+        None."""
+        self._path_points_mm = (
+            None if points_mm is None
+            else np.asarray(points_mm, dtype=np.float64)
+        )
+        self._path_closed = bool(closed)
+
     # ------------------------------------------------------------------
     # Public update methods (called from MainWindow's snapshot handler)
     # ------------------------------------------------------------------
@@ -266,6 +324,8 @@ class VisionMonitorWindow(QWidget):
         frame = _draw_warped_overlays(
             bgr, ball_state, target_x_mm, target_y_mm, control_terms,
             platform_size_mm,
+            path_points_mm=self._path_points_mm,
+            path_closed=self._path_closed,
         )
         w = self._warped_label.width()
         h = self._warped_label.height()
