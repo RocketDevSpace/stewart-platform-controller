@@ -20,12 +20,31 @@ pip install -r requirements.txt
 
 ## Configure
 
-Open `settings.py` and set these two values to match your machine before running:
+`settings.py` holds the committed, neutral defaults — **don't edit it for your
+machine.** Per-machine values live in `user_settings.json` in the repo root: a
+plain JSON file, untracked by git, holding overrides for a whitelisted set of
+12 keys (serial port, camera index, roll/pitch trims, PD gains, and the six
+HSV thresholds — see `OVERRIDABLE_KEYS` in `settings_store.py`). Nothing is
+created automatically on first run; without the file the defaults apply.
 
-```python
-SERIAL_PORT = "COM4"   # COM port the Arduino appears on (check Device Manager)
-CAMERA_INDEX = 1       # 0 = integrated webcam, 1 = first USB camera
-```
+Two ways to set your values:
+
+1. **Edit `user_settings.json` by hand.** Create it next to `main.py`:
+
+   ```json
+   {
+     "SERIAL_PORT": "COM8",
+     "CAMERA_INDEX": 1
+   }
+   ```
+
+   `SERIAL_PORT` is the COM port the Arduino appears on — check Device
+   Manager under "Ports (COM & LPT)". `CAMERA_INDEX` 0 = integrated webcam,
+   1 = first USB camera.
+
+2. **Use the GUI.** The "Save Trim as Default" button writes the current
+   roll/pitch trim values into `user_settings.json` (atomically, preserving
+   any keys you set by hand). Values take effect at the next launch.
 
 All other defaults work out of the box for the reference hardware.
 
@@ -44,7 +63,7 @@ The camera starts automatically when the vision panel is activated.
 pip install -r requirements-dev.txt
 pytest          # unit tests
 flake8          # lint
-mypy            # type check
+mypy .          # type check (runs locally; same config as CI)
 ```
 
 See `CLAUDE.md` for architecture, contribution rules, and milestone history.

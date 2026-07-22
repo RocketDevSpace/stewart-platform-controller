@@ -6,46 +6,59 @@ PyQt5 desktop app controlling a 6-DOF Stewart platform via Arduino serial. Inclu
 
 ## How to work in this codebase
 
-**Run:** `python main.py` from repo root. Arduino must be connected on the port set in `settings.py` (default `COM4`).
+**Run:** `python main.py` from repo root. Per-machine settings (serial port, camera index, trims, gains, HSV) are overridden via the untracked `user_settings.json` overlay (check Device Manager for the actual COM port); the committed `settings.py` holds neutral defaults — do not edit it per-machine.
 **Test:** `pytest` from repo root. CI runs pytest, flake8, mypy on every push.
-**Lint/typecheck:** `flake8` and `mypy` per `setup.cfg`. Legacy modules excluded; exclusions shrink as refactor advances.
+**Lint/typecheck:** `flake8` and `mypy` per `setup.cfg`. Exclude lists are now empty — every module is linted and type-checked, locally and in CI.
 **Imports:** repo-root-relative only. `from settings import ...`, `from core.safety import ...`. Never use `stewart_control.*` prefixes — that's an artifact of the original ChatGPT Codex codebase and is being removed.
 
 ## Current architecture
 
 ```
-main.py                # entry point — repo-root-relative imports. ✅
+main.py                # entry point — repo-root-relative imports; excepthook → emergency shutdown. ✅
 config.py              # physical geometry constants only. NOT runtime config.
-settings.py            # runtime config: port, baud, intervals, safety limits.
+settings.py            # runtime config: port, baud, intervals, safety limits. Neutral committed defaults; applies the user_settings.json overlay at import. ✅
+settings_store.py      # per-machine settings overlay: 12-key whitelist, atomic JSON writes. ✅
+user_settings.json     # untracked per-machine overrides (port, camera, trims, gains, HSV). Written by the GUI save-trim button or by hand.
 conftest.py            # pytest path shim.
-setup.cfg              # flake8 + mypy config. Exclude list shrinks each milestone.
+setup.cfg              # flake8 + mypy config. Exclude lists now EMPTY — every module checked.
 
 core/
-  platform_state.py    # dataclasses: Pose, ServoAngles, BallState. No logic. ✅
+  platform_state.py    # dataclasses: Pose, BallState, IKResult. No logic. ✅
   ik_engine.py         # single IK call site. ✅
-  safety.py            # servo clipping + validation. ✅
+  safety.py            # servo clipping + validation + large-move speedDelay policy. ✅
 
 hardware/
-  serial_manager.py    # connection lifecycle, read loop, callbacks. ✅
-  servo_driver.py      # command formatting and dispatch. ✅
+  serial_manager.py    # connection lifecycle, [READY] handshake, read loop, latest-wins writer, disconnect callbacks. ✅
+  servo_driver.py      # command formatting and dispatch; slew policy + validated raw path. ✅
 
 control/
   routine_runner.py    # routine playback state machine. No Qt deps. ✅
-  ball_controller.py   # PD controller. ✅
+  ball_controller.py   # PD controller facade over the four modules below. ✅
+  setpoint.py          # SetpointArbiter — single owner of the ball target setpoint. ✅
+  auto_trim.py         # AutoTrim — single writer of roll/pitch trim offsets + integral correction. ✅
+  autotune.py          # PDAutotuner — autotune state machine + per-leg step evaluator. ✅
+  pd_core.py           # PDCore — pure PD math: d-term cap, tilt clamp, slew limiter. ✅
+  pose_commander.py    # PoseCommander — GUI-facing Pose→IK→servo facade (zero IK in gui/). ✅
 
 cv/
-  ball_tracker.py      # vision pipeline: capture thread + ArUco + detection. Returns BallState. ✅
-  vision_control_worker.py  # owns BallTracker + BallController; vision/PD/IK loop in a QThread. ✅
+  camera_source.py     # camera lifecycle: backend probe, capture thread, exposure policy, software gain. ✅
+  ball_tracker.py      # pure detection: ArUco homography + HSV blob → BallState. No camera, no threads. ✅
+  vision_control_worker.py  # owns CameraSource + BallTracker + BallController; vision/PD/IK loop in a QThread. ✅
 
 routines/              # pure pose-list generators.
 visualization/
-  visualizer3d.py      # drawing only. Accepts pre-solved geometry. ✅
+  visualizer3d.py      # drawing only. Accepts pre-solved geometry. Persistent artists + draw_idle. ✅
 gui/
   main_window.py       # top-level window. Wires all modules. ✅
   control_panel.py     # sliders, buttons, signals. ✅
   serial_monitor.py    # serial output display widget. ✅
   vision_monitor.py    # floating camera/warped/mask debug views. ✅
-tests/                 # test_safety, test_servo_driver, test_ik_engine, test_routine_runner, test_ball_controller, test_vision_control_worker.
+  timing_plot.py       # TimingPlotWidget — vision-loop timing strip, persistent Line2D artists. ✅
+firmware/              # Arduino side: flash dump (ground truth), reconstructed sketch, wiring_check.py bench utility, README (pin map + protocol).
+docs/
+  codex_audit.md       # historical M7 audit of the original Codex branch.
+  code-review-2026-07-22.md  # five-agent full-repo review record; maps findings → overhaul fixes.
+tests/                 # test_safety, test_serial_manager, test_servo_driver, test_ik_engine, test_ik_solver, test_routine_runner, test_ball_controller (+ characterization), test_ball_tracker, test_camera_source, test_vision_control_worker, test_settings_store, test_settings_overlay.
 ```
 
 **Module ownership boundaries:**
@@ -59,21 +72,19 @@ tests/                 # test_safety, test_servo_driver, test_ik_engine, test_ro
 
 **Shared data contracts** (defined in `core/platform_state.py`):
 - `Pose`: x, y, z, roll, pitch, yaw — all float, mm and degrees.
-- `ServoAngles`: list[float], 6 elements, degrees, index 0–5.
 - `BallState`: x_mm, y_mm, vx_mm_s, vy_mm_s required; z_mm, vz_mm_s Optional (None if 2D-only).
-- IK result dict: `{success, platform_points, arm_points, servo_angles_deg, platform_center, platform_R, debug}`.
+- `IKResult` (frozen dataclass, replaced the old untyped result dict in the 2026-07 overhaul): success, servo_angles_deg, platform_points, arm_points, platform_center, platform_R, per-servo `servo_status` (None = OK), debug. Failed servos carry neutral placeholders — never send angles from a result whose success is False.
 
 ## Project state
 
 **The original 7-milestone refactor is complete — M1–M7 all merged** (M7 merged 2026-05-12; autotune guard follow-ups via PR #13; tracker velocity low-pass via PR #14 and servo 4 geometry fix via PR #15, both merged 2026-06-11). Read `CHANGELOG.md` for what each milestone shipped. Always check the open PR list (`gh pr list`) before treating any status written here as current — implementation may be in review.
 
-**Current phase: post-refactor hardening (M8–M12), scoped 2026-06-11.** Full detail and decisions in PROJECT_STATE.md.
+**The post-refactor hardening phase (M8–M12, scoped 2026-06-11) is done.** M8 (housekeeping) merged earlier via PR #16. The remaining milestones — M9 (IK correctness), M10 (controller decomposition), M11 (vision split), M12 (settings overlay + GUI slimming) — were all absorbed into the **2026-07-22 overhaul** (branch `overhaul/safety-ik-vision-gui`, one PR), which grew out of a five-agent full-repo review that same day. The overhaul also shipped safety work that was never on the roadmap: serial-link hardening (write lock, crash-surviving read loop, disconnect reporting, latest-wins streaming writer, [READY] handshake), mode mutual exclusion in the GUI, and the `closeEvent` deadlock / `sys.excepthook` emergency-shutdown fixes. See `docs/code-review-2026-07-22.md` for the finding-by-finding record and `CHANGELOG.md` for what shipped.
 
-- **M8 — Housekeeping:** untrack `__pycache__` artifacts, requirements files, sync docs to reality, fix stale `config.py` comments.
-- **M9 — IK correctness + safety rail:** fix the IK branch-flip bug in `kinematics/ik_solver.py` — the "closest to neutral" servo-angle pick silently overrides the continuity-based elbow choice (root cause of the screw-routine servo snap at yaw=-35° logged at M5). Add a slew-rate guard in `core/safety.py` applied in `ServoDriver.send_angles`; manual sends ramp through it too (decided 2026-06-11). Consolidate the three duplicated inline 0–180 clamps. Move reacquire gating into the worker command path. Routine-sweep continuity regression tests.
-- **M10 — Controller decomposition:** split autotune + auto-trim out of the 800-line `control/ball_controller.py`; collapse `compute()` into `compute_with_terms()` (tests currently cover the unused `compute()` path; production uses `compute_with_terms()`).
-- **M11 — Vision split:** extract camera lifecycle from `BallTracker`; public tracker API (the worker currently reaches into tracker privates); synthetic-frame tests; remove `cv/ball_tracker.py` from setup.cfg excludes; remove dead velocity-smoother state left by PR #14.
-- **M12 — GUI slimming:** replace the `settings.py` regex rewrite (save-trim-as-default) with a user-settings overlay; extract timing plot + vision bridge from `gui/main_window.py`; non-blocking serial connect (currently freezes the GUI ~2 s at startup).
+**Still open after the overhaul:**
+- Hardware smoke tests gate the PR — the overhaul is not merged until manual tests with the Arduino pass.
+- The Cone Tracing routine exits the workspace on 20 of its 120 steps (pre-existing, now honestly reported and pinned by test). Adjusting its tilt/radius is a physical-envelope decision for Hudson.
+- CI remains ubuntu/unit-only for a Windows app; hardware paths stay manual.
 
 ## What good looks like in this domain
 
@@ -150,3 +161,6 @@ These are non-negotiable. Violating any is grounds to reject and revert.
 | `PROJECT_STATE.md` | Current phase, decisions log, open questions, phase roadmap. Living. |
 | `SPEC.md` | Feature specs and milestone acceptance criteria. |
 | `CHANGELOG.md` | Per-milestone shipped changes. Keep-a-changelog format. |
+| `firmware/README.md` | Arduino firmware provenance, pin map, servo clocking, verified serial protocol. |
+| `docs/code-review-2026-07-22.md` | Full-repo review record; every finding maps to the overhaul commit that fixed it. |
+| `settings_store.py` | User-settings overlay implementation: whitelist, load/save, atomic writes. |

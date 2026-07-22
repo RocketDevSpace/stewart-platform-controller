@@ -134,7 +134,10 @@ No behavior changes. Pure restructuring.
 
 **Notes:** Screw routine produces unexpected servo limit behaviour (3 servos
 snap min→max ~2s in). Root cause is a pre-existing IK branch-switching
-workspace issue at yaw=-35°, not an M5 regression. Logged for M6.
+workspace issue at yaw=-35°, not an M5 regression. Root-caused and fixed in
+the 2026-07-22 overhaul (branch-selection redesign in
+`kinematics/ik_solver.py`; see the Overhaul section below and
+`docs/code-review-2026-07-22.md`, finding C1).
 
 ---
 
@@ -190,6 +193,66 @@ ball balancing to full working state and adds all Codex-developed capabilities.
 
 ---
 
+### 2026-07-22 Overhaul — Safety, IK, Vision, GUI (absorbs M9–M12)
+**Status:** Implemented (branch `overhaul/safety-ik-vision-gui`); merge gated
+on hardware smoke tests
+
+**What it does:** Six-step hardening pass driven by the 2026-07-22 five-agent
+full-repo review (`docs/code-review-2026-07-22.md` — the finding-by-finding
+record and acceptance evidence). Absorbs milestones M9 (IK correctness), M10
+(controller decomposition), M11 (vision split), and M12 (settings overlay +
+GUI slimming), plus safety work the review surfaced that was never on the
+roadmap.
+
+**Serial protocol additions (host side — firmware unchanged):**
+- The host now uses the firmware's `speedDelay` field: per-servo jumps larger
+  than `SERVO_SLEW_INSTANT_MAX_DEG` are sent with
+  `SERVO_LARGE_MOVE_SPEED_DELAY_MS` so the ramp happens in hardware
+  (`core/safety.select_speed_delay`, applied on every send path including
+  manual). Small streaming steps stay `speedDelay=0`.
+- On connect, `SerialManager` poll-reads for the firmware's `[READY]` boot
+  banner (3 s cap, with a fallback for firmware that never prints it)
+  instead of an open-loop 2 s sleep.
+
+**Safety rails:**
+- Serial hardening: write lock (GUI + vision worker both send), read loop
+  survives callback exceptions, read/write errors mark the link dead and
+  fire a disconnect callback, double-connect guard, latest-wins depth-1
+  writer thread for streaming setpoints.
+- Global 0–180 clamp on every servo plus length/finiteness validation in
+  `core/safety.py` (the min/max limit keys were previously dead).
+- Raw-command box routed through `ServoDriver.send_raw` (parse, clip, ramp,
+  guaranteed newline) instead of GUI→serial directly.
+- Mode mutual exclusion: vision mode locks routines, SEND, and the raw box.
+- Crash paths: `closeEvent` thread-shutdown handshake (no more 3 s hang);
+  `sys.excepthook` logs, attempts ramped-neutral emergency shutdown, and
+  disconnects instead of PyQt5's `qFatal()` abort with servos live.
+- Vision: bounded stale-homography hold with cache invalidation; reacquire
+  gating moved into the worker command path; neutral-pose fallback policy
+  moved into the worker miss branch.
+
+**IK behavior change:**
+- Branch selection redesigned (seed by servo-angle validity, symmetric elbow
+  handling, continuity from a single choice). Out-of-range angles are now
+  **per-servo failures** (`IKResult.servo_status`) instead of silent clamps;
+  failed servos carry neutral placeholders. Frozen `IKResult` dataclass
+  replaces the untyped result dict for all consumers.
+- Send-mode routines ease back to neutral on completion and cancel (approved
+  behavior change — screw used to park at z=-12/yaw=-35). IK failures during
+  playback are counted and reported in the GUI.
+
+**Acceptance criteria:**
+- 206 unit tests pass; flake8/mypy clean with empty setup.cfg exclude lists ✅
+- Sweep-continuity regression across all routines (screw max step 2.7°,
+  formerly a commanded 180° snap) ✅
+- Manual hardware smoke test — pending (gates the PR)
+
+**Known limitation:** Cone Tracing exits the workspace on 20 of 120 steps
+(pre-existing, now reported honestly and pinned by test); envelope
+adjustment is an open physical-design decision.
+
+---
+
 ## Future Features (not scheduled)
 
 ### Multi-Camera Ball Tracking
@@ -222,4 +285,4 @@ ball balancing to full working state and adds all Codex-developed capabilities.
 - IK solve time: <1ms typical, acceptable per frame
 - Platform geometry in config.py is physical measurement — do not change without
   re-measuring hardware
-- `_{pycache__}` and `.pyc` files should be in `.gitignore`
+- `__pycache__` and `.pyc` files should be in `.gitignore`

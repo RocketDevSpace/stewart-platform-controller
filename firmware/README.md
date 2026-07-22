@@ -100,8 +100,14 @@ front-left position moves. Repeat per index before first full-platform test.
 - **Ack:** `[OK] Updated angles: a0, ..., a5 | speedDelay=N` prints **after
   the ramp finishes** — it is a completion ack, not a receipt ack. A
   `speedDelay>0` command therefore blocks the firmware's command loop for the
-  whole ramp; the GUI/vision loop always sends `speedDelay=0` (built in
+  whole ramp; streaming sends use `speedDelay=0` (built in
   `hardware/servo_driver.py`), which keeps round-trip ~20-30 ms.
+- **Host-side usage (2026-07 overhaul):** the Python side now sends a nonzero
+  `speedDelay` for large moves — any per-servo jump over
+  `settings.SERVO_SLEW_INSTANT_MAX_DEG` is ramped in firmware per the
+  `core/safety.select_speed_delay` policy — and `connect()` waits for the
+  `[READY]` boot banner (3 s cap, old-firmware fallback) instead of a fixed
+  sleep; see `hardware/serial_manager.py`.
 
 ## Board identification
 

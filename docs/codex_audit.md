@@ -1,3 +1,10 @@
+> **Historical snapshot (2026-05-10).** This is the original audit of the
+> Codex-written codebase, produced for the M7 integration milestone. It has
+> since been superseded by the M1–M7 refactor and the 2026-07 overhaul
+> (see `docs/code-review-2026-07-22.md`): module layouts, constants, and
+> file paths referenced below may no longer exist. Kept as a record of what
+> was ported and why.
+
 # Codex Audit — offset-tuning-and-camera-exposure
 
 **Branch audited:** `codex/offset-tuning-and-camera-exposure`
@@ -388,4 +395,4 @@ Steps 1–6 can be done as one PR ("vision backend + controller enrichment") or 
 2. **Dark mode scope:** Does dark mode apply to the full app or only the vision-related panels?
 3. **Backward compatibility:** `BallTracker.update()` already returns `BallState`. The Codex version returns a `dict`. Port should adopt the refactored signature (returning `BallState`) while adding all the new internal logic. Confirm this is the intent.
 4. **config.py geometry constants:** The Codex `config.py` also contains platform geometry constants. These must NOT be ported — they belong in the existing `config.py` and are hardware-specific. Confirm dev Claude should treat all geometry constants as read-only.
-5. **`comms/serial_sender.py`:** The Codex `gui_main.py` imports `SerialSender` from `stewart_control.comms.serial_sender`. Post-M6 refactor uses `hardware/` equivalents. Dev Claude must use `comms/serial_sender.py` was deleted in M6; the equivalent is `hardware/serial_manager.py` + `hardware/servo_driver.py`. Confirm mapping.
+5. **`comms/serial_sender.py`:** The Codex `gui_main.py` imports `SerialSender` from `stewart_control.comms.serial_sender`. That module was deleted in M6; dev Claude must use the post-M6 equivalents instead: `hardware/serial_manager.py` + `hardware/servo_driver.py`. Confirm mapping.
