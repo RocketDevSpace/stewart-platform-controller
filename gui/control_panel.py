@@ -126,7 +126,7 @@ class ControlPanel(QWidget):
         ag.setContentsMargins(6, 10, 6, 6)
         for ax in AXES:
             lbl = QLabel(f"{ax}: 0")
-            sld = QSlider(QtCore.Qt.Horizontal)
+            sld = QSlider(QtCore.Qt.Orientation.Horizontal)
             sld.setMinimum(-100)
             sld.setMaximum(100)
             sld.setValue(0)
@@ -161,7 +161,7 @@ class ControlPanel(QWidget):
         ]
         for display, attr, lo, hi, default in _hsv_defs:
             lbl = QLabel(f"{display}: {default}")
-            sld = QSlider(QtCore.Qt.Horizontal)
+            sld = QSlider(QtCore.Qt.Orientation.Horizontal)
             sld.setRange(lo, hi)
             sld.setValue(default)
             sld.setMaximumHeight(20)
@@ -191,7 +191,7 @@ class ControlPanel(QWidget):
         self._target_x_label = QLabel(
             f"Target X: {BALL_TARGET_DEFAULT_X_MM:.0f} mm"
         )
-        self._target_x_slider = QSlider(QtCore.Qt.Horizontal)
+        self._target_x_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
         self._target_x_slider.setMinimum(-120)
         self._target_x_slider.setMaximum(120)
         self._target_x_slider.setValue(int(BALL_TARGET_DEFAULT_X_MM))
@@ -203,7 +203,7 @@ class ControlPanel(QWidget):
         self._target_y_label = QLabel(
             f"Target Y: {BALL_TARGET_DEFAULT_Y_MM:.0f} mm"
         )
-        self._target_y_slider = QSlider(QtCore.Qt.Horizontal)
+        self._target_y_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
         self._target_y_slider.setMinimum(-120)
         self._target_y_slider.setMaximum(120)
         self._target_y_slider.setValue(int(BALL_TARGET_DEFAULT_Y_MM))
@@ -222,7 +222,7 @@ class ControlPanel(QWidget):
         tr.setContentsMargins(6, 10, 6, 6)
 
         self._trim_roll_label = QLabel(f"Roll Trim: {MANUAL_ROLL_TRIM_DEG:.2f}°")
-        self._trim_roll_slider = QSlider(QtCore.Qt.Horizontal)
+        self._trim_roll_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
         self._trim_roll_slider.setMinimum(-1000)
         self._trim_roll_slider.setMaximum(1000)
         self._trim_roll_slider.setValue(int(MANUAL_ROLL_TRIM_DEG * 100))
@@ -234,7 +234,7 @@ class ControlPanel(QWidget):
         self._trim_pitch_label = QLabel(
             f"Pitch Trim: {MANUAL_PITCH_TRIM_DEG:.2f}°"
         )
-        self._trim_pitch_slider = QSlider(QtCore.Qt.Horizontal)
+        self._trim_pitch_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
         self._trim_pitch_slider.setMinimum(-1000)
         self._trim_pitch_slider.setMaximum(1000)
         self._trim_pitch_slider.setValue(int(MANUAL_PITCH_TRIM_DEG * 100))
@@ -269,7 +269,7 @@ class ControlPanel(QWidget):
         tune.setContentsMargins(6, 10, 6, 6)
 
         self._kp_label = QLabel(f"Kp: {PD_DEFAULT_KP:.3f}")
-        self._kp_slider = QSlider(QtCore.Qt.Horizontal)
+        self._kp_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
         self._kp_slider.setMinimum(0)
         self._kp_slider.setMaximum(300)  # supports PD_AUTOTUNE_MAX_KP = 0.250
         self._kp_slider.setValue(int(PD_DEFAULT_KP * 1000))
@@ -279,7 +279,7 @@ class ControlPanel(QWidget):
         tune.addWidget(self._kp_slider)
 
         self._kd_label = QLabel(f"Kd: {PD_DEFAULT_KD:.3f}")
-        self._kd_slider = QSlider(QtCore.Qt.Horizontal)
+        self._kd_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
         self._kd_slider.setMinimum(0)
         self._kd_slider.setMaximum(100)
         self._kd_slider.setValue(int(PD_DEFAULT_KD * 1000))

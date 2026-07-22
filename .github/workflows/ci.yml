@@ -1,8 +1,14 @@
 name: CI
 
+# NOTE: CI runs on ubuntu for speed/availability, but this is a Windows-only
+# desktop app. Unit tests, lint, and type checks are platform-neutral; every
+# Windows-specific path (DSHOW camera backend, COM serial ports, real Qt event
+# loop against a display) is exercised only by the manual hardware smoke tests
+# documented in CLAUDE.md's verification expectations.
+
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -18,28 +24,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install lint/type-check dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest flake8 mypy numpy types-pyserial
-
-      - name: Lint with flake8
-        run: |
-          # Runs on the whole repo. Legacy modules are excluded via setup.cfg.
-          # New refactored modules are covered automatically — no config change needed.
-          flake8 .
-
-      - name: Type check with mypy
-        run: |
-          # Runs WITHOUT PyQt5 installed so ignore_missing_imports treats Qt as Any.
-          # Installing PyQt5 before this step would pull in strict 5.15.x stubs that
-          # break on the unqualified Qt.Xxx enum style used throughout this codebase.
-          # --explicit-package-bases avoids "not a valid package name" error from hyphens.
-          mypy . \
-            --ignore-missing-imports \
-            --explicit-package-bases
-
-      - name: Install system dependencies
+      - name: Install system dependencies (Qt runtime libs)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -47,12 +32,24 @@ jobs:
             libdbus-1-3 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-randr0 libxcb-render-util0 libxcb-xinerama0
 
-      - name: Install test dependencies
+      - name: Install dependencies (same files developers use)
         run: |
-          pip install PyQt5 opencv-python-headless
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint with flake8
+        run: |
+          # Runs on the whole repo. Legacy modules are excluded via setup.cfg.
+          flake8 .
+
+      - name: Type check with mypy
+        run: |
+          # Full dependency set is installed (PyQt5 included), so this run
+          # matches what developers see locally with `mypy .`.
+          mypy .
 
       - name: Run tests
         run: |
-          pytest tests/ -v
+          pytest -q
         env:
           QT_QPA_PLATFORM: offscreen

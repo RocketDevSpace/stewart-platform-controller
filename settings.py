@@ -3,7 +3,6 @@
 # =============================================================================
 SERIAL_PORT = "COM4"
 SERIAL_BAUD = 115200
-SERIAL_QUEUE_MAX = 256
 
 # =============================================================================
 # Safety limits
@@ -11,10 +10,10 @@ SERIAL_QUEUE_MAX = 256
 MAX_TILT_DEG = 8.0                      # maximum platform tilt in vision mode
 
 SAFETY_LIMITS = {
-    "max_angle": 180,
-    "min_angle": 0,
-    "odd_servo_max": 170,   # servos 0, 2, 4
-    "even_servo_min": 10,   # servos 1, 3, 5
+    "max_angle": 180,       # global ceiling, all servos (enforced in core/safety.py)
+    "min_angle": 0,         # global floor, all servos (enforced in core/safety.py)
+    "odd_servo_max": 170,   # extra ceiling for INDICES 0, 2, 4 (mirrored mount)
+    "even_servo_min": 10,   # extra floor for INDICES 1, 3, 5 (mirrored mount)
 }
 
 # =============================================================================
@@ -100,7 +99,6 @@ AUTO_TRIM_SETTLE_RADIUS_LPF_ALPHA = 0.75
 # =============================================================================
 PD_AUTOTUNE_ENABLED = False
 PD_AUTOTUNE_AUTO_APPLY = False
-PD_AUTOTUNE_TRIGGER_RADIUS_MM = 35.0
 PD_AUTOTUNE_SETTLE_RADIUS_MM = 6.0
 PD_AUTOTUNE_SETTLE_SPEED_MM_S = 18.0
 PD_AUTOTUNE_SETTLE_HOLD_S = 0.35
@@ -125,8 +123,6 @@ AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 # Loop rates
 # =============================================================================
 CONTROL_LOOP_INTERVAL_MS = 20
-VISION_LOOP_INTERVAL_MS = 20            # legacy QTimer interval (pre-M7 worker)
-VISUALIZER_THREAD_INTERVAL_S = 0.03    # legacy background draw thread interval
 VISION_LOOP_HZ = 120
 VISUALIZER_HZ = 25
 GUI_SNAPSHOT_HZ = 30

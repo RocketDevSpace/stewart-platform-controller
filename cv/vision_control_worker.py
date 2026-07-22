@@ -222,7 +222,7 @@ class VisionControlWorker(QtCore.QObject):
         self._prev_arm_points = None
 
         self._timer = QtCore.QTimer(self)
-        self._timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._tick)
         self._timer.start(int(1000 / self._loop_hz))
 

@@ -1,8 +1,12 @@
 # Runtime dependencies — install with: pip install -r requirements.txt
-# Windows-only desktop app (see CLAUDE.md). Floors match the versions the
-# app is developed and smoke-tested against.
-PyQt5>=5.15
-matplotlib>=3.8
-numpy>=1.26
-pyserial>=3.5
-opencv-contrib-python>=4.8
+# Windows-only desktop app (see CLAUDE.md). Floors are the oldest versions the
+# app is smoke-tested against; ceilings exclude the next major version so a
+# fresh install can't silently jump onto an unvalidated API (this happened
+# once: the >=4.8 floor alone resolved to OpenCV 5.0). OpenCV 5.0.x is
+# validated on the dev machine (ArUco class API verified live 2026-07-22),
+# so its ceiling is <6.
+PyQt5>=5.15,<6
+matplotlib>=3.8,<4
+numpy>=1.26,<3
+pyserial>=3.5,<4
+opencv-contrib-python>=4.8,<6

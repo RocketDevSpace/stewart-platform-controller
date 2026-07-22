@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Mon Feb 16 12:25:39 2026
+"""Physical geometry constants for the Stewart platform rig.
 
-@author: hudso
+Measured values only — runtime configuration lives in settings.py.
+All servo/platform arrays are 0-indexed (indices 0-5) and match the wiring
+documented in firmware/README.md (command index i drives Arduino pin D2+i).
 """
 
 import numpy as np
@@ -70,20 +71,17 @@ PLATFORM_POINTS_LOCAL = np.column_stack((PLATFORM_POINTS_LOCAL_XY, np.zeros(6)))
 # =========================
 # Each servo arm rotates in a vertical plane, meaning its axis is horizontal.
 # We define the axis direction vector (unit) for each servo shaft.
+#
+# The pair at indices 0/5 sits on the +x face with axes pointing +x; the other
+# two pairs sit on the faces rotated +/-120 deg about Z.
 
-# Face 1/6 shafts are on x=+ side, axis points +x (as you described)
-# Other faces rotated +/-120 deg around Z.
-# We can infer axis by angle of servo position around origin.
-
-def compute_servo_axes(shafts_xy):
+def compute_servo_axes(shafts_xy: np.ndarray) -> np.ndarray:
+    """Snap each shaft's outward radial direction to the nearest of the three
+    face normals (0 deg, +120 deg, -120 deg about Z). The servo axis IS the
+    outward face normal; arms rotate in the vertical plane perpendicular to it.
+    """
     axes = []
     for (x, y) in shafts_xy:
-        angle = np.arctan2(y, x)  # angle around origin
-
-        # Face axis direction is perpendicular to radius vector (approx)
-        # But based on your earlier definition, axis is along outward normal of each face.
-        # We approximate by snapping to the nearest of 3 directions.
-
         # Three face normals at 0, 120, -120 degrees
         candidates = [
             np.array([1.0, 0.0, 0.0]),
@@ -100,15 +98,15 @@ def compute_servo_axes(shafts_xy):
 
     return np.array(axes)
 
+
 SERVO_AXES = compute_servo_axes(SERVO_SHAFTS_XY)
 
 
 # =========================
 # SERVO ROTATION DIRECTIONS
 # =========================
-# You stated:
-# - servos 1,3,5 rotate same sense
-# - servos 2,4,6 rotate opposite sense
+# Adjacent servos are mirror-mounted, so command sense alternates by INDEX:
+# indices 0, 2, 4 -> +1 (one sense), indices 1, 3, 5 -> -1 (opposite sense).
 
 SERVO_SIGN = np.array([+1, -1, +1, -1, +1, -1], dtype=float)
 
@@ -117,7 +115,3 @@ SERVO_SIGN = np.array([+1, -1, +1, -1, +1, -1], dtype=float)
 # DEFAULT SERVO NEUTRAL ANGLES
 # =========================
 SERVO_NEUTRAL_DEG = 90.0
-
-# Optional safety limits
-SERVO_MIN_DEG = 0.0
-SERVO_MAX_DEG = 180.0

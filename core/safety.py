@@ -1,13 +1,4 @@
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
-
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from settings import SAFETY_LIMITS  # noqa: E402
+from settings import SAFETY_LIMITS
 
 
 def clip_servo_angles(
@@ -16,15 +7,13 @@ def clip_servo_angles(
     """
     Clip servo angles to hardware-safe ranges.
 
-    Rules:
-    - Servos 0, 2, 4 (odd physical mount): max capped at SAFETY_LIMITS["odd_servo_max"]
-    - Servos 1, 3, 5 (even physical mount): min capped at SAFETY_LIMITS["even_servo_min"]
+    Rules (all indices 0-based):
+    - Indices 0, 2, 4 (mirror-mounted one way): max capped at SAFETY_LIMITS["odd_servo_max"]
+    - Indices 1, 3, 5 (mirror-mounted the other way): min capped at SAFETY_LIMITS["even_servo_min"]
 
     Returns:
         (clipped_angles, [(index, original_value, clipped_value), ...])
         The clip list is empty when no clipping occurred.
-
-    Matches the behaviour of safety_clip_servos() in gui/gui_layout.py exactly.
     """
     safe_angles = list(angles)
     clipped: list[tuple[int, float, float]] = []

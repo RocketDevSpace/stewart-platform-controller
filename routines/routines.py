@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Mon Feb 16 16:07:57 2026
+"""Scripted motion routines: pure pose-list generators.
 
-@author: hudso
+Each generator returns a list of pose dicts with keys
+x, y, z, roll, pitch, yaw (floats; mm and degrees; z is an offset from
+Z_NEUTRAL). No Qt, no hardware, no IK — playback is control/routine_runner.py's
+job.
 """
 
-# stewart_control/routines.py
+import math
+from typing import Callable
 
 import numpy as np
-import math
 
 
-def cube_routine_smooth(steps_per_edge=8):
+def cube_routine_smooth(steps_per_edge: int = 8) -> list[dict[str, float]]:
     # 8 cube vertices, centered at 0
     verts = np.array([
         [+14, +14, +14],
@@ -23,25 +25,25 @@ def cube_routine_smooth(steps_per_edge=8):
         [-14, -14, +14],
         [-14, -14, -14],
     ])
-    
+
     # Define a path through the cube vertices
     path_indices = [0, 1, 3, 2, 6, 7, 5, 4, 0]  # just one continuous loop
 
     poses = []
-    for i in range(len(path_indices)-1):
+    for i in range(len(path_indices) - 1):
         start = verts[path_indices[i]]
-        end = verts[path_indices[i+1]]
-        
+        end = verts[path_indices[i + 1]]
+
         # interpolate linearly along the edge
         for t in np.linspace(0, 1, steps_per_edge, endpoint=False):
-            interp = start*(1-t) + end*t
+            interp = start * (1 - t) + end * t
             pose = {
                 "x": float(interp[0]),
                 "y": float(interp[1]),
                 "z": float(interp[2]),
                 "roll": 0.0,
                 "pitch": 0.0,
-                "yaw": 0.0
+                "yaw": 0.0,
             }
             poses.append(pose)
     # include final vertex
@@ -52,7 +54,7 @@ def cube_routine_smooth(steps_per_edge=8):
     return poses
 
 
-def xy_circle(radius=20, num_points=100):
+def xy_circle(radius: float = 20, num_points: int = 100) -> list[dict[str, float]]:
     poses = []
 
     for i in range(num_points):
@@ -64,15 +66,21 @@ def xy_circle(radius=20, num_points=100):
         poses.append({
             "x": x,
             "y": y,
-            "z": 0,
-            "roll": 0,
-            "pitch": 0,
-            "yaw": 0
+            "z": 0.0,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 0.0,
         })
 
     return poses
 
-def generate_cone_orbit_routine(radius=8, tilt_deg=15, z_height=0, steps=120):
+
+def generate_cone_orbit_routine(
+    radius: float = 8,
+    tilt_deg: float = 15,
+    z_height: float = 0,
+    steps: int = 120,
+) -> list[dict[str, float]]:
     """
     Generates a circular XY motion while rolling/pitching inward toward origin,
     creating a cone-like sweep.
@@ -93,7 +101,7 @@ def generate_cone_orbit_routine(radius=8, tilt_deg=15, z_height=0, steps=120):
 
         # inward tilt proportional to x/y direction
         pitch = tilt_deg * (x / radius)
-        roll  = -tilt_deg * (y / radius)
+        roll = -tilt_deg * (y / radius)
 
         routine.append({
             "x": x,
@@ -101,19 +109,19 @@ def generate_cone_orbit_routine(radius=8, tilt_deg=15, z_height=0, steps=120):
             "z": z_height,
             "roll": roll,
             "pitch": pitch,
-            "yaw": 0
+            "yaw": 0.0,
         })
 
     return routine
 
 
 def generate_parabola_plane_dance(
-    max_xy=15,          # max +/- X or Y excursion (mm)
-    z_top=5,            # top Z height
-    z_drop=5,          # how far it drops at edges (mm)
-    max_tilt_deg=10,    # max pitch/roll angle at edges
-    steps_per_half=40   # resolution
-):
+    max_xy: float = 15,         # max +/- X or Y excursion (mm)
+    z_top: float = 5,           # top Z height
+    z_drop: float = 5,          # how far it drops at edges (mm)
+    max_tilt_deg: float = 10,   # max pitch/roll angle at edges
+    steps_per_half: int = 40,   # resolution
+) -> list[dict[str, float]]:
     """
     Generates:
     XZ parabola sweep → YZ parabola sweep
@@ -122,12 +130,12 @@ def generate_parabola_plane_dance(
     Returns list of pose dictionaries.
     """
 
-    routine = []
+    routine: list[dict[str, float]] = []
 
-    def parabola_z(pos):
+    def parabola_z(pos: float) -> float:
         return z_top - z_drop * (pos / max_xy) ** 2
 
-    def sweep_plane(plane="xz"):
+    def sweep_plane(plane: str = "xz") -> None:
         # center → +edge → center → -edge → center
         segments = [
             (0, max_xy),
@@ -144,15 +152,15 @@ def generate_parabola_plane_dance(
 
                 if plane == "xz":
                     x = pos
-                    y = 0
+                    y = 0.0
                     pitch = -max_tilt_deg * (pos / max_xy)
-                    roll = 0
+                    roll = 0.0
 
                 elif plane == "yz":
-                    x = 0
+                    x = 0.0
                     y = pos
                     roll = max_tilt_deg * (pos / max_xy)
-                    pitch = 0
+                    pitch = 0.0
 
                 routine.append({
                     "x": x,
@@ -160,7 +168,7 @@ def generate_parabola_plane_dance(
                     "z": z,
                     "roll": roll,
                     "pitch": pitch,
-                    "yaw": 0
+                    "yaw": 0.0,
                 })
 
     # Entire dance twice:
@@ -172,13 +180,13 @@ def generate_parabola_plane_dance(
 
 
 def generate_screw_motion(
-    z_min=-12,
-    z_max=8,
-    yaw_min=-35,
-    yaw_max=35,
-    steps_per_half=80,
-    cycles=2
-):
+    z_min: float = -12,
+    z_max: float = 8,
+    yaw_min: float = -35,
+    yaw_max: float = 35,
+    steps_per_half: int = 80,
+    cycles: int = 2,
+) -> list[dict[str, float]]:
     """
     Generates a screw motion:
     Up in Z while yaw rotates one way,
@@ -193,7 +201,7 @@ def generate_screw_motion(
 
     routine = []
 
-    def smooth_interp(a, b, t):
+    def smooth_interp(a: float, b: float, t: float) -> float:
         # cosine easing for smooth acceleration
         t_smooth = (1 - math.cos(math.pi * t)) / 2
         return a + (b - a) * t_smooth
@@ -208,12 +216,12 @@ def generate_screw_motion(
             yaw = smooth_interp(yaw_min, yaw_max, t)
 
             routine.append({
-                "x": 0,
-                "y": 0,
+                "x": 0.0,
+                "y": 0.0,
                 "z": z,
-                "roll": 0,
-                "pitch": 0,
-                "yaw": yaw
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": yaw,
             })
 
         # Down phase
@@ -224,22 +232,21 @@ def generate_screw_motion(
             yaw = smooth_interp(yaw_max, yaw_min, t)
 
             routine.append({
-                "x": 0,
-                "y": 0,
+                "x": 0.0,
+                "y": 0.0,
                 "z": z,
-                "roll": 0,
-                "pitch": 0,
-                "yaw": yaw
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": yaw,
             })
 
     return routine
 
 
-
-ROUTINES = {
+ROUTINES: dict[str, Callable[[], list[dict[str, float]]]] = {
     "Cube Vertices (32x32x32)": cube_routine_smooth,
     "XY Circle (r=8)": xy_circle,
     "Cone Tracing": generate_cone_orbit_routine,
     "Parabola Dance": generate_parabola_plane_dance,
-    "Screw": generate_screw_motion
+    "Screw": generate_screw_motion,
 }

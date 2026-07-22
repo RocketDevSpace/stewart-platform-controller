@@ -186,7 +186,7 @@ class MainWindow(QWidget):
 
         # --- Routine timer ---
         self._routine_timer = QtCore.QTimer()
-        self._routine_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self._routine_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._routine_timer.timeout.connect(self._routine_tick)
 
         # --- Wire signals ---
@@ -675,12 +675,13 @@ class MainWindow(QWidget):
              self._vision_worker.mark_snapshot_consumed),
         ]:
             try:
-                sig.disconnect(slot)
+                # PyQt5 stubs type slots narrowly; runtime accepts any callable.
+                sig.disconnect(slot)  # type: ignore[call-overload]
             except TypeError:
                 pass
 
         QtCore.QMetaObject.invokeMethod(
-            self._vision_worker, "stop", QtCore.Qt.QueuedConnection
+            self._vision_worker, "stop", QtCore.Qt.ConnectionType.QueuedConnection
         )
 
     def _on_vision_worker_stopped(self) -> None:
