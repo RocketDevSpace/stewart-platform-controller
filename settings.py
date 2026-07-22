@@ -67,12 +67,27 @@ CAMERA_RUNTIME_SOFT_GAIN_MAX = 2.4
 # =============================================================================
 TRACKER_WARP_SIZE_PX = 480
 TRACKER_ARUCO_DETECT_SCALE = 0.5
-TRACKER_ARUCO_REDETECT_EVERY_N = 10
+# Every-frame marker detection (perf pass): the old freeze/re-solve cadence
+# (N=10) was injecting a ~3 Hz position stairstep as H snapped to each fresh
+# solve; solving from filtered centers every frame keeps the warp smooth.
+TRACKER_ARUCO_REDETECT_EVERY_N = 1
 TRACKER_WARP_GRAY_CACHE_N: int = 5   # recompute warp gray mean every N frames
 TRACKER_MIN_RADIUS_PX = 4.0
 TRACKER_MIN_CONTOUR_AREA = 150.0
-TRACKER_ARUCO_CENTER_FILTER_ALPHA = 0.70
-TRACKER_MAX_ARUCO_HOLD_FRAMES = 3
+# Marker-center filter (perf pass): deadband + scheduled alpha. Motion below
+# DEADBAND_PX freezes the filtered center (H fully static at rest); motion
+# past FAST_PX uses the fast alpha so real platform tilt tracks in 1-2
+# frames; in between the slow alpha smooths drift.
+TRACKER_ARUCO_CENTER_DEADBAND_PX = 0.3
+TRACKER_ARUCO_CENTER_FAST_PX = 1.5
+TRACKER_ARUCO_CENTER_ALPHA_SLOW = 0.70
+TRACKER_ARUCO_CENTER_ALPHA_FAST = 0.2
+# 6 hold attempts at every-frame detection = the same wall-clock stale-H
+# budget the old 3-attempts policy allowed at N=10 loss cadence.
+TRACKER_MAX_ARUCO_HOLD_FRAMES = 6
+TRACKER_ARUCO_SUBPIX_REFINE = True    # detector-level SUBPIX corner refinement
+TRACKER_ARUCO_FULLRES_SUBPIX = True   # re-refine used corners on full-res gray
+TRACKER_BALL_SUBPIXEL = True          # float (sub-pixel) ball centroid
 TRACKER_POS_FILTER_ENABLED = False
 TRACKER_POS_FILTER_ALPHA_SLOW = 0.88
 TRACKER_POS_FILTER_ALPHA_FAST = 0.25
@@ -93,6 +108,23 @@ TRACKER_HSV_V_MAX = int(_OV.get("TRACKER_HSV_V_MAX", 255))
 
 # low-pass weight on raw velocity (0=frozen, 1=raw); ~6 Hz cutoff at 30 fps; tunable
 BALL_VEL_FILTER_ALPHA: float = 0.55
+
+# Measurement-filter mode (cv/measurement_filter.py):
+#   "alpha_beta" — adaptive alpha-beta tracker: gains scheduled between MIN
+#                  (quiet, near-static) and MAX (fast acquisition) by
+#                  innovation magnitude and predicted speed.
+#   "legacy"     — original position low-pass + velocity EMA (regression ref).
+#   "raw"        — passthrough position + raw finite-difference velocity
+#                  (bench comparison only).
+TRACKER_FILTER_MODE = "alpha_beta"
+TRACKER_AB_ALPHA_MIN = 0.30
+TRACKER_AB_ALPHA_MAX = 0.90
+TRACKER_AB_BETA_MIN = 0.05
+TRACKER_AB_BETA_MAX = 0.50
+TRACKER_AB_INNOV_OPEN_MM = 1.0       # innovation below this: gains stay MIN
+TRACKER_AB_INNOV_FULL_MM = 4.0       # innovation above this: gains at MAX
+TRACKER_AB_SPEED_OPEN_MM_S = 60.0    # predicted speed below this: no opening
+TRACKER_AB_SPEED_FULL_MM_S = 150.0   # predicted speed above this: gains at MAX
 
 # =============================================================================
 # PD controller

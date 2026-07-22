@@ -36,7 +36,7 @@ if _REPO_ROOT not in sys.path:
 from control.ball_controller import BallController  # noqa: E402
 from core.ik_engine import IKEngine  # noqa: E402
 from core.platform_state import BallState, Pose  # noqa: E402
-from cv.measurement_filter import MeasurementFilter  # noqa: E402
+from cv.measurement_filter import FILTER_MODES, MeasurementFilter  # noqa: E402
 from hardware.serial_manager import SerialManager  # noqa: E402
 from hardware.servo_driver import ServoDriver  # noqa: E402
 from settings import MAX_TILT_DEG, PD_D_TERM_LIMIT_DEG  # noqa: E402
@@ -184,14 +184,19 @@ def build_profile(
 
 
 def run_bench(
-    samples: list[tuple[float, float, float]], label: str
+    samples: list[tuple[float, float, float]],
+    label: str,
+    filter_mode: str | None = None,
 ) -> dict[str, object]:
-    """Push the samples through the production chain; return the metrics."""
+    """Push the samples through the production chain; return the metrics.
+
+    filter_mode overrides settings.TRACKER_FILTER_MODE for A/B runs
+    (None = whatever the settings default is)."""
     if not samples:
         raise ValueError("no samples to bench")
 
     clock = FakeClock()
-    meas = MeasurementFilter()
+    meas = MeasurementFilter() if filter_mode is None else MeasurementFilter(filter_mode)
     controller = BallController(max_tilt_deg=float(MAX_TILT_DEG), clock=clock)
     ik = IKEngine()
     serial = CapturingSerial()
@@ -261,6 +266,7 @@ def run_bench(
 
     return {
         "profile": label,
+        "filter_mode": meas.mode,
         "frames": frames,
         "duration_s": round(duration_s, 3),
         "valid_frames": valid_frames,
@@ -287,9 +293,12 @@ def run_profile(
     frames: int = _DEFAULT_FRAMES,
     fps: float = _DEFAULT_FPS,
     seed: int = _DEFAULT_SEED,
+    filter_mode: str | None = None,
 ) -> dict[str, object]:
     """Build a named profile and bench it (test/API entry point)."""
-    return run_bench(build_profile(profile, frames, fps, seed), profile)
+    return run_bench(
+        build_profile(profile, frames, fps, seed), profile, filter_mode
+    )
 
 
 def format_report(report: dict[str, object]) -> str:
@@ -312,6 +321,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--frames", type=int, default=_DEFAULT_FRAMES)
     parser.add_argument("--fps", type=float, default=_DEFAULT_FPS)
     parser.add_argument("--seed", type=int, default=_DEFAULT_SEED)
+    parser.add_argument(
+        "--filter-mode",
+        choices=FILTER_MODES,
+        default=None,
+        help="override settings.TRACKER_FILTER_MODE for A/B comparison",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON")
     args = parser.parse_args(argv)
 
@@ -322,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         samples = build_profile(args.profile, args.frames, args.fps, args.seed)
         label = args.profile
 
-    report = run_bench(samples, label)
+    report = run_bench(samples, label, args.filter_mode)
     if args.json:
         print(json.dumps(report, indent=2))
     else:
