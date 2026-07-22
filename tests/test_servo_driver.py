@@ -66,22 +66,32 @@ class TestFormatCommand:
 class TestSendAngles:
     def test_successful_send_returns_true(self) -> None:
         driver, _ = make_driver(send_return=True)
-        assert driver.send_angles(all_90()) is True
+        assert driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0]) is True
 
     def test_serial_failure_returns_false(self) -> None:
         driver, _ = make_driver(send_return=False)
-        assert driver.send_angles(all_90()) is False
+        # Not the boot pose — a boot-pose send is dedup-suppressed (the
+        # firmware already holds it), which succeeds without touching serial.
+        assert driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0]) is False
 
     def test_send_calls_serial_send_once(self) -> None:
         driver, mock_serial = make_driver()
-        driver.send_angles(all_90())
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])
         mock_serial.send.assert_called_once()
+
+    def test_boot_pose_resend_is_deduped(self) -> None:
+        """The firmware boots at 90s; re-commanding 90s is pure serial noise
+        and is suppressed (returns True, nothing written)."""
+        driver, mock_serial = make_driver()
+        assert driver.send_angles(all_90()) is True
+        mock_serial.send.assert_not_called()
+        assert driver.dedup_skips == 1
 
     def test_unclipped_angles_sent_unchanged(self) -> None:
         driver, mock_serial = make_driver()
-        driver.send_angles(all_90())
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])
         sent_bytes = mock_serial.send.call_args[0][0]
-        assert sent_bytes == b"S,90,90,90,90,90,90,0\n"
+        assert sent_bytes == b"S,95,90,90,90,90,90,0\n"
 
     def test_servo_0_clipped_to_170_before_send(self) -> None:
         """Servo 0 at 180 must be clipped to 170 by send_angles.
@@ -112,7 +122,7 @@ class TestSendAngles:
 
     def test_serial_send_receives_bytes_not_str(self) -> None:
         driver, mock_serial = make_driver()
-        driver.send_angles(all_90())
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])
         sent_arg = mock_serial.send.call_args[0][0]
         assert isinstance(sent_arg, bytes)
 
@@ -141,7 +151,7 @@ class TestSendAngles:
     def test_streaming_uses_send_latest(self) -> None:
         driver, mock_serial = make_driver()
         mock_serial.send_latest.return_value = True
-        driver.send_angles(all_90(), streaming=True)
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0], streaming=True)
         mock_serial.send_latest.assert_called_once()
         mock_serial.send.assert_not_called()
 
@@ -156,6 +166,58 @@ class TestSendAngles:
         with pytest.raises(ValueError):
             driver.send_angles([float("nan"), 90.0, 90.0, 90.0, 90.0, 90.0])
         mock_serial.send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Schmitt-trigger quantizer + dedup (anti-dither, perf pass)
+# ---------------------------------------------------------------------------
+
+class TestSchmittQuantizer:
+    def test_boundary_oscillation_commits_nothing(self) -> None:
+        """Float commands flapping around a rounding boundary (the measured
+        6100-flips/min dither) must produce ZERO integer changes."""
+        driver, mock_serial = make_driver()
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])  # commit 95
+        mock_serial.send.reset_mock()
+        for i in range(20):
+            wobble = 95.5 + (0.35 if i % 2 else -0.35)  # 95.15..95.85
+            driver.send_angles([wobble, 90.0, 90.0, 90.0, 90.0, 90.0])
+        mock_serial.send.assert_not_called()          # all deduped at 95
+        assert driver._committed[0] == 95
+
+    def test_decisive_crossing_commits(self) -> None:
+        driver, mock_serial = make_driver()
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])
+        driver.send_angles([96.0, 90.0, 90.0, 90.0, 90.0, 90.0])
+        assert mock_serial.send.call_args[0][0] == b"S,96,90,90,90,90,90,0\n"
+
+    def test_large_jump_commits_immediately(self) -> None:
+        """No per-step lag: a jump crossing many boundaries lands on its
+        final integer in a single call (11.3 deg stays under the slew
+        ramp threshold, isolating the quantizer's behavior)."""
+        driver, mock_serial = make_driver()
+        driver.send_angles([101.3, 90.0, 90.0, 90.0, 90.0, 90.0])
+        assert mock_serial.send.call_args[0][0] == b"S,101,90,90,90,90,90,0\n"
+
+    def test_dedup_counts_skips(self) -> None:
+        driver, mock_serial = make_driver()
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])
+        for _ in range(5):
+            driver.send_angles([95.2, 90.0, 90.0, 90.0, 90.0, 90.0])
+        assert driver.dedup_skips == 5
+        assert mock_serial.send.call_count == 1
+
+    def test_dedup_disabled_sends_every_command(self) -> None:
+        driver, mock_serial = make_driver()
+        driver.dedup_enabled = False
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])
+        assert mock_serial.send.call_count == 2
+
+    def test_raw_send_updates_committed_state(self) -> None:
+        driver, _ = make_driver()
+        driver.send_raw("S,120,90,90,90,90,90")
+        assert driver._committed[0] == 120
 
 
 # ---------------------------------------------------------------------------

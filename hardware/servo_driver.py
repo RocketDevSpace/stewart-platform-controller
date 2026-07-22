@@ -19,7 +19,11 @@ import logging
 
 from core.safety import NUM_SERVOS, clip_servo_angles, select_speed_delay
 from hardware.serial_manager import SerialManager
-from settings import DEBUG_PRINTS
+from settings import (
+    DEBUG_PRINTS,
+    SERVO_DEDUP_ENABLED,
+    SERVO_QUANT_HYST_DEG,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,13 @@ class ServoDriver:
     def __init__(self, serial_manager: SerialManager) -> None:
         self._serial = serial_manager
         self._last_sent: list[float] = list(_BOOT_ANGLES)
+        # Schmitt-trigger quantizer state: the integer each servo is
+        # currently committed to. Seeded with the firmware boot pose.
+        self._committed: list[int] = [int(a) for a in _BOOT_ANGLES]
+        self.quant_hyst_deg = float(SERVO_QUANT_HYST_DEG)
+        self.dedup_enabled = bool(SERVO_DEDUP_ENABLED)
+        # Telemetry: sends actually suppressed by dedup.
+        self.dedup_skips = 0
         # Expected firmware-side ramp duration of the LAST send (ms). The
         # firmware acks only AFTER a ramp and buffers just 64 bytes of
         # commands while ramping — streaming callers (RoutineRunner) must
@@ -90,17 +101,43 @@ class ServoDriver:
                     "[SAFETY CLIP] Servo %d: %s -> %s", idx, original, clipped
                 )
 
-        speed_delay = select_speed_delay(self._last_sent, clipped_angles)
-        cmd = self.format_command(clipped_angles, speed_delay)
+        quantized = self._quantize(clipped_angles)
+
+        if self.dedup_enabled and quantized == [int(a) for a in self._last_sent]:
+            # The hardware already holds exactly this command — sending it
+            # again is pure serial noise. (Safe: no firmware watchdog; the
+            # Servo library holds the last pulse width indefinitely.)
+            self.dedup_skips += 1
+            self.last_ramp_ms = 0.0
+            return True
+
+        target = [float(q) for q in quantized]
+        speed_delay = select_speed_delay(self._last_sent, target)
+        cmd = self.format_command(target, speed_delay)
 
         if streaming:
             ok = self._serial.send_latest(cmd.encode())
         else:
             ok = self._serial.send(cmd.encode())
         if ok:
-            self.last_ramp_ms = self._ramp_ms(clipped_angles, speed_delay)
-            self._last_sent = list(clipped_angles)
+            self.last_ramp_ms = self._ramp_ms(target, speed_delay)
+            self._last_sent = target
         return ok
+
+    def _quantize(self, angles: list[float]) -> list[int]:
+        """Schmitt-trigger rounding: each servo keeps its committed integer
+        until the commanded float crosses the rounding boundary by
+        quant_hyst_deg. A large jump commits directly to its final integer
+        in one call — zero added latency for genuine motion; boundary
+        noise commits nothing."""
+        out: list[int] = []
+        for i, a in enumerate(angles):
+            c = self._committed[i]
+            if abs(a - c) > 0.5 + self.quant_hyst_deg:
+                c = int(round(a))
+                self._committed[i] = c
+            out.append(c)
+        return out
 
     def _ramp_ms(self, target: list[float], speed_delay: int) -> float:
         if speed_delay <= 0:
@@ -151,4 +188,7 @@ class ServoDriver:
         if ok:
             self.last_ramp_ms = self._ramp_ms(clipped_angles, speed_delay)
             self._last_sent = list(clipped_angles)
+            # Raw commands bypass the Schmitt (explicit operator intent)
+            # but must keep the quantizer's committed state truthful.
+            self._committed = [int(round(a)) for a in clipped_angles]
         return ok

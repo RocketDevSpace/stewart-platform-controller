@@ -33,6 +33,16 @@ SAFETY_LIMITS = {
 SERVO_SLEW_INSTANT_MAX_DEG = 12.0
 SERVO_LARGE_MOVE_SPEED_DELAY_MS = 5     # -> 200 deg/s hardware ramp on big moves
 
+# Anti-dither command quantization (perf pass). The protocol carries whole
+# degrees; without hysteresis, PD noise near a rounding boundary flaps the
+# servos +/-1 deg continuously (measured: ~6100 integer flips/min at rest).
+# A servo's committed integer only changes when the commanded float crosses
+# the boundary by this margin (Schmitt trigger); identical quantized command
+# tuples are not re-sent at all (the firmware holds its last command; it has
+# no watchdog).
+SERVO_QUANT_HYST_DEG = 0.4
+SERVO_DEDUP_ENABLED = True
+
 # =============================================================================
 # Camera
 # =============================================================================
