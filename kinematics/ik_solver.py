@@ -67,7 +67,7 @@ def rot_z(a: float) -> np.ndarray:
 
 def build_rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
     """roll/pitch/yaw in radians."""
-    return rot_z(yaw) @ rot_y(pitch) @ rot_x(roll)
+    return np.asarray(rot_z(yaw) @ rot_y(pitch) @ rot_x(roll))
 
 
 def wrap_deg(angle: float) -> float:

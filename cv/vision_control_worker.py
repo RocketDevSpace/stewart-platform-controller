@@ -24,6 +24,7 @@ from control.ball_controller import BallController
 from core.ik_engine import IKEngine
 from core.platform_state import BallState, IKResult, Pose
 from cv.ball_tracker import BallTracker
+from cv.camera_source import CameraSource
 from settings import (
     AUTO_TRIM_ENABLED,
     BALL_TARGET_DEFAULT_X_MM,
@@ -42,41 +43,15 @@ from settings import (
     TRACKER_HSV_V_MAX,
     TRACKER_HSV_V_MIN,
     TRACKER_REACQUIRE_VALID_FRAMES,
+    TRACKER_WARP_SIZE_PX,
 )
 
-# tracker-internal keys we zero-fill (our BallTracker.update() returns BallState,
-# not a dict with profile_ms, so these sub-step timings are unavailable)
-_TRK_ZERO_KEYS: tuple[str, ...] = (
-    "trk_capture",
-    "trk_frame_age",
-    "trk_slow_streak",
-    "trk_runtime_applied",
-    "trk_runtime_tries",
-    "trk_aruco",
-    "trk_aruco_retry",
-    "trk_h",
-    "trk_warp",
-    "trk_hsv",
-    "trk_contour",
-    "trk_kin",
-    "trk_overlay",
-    "trk_cached_h",
-    "trk_radius_px",
-    "trk_area",
-    "trk_circularity",
-    "trk_fill",
-    "trk_dt_s",
-    "trk_warp_gray",
-    "trk_vmin_eff",
-    "trk_aruco_ids",
-    "trk_raw_speed_mm_s",
-    "trk_raw_vx_mm_s",
-    "trk_raw_vy_mm_s",
-    "trk_pos_filter_alpha",
-    "trk_pos_lag_mm",
-    "trk_pos_filter_enabled",
-)
-
+# Timing dicts contain ONLY genuinely measured values — the 28 zero-filled
+# "trk_*" placeholder keys are gone (the GUI plot was rendering fabricated
+# zeros as data). Semantics of the frame_to_* keys:
+#   frame_to_worker_ms: capture timestamp -> after tracker.process() returned
+#   frame_to_cmd:       capture timestamp -> after the command send call
+# Both measured against the timestamp of the frame actually processed.
 _EMPTY_CONTROL_TERMS: dict = {
     "position_vec_mm": (0.0, 0.0),
     "velocity_vec_mm_s": (0.0, 0.0),
@@ -164,7 +139,10 @@ class VisionControlWorker(QtCore.QObject):
         self._last_snapshot_emit_perf = 0.0
 
         self._prev_arm_points: np.ndarray | None = None
+        self._last_frame_ts = 0.0
+        self._last_error_emit = 0.0
 
+        self.camera: CameraSource | None = None
         self.ball_tracker: BallTracker | None = None
         self.ball_controller: BallController | None = None
 
@@ -183,11 +161,18 @@ class VisionControlWorker(QtCore.QObject):
         if self._running:
             return
 
-        if self.ball_tracker is None:
+        if self.ball_tracker is None or self.camera is None:
             try:
+                # Camera first (the blocking probe runs on this QThread, off
+                # the GUI); tracker/controller failures must release it —
+                # a half-initialized worker used to leak the open camera
+                # and then no-op forever on restart.
+                if self.camera is None:
+                    self.camera = CameraSource(camera_index=self._camera_index)
+                    self.camera.open()
                 self.ball_tracker = BallTracker(
-                    camera_index=self._camera_index,
-                    show_debug=False,
+                    platform_size_mm=240.0,
+                    warp_size_px=int(TRACKER_WARP_SIZE_PX),
                 )
                 self.ball_controller = BallController(
                     kp=self._kp_init,
@@ -203,17 +188,26 @@ class VisionControlWorker(QtCore.QObject):
                 )
                 self.ball_tracker.set_hsv_thresholds(*self._pending_hsv)
             except Exception as exc:
+                if self.camera is not None:
+                    try:
+                        self.camera.close()
+                    except Exception:
+                        pass
+                    self.camera = None
+                self.ball_tracker = None
+                self.ball_controller = None
                 self.error.emit(f"camera init failed: {exc}")
                 self.stopped.emit()
                 return
 
+            cam_stats = self.camera.stats()
             self.camera_ready.emit({
                 "hsv_lower": self.ball_tracker.hsv_lower.tolist(),
                 "hsv_upper": self.ball_tracker.hsv_upper.tolist(),
-                "backend": getattr(self.ball_tracker, "camera_backend", "unknown"),
-                "mode": getattr(self.ball_tracker, "_runtime_policy_state", ""),
-                "period_ms": float(getattr(self.ball_tracker, "camera_measured_period_ms", 0.0)),
-                "gray": float(getattr(self.ball_tracker, "_capture_gray_mean", 0.0)),
+                "backend": cam_stats.backend,
+                "mode": cam_stats.policy_mode,
+                "period_ms": cam_stats.period_ms,
+                "gray": cam_stats.gray_mean,
             })
 
         self._running = True
@@ -224,6 +218,7 @@ class VisionControlWorker(QtCore.QObject):
         self._snapshot_inflight = False
         self._last_snapshot_emit_perf = 0.0
         self._prev_arm_points = None
+        self._last_frame_ts = 0.0
 
         self._timer = QtCore.QTimer(self)
         self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
@@ -238,10 +233,11 @@ class VisionControlWorker(QtCore.QObject):
             self._timer.deleteLater()
             self._timer = None
         try:
-            if self.ball_tracker is not None:
-                self.ball_tracker.release()
+            if self.camera is not None:
+                self.camera.close()
         except Exception:
             pass
+        self.camera = None
         self.ball_tracker = None
         self.ball_controller = None
         self.stopped.emit()
@@ -332,28 +328,34 @@ class VisionControlWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def _tick(self) -> None:
-        if not self._running or self.ball_tracker is None or self.ball_controller is None:
+        if (
+            not self._running
+            or self.camera is None
+            or self.ball_tracker is None
+            or self.ball_controller is None
+        ):
             return
 
         loop_start = time.perf_counter()
         self._counter += 1
 
         try:
-            # Read latest_ts under lock for stale-check and latency timing.
-            with self.ball_tracker._capture_lock:
-                latest_ts = self.ball_tracker._latest_frame_ts
-
             # Stale frame: no new frame since last processed — skip silently.
             # Do NOT reset controller state or advance miss count.
-            if (
-                latest_ts > 0
-                and self.ball_tracker._last_processed_frame_ts > 0
-                and latest_ts <= self.ball_tracker._last_processed_frame_ts
-            ):
+            if not self.camera.has_new_frame(self._last_frame_ts):
                 return
 
+            grabbed = self.camera.read_latest()
+            if grabbed is None:
+                return
+            frame, latest_ts = grabbed
+            self._last_frame_ts = latest_ts
+
             t0 = time.perf_counter()
-            ball_state = self.ball_tracker.update()
+            ball_state = self.ball_tracker.process(
+                frame, latest_ts,
+                brightness_gain=self.camera.stats().software_gain,
+            )
             t1 = time.perf_counter()
 
             now_perf = time.perf_counter()
@@ -362,6 +364,8 @@ class VisionControlWorker(QtCore.QObject):
                 or (now_perf - self._last_snapshot_emit_perf)
                 >= (1.0 / float(self._snapshot_hz))
             )
+
+            cam_view, warped_view, mask_view = self.ball_tracker.debug_views()
 
             if ball_state is None:
                 self._miss_count += 1
@@ -385,9 +389,9 @@ class VisionControlWorker(QtCore.QObject):
                     tracking_valid=False,
                     reason="no_ball_detected",
                     miss_count=self._miss_count,
-                    camera_bgr=getattr(self.ball_tracker, "_last_camera_bgr", None),
-                    warped_bgr=getattr(self.ball_tracker, "_last_warped_bgr", None),
-                    mask_gray=getattr(self.ball_tracker, "_last_mask_gray", None),
+                    camera_bgr=cam_view,
+                    warped_bgr=warped_view,
+                    mask_gray=mask_view,
                     worker_emit_perf_ts=time.perf_counter(),
                 )
                 if should_emit and not self._snapshot_inflight:
@@ -468,9 +472,9 @@ class VisionControlWorker(QtCore.QObject):
                 tracking_valid=True,
                 reason="reacquire_gating" if send_gated else "ok",
                 miss_count=0,
-                camera_bgr=getattr(self.ball_tracker, "_last_camera_bgr", None),
-                warped_bgr=getattr(self.ball_tracker, "_last_warped_bgr", None),
-                mask_gray=getattr(self.ball_tracker, "_last_mask_gray", None),
+                camera_bgr=cam_view,
+                warped_bgr=warped_view,
+                mask_gray=mask_view,
                 worker_emit_perf_ts=time.perf_counter(),
             )
             if should_emit and not self._snapshot_inflight:
@@ -479,11 +483,22 @@ class VisionControlWorker(QtCore.QObject):
                 self.snapshot_ready.emit(snapshot)
 
         except Exception as exc:
-            self.error.emit(str(exc))
+            # Rate-limit: a persistent per-tick failure at loop rate would
+            # flood the GUI log with up to VISION_LOOP_HZ messages/second.
+            now = time.perf_counter()
+            if (now - self._last_error_emit) >= 1.0:
+                self._last_error_emit = now
+                self.error.emit(str(exc))
 
     # ------------------------------------------------------------------
     # Timing helpers
     # ------------------------------------------------------------------
+
+    def _capture_stats_pair(self) -> tuple[float, float]:
+        if self.camera is None:
+            return 0.0, 0.0
+        st = self.camera.stats()
+        return float(st.period_ms), float(st.gray_mean)
 
     def _build_miss_timings(
         self,
@@ -492,22 +507,21 @@ class VisionControlWorker(QtCore.QObject):
         loop_start: float,
         latest_ts: float,
     ) -> dict:
-        tracker = self.ball_tracker
-        timings_ms: dict = {
+        period_ms, gray_mean = self._capture_stats_pair()
+        return {
             "ball_update": (t1 - t0) * 1000.0,
             "pd_compute": 0.0,
             "ik_solve": 0.0,
             "serial_enqueue": 0.0,
             "total": (time.perf_counter() - loop_start) * 1000.0,
-            "frame_to_worker_ms": 0.0,
+            "frame_to_worker_ms": (
+                max(0.0, (t1 - latest_ts) * 1000.0) if latest_ts > 0 else 0.0
+            ),
             "worker_to_gui_ms": 0.0,
             "frame_to_cmd": 0.0,
-            "trk_cap_period": float(getattr(tracker, "_capture_period_ms", 0.0)),
-            "trk_gray_mean": float(getattr(tracker, "_capture_gray_mean", 0.0)),
+            "trk_cap_period": period_ms,
+            "trk_gray_mean": gray_mean,
         }
-        for key in _TRK_ZERO_KEYS:
-            timings_ms.setdefault(key, 0.0)
-        return timings_ms
 
     def _build_valid_timings(
         self,
@@ -521,14 +535,14 @@ class VisionControlWorker(QtCore.QObject):
         loop_start: float,
         latest_ts: float,
     ) -> dict:
-        tracker = self.ball_tracker
+        period_ms, gray_mean = self._capture_stats_pair()
         frame_to_worker = (
             max(0.0, (t1 - latest_ts) * 1000.0) if latest_ts > 0 else 0.0
         )
         frame_to_cmd = (
             max(0.0, (t_cmd1 - latest_ts) * 1000.0) if latest_ts > 0 else 0.0
         )
-        timings_ms: dict = {
+        return {
             "ball_update": (t1 - t0) * 1000.0,
             "pd_compute": (t3 - t2) * 1000.0,
             "ik_solve": (t4 - t3) * 1000.0,
@@ -537,9 +551,6 @@ class VisionControlWorker(QtCore.QObject):
             "frame_to_worker_ms": frame_to_worker,
             "worker_to_gui_ms": 0.0,
             "frame_to_cmd": frame_to_cmd,
-            "trk_cap_period": float(getattr(tracker, "_capture_period_ms", 0.0)),
-            "trk_gray_mean": float(getattr(tracker, "_capture_gray_mean", 0.0)),
+            "trk_cap_period": period_ms,
+            "trk_gray_mean": gray_mean,
         }
-        for key in _TRK_ZERO_KEYS:
-            timings_ms.setdefault(key, 0.0)
-        return timings_ms

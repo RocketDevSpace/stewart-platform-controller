@@ -863,9 +863,10 @@ class MainWindow(QWidget):
             self._sync_auto_trim_from_terms(terms)
             self._sync_home_calibration_from_terms(terms)
 
-            # Timing history
+            # Timing history — serial_enqueue arrives measured from the
+            # worker (it was previously overwritten with a nonexistent key,
+            # so that plot line had never shown a real number).
             timings = dict(snapshot.timings_ms)
-            timings["serial_enqueue"] = float(timings.get("cmd_enqueue_worker", 0.0))
             timings["visualizer_gui"] = vis_ms
             wets = snapshot.worker_emit_perf_ts
             timings["worker_to_gui_ms"] = (
