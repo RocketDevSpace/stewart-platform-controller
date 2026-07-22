@@ -2,7 +2,7 @@
 
 *Living document — update at the end of substantive sessions. Sync between venues if applicable.*
 
-**Last updated:** June 11, 2026 — full-codebase audit; hardening roadmap M8–M12 adopted; PRs #14 (velocity low-pass) and #15 (servo 4 geometry fix) merged; M8 housekeeping in review.
+**Last updated:** July 22, 2026 — 2026-07-22 full-repo review (five parallel agents, ~70 findings) and the overhaul branch `overhaul/safety-ik-vision-gui` absorbing M9–M12 plus unroadmapped safety work; firmware captured off the board 2026-07-20; M8 merged via PR #16.
 
 ---
 
@@ -12,18 +12,15 @@ A PyQt5 desktop application that drives a hand-built 6-DOF Stewart platform via 
 
 ## Current phase
 
-**Post-refactor hardening (M8–M12). Refactor M1–M7 fully merged.**
+**Hardening complete pending hardware validation. The 2026-07-22 overhaul absorbed M9–M12; the PR is gated on manual hardware smoke tests.**
 
-M7 (Codex audit + integration) merged May 2026 via PRs #9/#10; autotune guard follow-ups merged via PR #13. A full-codebase audit on June 11, 2026 confirmed the layered architecture held, and produced a five-milestone hardening plan addressing what the refactor left behind: a reproducible IK branch-flip bug (the screw-routine servo snap at yaw=-35°), no rate limiting at the hardware boundary, three modules that regrew past 700–1000 lines (`gui/main_window.py`, `control/ball_controller.py`, `cv/ball_tracker.py`), test gaps on the riskiest code (`compute()` is tested but production calls `compute_with_terms()`; the IK solver internals and tracker math have no tests), and doc/hygiene drift.
+The hardening phase played out in three moves:
 
-Hardening milestones (see Phase roadmap below for status):
-- **M8 — Housekeeping:** untrack `__pycache__`, requirements files, doc sync, config.py comment fixes.
-- **M9 — IK correctness + safety rail:** fix branch-flip in `kinematics/ik_solver.py`; slew-rate guard in `core/safety.py` applied at `ServoDriver.send_angles`; consolidate inline clamps; reacquire gating into worker command path; continuity regression tests.
-- **M10 — Controller decomposition:** split autotune/auto-trim out of `ball_controller.py`; single PD compute path.
-- **M11 — Vision split:** camera lifecycle out of `BallTracker`; public tracker API; synthetic-frame tests; clear `cv/` excludes.
-- **M12 — GUI slimming:** user-settings overlay replaces the settings.py regex rewrite; extract timing plot + vision bridge from `main_window.py`; non-blocking serial connect.
+1. **M8 — Housekeeping** merged via PR #16 (untracked `__pycache__`, requirements files, doc sync, config.py comment fixes).
+2. **Firmware capture (2026-07-20, branch `firmware/arduino-capture`, folded into the overhaul PR):** the running Uno firmware was read off the board (avrdude flash dump — the original sketch source was never committed), a behavior-accurate sketch reconstructed from disassembly, the pin map and servo clocking documented against `config.py` geometry, the serial protocol verified against the live board, and wiring validated with `firmware/wiring_check.py`. See `firmware/README.md`.
+3. **The 2026-07-22 full-repo review + overhaul (branch `overhaul/safety-ik-vision-gui`, one PR):** five parallel line-by-line reviews (kinematics/core, hardware/control, vision, GUI, tests/tooling/docs) produced ~70 findings — record at `docs/code-review-2026-07-22.md`, every finding mapped to the commit that addressed it. The six-step overhaul absorbed all of M9 (IK branch-selection redesign, typed `IKResult`, reacquire gate on the command path, clamp consolidation, continuity tests), M10 (controller decomposition into SetpointArbiter/AutoTrim/PDAutotuner/PDCore, single PD compute path), M11 (CameraSource split, pure tracker, synthetic-frame tests, empty setup.cfg excludes), and M12 (settings overlay, timing-plot extraction, PoseCommander, non-blocking connect) — **plus safety work that was never on the roadmap:** serial hardening (write lock, crash-surviving read loop, disconnect reporting, double-connect guard, latest-wins streaming writer, [READY] handshake), mode mutual exclusion in the GUI, the `closeEvent` deadlock fix, and a `sys.excepthook` emergency-shutdown path. Test suite grew 90 → 206.
 
-After M12, feature development resumes (second camera, ball catching, ball bouncing).
+After the overhaul merges, feature development resumes (second camera, ball catching, ball bouncing).
 
 ## Architectural commitments
 
@@ -38,7 +35,7 @@ These are committed and shape the project. Revisable only with explicit discussi
 - **Layered module architecture.** GUI → Control → Hardware → Serial. Layer violations are not fixed in place; they are reverted.
 - **Single call sites for shared concerns.** IK lives in `core/ik_engine.py`. Serial command formatting in `hardware/servo_driver.py`. Safety clipping in `core/safety.py`. Data shapes in `core/platform_state.py`.
 - **Repo-root-relative imports.** No `stewart_control.*` prefixes. The original Codex codebase used these; they're being removed as code touches them.
-- **CI on every push and PR** via `.github/workflows/ci.yml` — pytest, flake8, mypy. Legacy modules are excluded; exclusion list shrinks each milestone.
+- **CI on every push and PR** via `.github/workflows/ci.yml` — pytest, flake8, mypy. As of the 2026-07-22 overhaul the setup.cfg exclude lists are empty: every module is linted and type-checked. CI is ubuntu/unit-only; hardware paths stay manual.
 
 ## Decisions log
 
@@ -58,7 +55,14 @@ These are committed and shape the project. Revisable only with explicit discussi
 | 12 | M6 Step 5 narrows `cv/` flake8/mypy exclude to `cv/ball_tracker.py` rather than removing it | PM plan said "remove cv/ball_controller.py from excludes" but setup.cfg excludes the whole `cv/` directory. After ball_controller moves to `control/`, `cv/ball_tracker.py` remains untyped and must stay excluded. Directory-level exclude is replaced with a file-level one. | Committed (M6, May 10, 2026) |
 | 13 | Ball velocity low-pass filter lives in the tracker, weight in `settings.BALL_VEL_FILTER_ALPHA` | Filtering at source keeps BallController clean; raw frame-diff velocity noise made kd untunable. Filter state resets on tracking loss. | Committed (PR #14, merged June 11, 2026) |
 | 14 | `config.py` servo 4 shaft Y corrected −99.920 → −99.290 (digit transposition) | Shaft table is generated from the measured 0/5 mirror pair rotated ±120° about Z, so all shafts must sit at r = 100.276 mm; servo 4 was the lone outlier and the rotation predicts −99.2904 exactly. Quick hardware symmetry check (servo 4 vs servo 1) recommended on next power-up. | Committed (PR #15, June 11, 2026) |
-| 15 | The M9 slew-rate guard applies to ALL command paths — manual sends ramp through it, no bypass | Single choke point in `ServoDriver.send_angles` protects routines, vision, and manual alike; a bypass flag would reintroduce the unprotected path the guard exists to close. | Committed (June 11, 2026), implement in M9 |
+| 15 | The M9 slew-rate guard applies to ALL command paths — manual sends ramp through it, no bypass | Single choke point in `ServoDriver.send_angles` protects routines, vision, and manual alike; a bypass flag would reintroduce the unprotected path the guard exists to close. | Committed (June 11, 2026); implemented in overhaul step 2 |
+| 16 | The 2026-07-22 overhaul ships as ONE PR containing everything (M9–M12 + review fixes) | The review findings interlock across layers; splitting them would force artificial sequencing and repeated partial states. Six reviewable step-commits inside one PR instead. | Committed (2026-07-22) |
+| 17 | Send-mode routines auto-return home: ease back to neutral on completion AND cancel | Routines used to park at their final pose — screw ended at z=-12/yaw=-35, its most extreme point. Approved behavior change; `cancel(wind_down=False)` exists for vision-mode takeover. | Committed (2026-07-22, overhaul step 3) |
+| 18 | Frozen `IKResult` dataclass replaces the untyped IK result dict | Per-servo `servo_status` failure reporting (no silent clamps), a complete failure shape (the exception path used to return a 2-key dict), neutral placeholders for failed servos (0° is a valid extreme command — dangerous sentinel). Dead `ServoAngles` contract deleted. | Committed (2026-07-22, overhaul step 3) |
+| 19 | User-settings overlay (`settings_store.py` + untracked `user_settings.json`) replaces the save-trim regex rewrite of settings.py | The regex rewrite had corrupted trim values on this machine (unrounded repr floats), silently reported success on zero substitutions, and had a sci-notation blind spot. Overlay: 12-key whitelist, atomic writes, corrupt input degrades to defaults. | Committed (2026-07-22, overhaul step 5) |
+| 20 | Committed `settings.py` defaults are neutral (COM4, 0.0 trims); machine-local values live in `user_settings.json` | The repo stops carrying one machine's calibration; every `from settings import X` picks up overrides at import with zero call-site churn. | Committed (2026-07-22, overhaul step 5) |
+| 21 | Reacquire gating lives in the worker command path, counting real processed frames | It previously ran in the GUI snapshot handler — after the command had already been sent, on ≤30 Hz subsampled snapshots — so it gated nothing. | Committed (2026-07-22, overhaul step 3) |
+| 22 | Large moves ramp firmware-side via the speedDelay policy (`core/safety.select_speed_delay`) | Jumps over `SERVO_SLEW_INSTANT_MAX_DEG` are sent with a nonzero speedDelay so the firmware ramps in hardware (1°/step); small streaming steps stay instant. Implements decision #15 with the ramp where it is cheapest and most reliable. | Committed (2026-07-22, overhaul step 2) |
 
 For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone scope and acceptance criteria, see `SPEC.md`.
 
@@ -67,10 +71,10 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 - **Servo safety limits:** servos 0, 2, 4 max 170°; servos 1, 3, 5 min 10°. Hardware-defined; do not change without re-measuring rig.
 - **Control loop:** 50 Hz target (20 ms QTimer). Vision loop runs at the same cadence.
 - **Qt timer callbacks must stay fast** (<5 ms). Blocking work goes to threads.
-- **Hardware tests require a physical Arduino on COM4** (or whatever `settings.SERIAL_PORT` is set to). These tests are marked `[HARDWARE]` and skipped in CI.
+- **Hardware tests require a physical Arduino** on the configured serial port (`settings.SERIAL_PORT`, per-machine value in `user_settings.json`; the dev board enumerates as COM8 — see `firmware/README.md`). These tests are marked `[HARDWARE]` and skipped in CI.
 - **Windows-only.** Project depends on COM-port serial conventions and PyQt5; no Mac/Linux support planned.
 - **Vision pipeline currently 2D.** Single camera + ArUco corner markers + HSV blob detection. z-axis ball state is plumbed but not populated.
-- **Known IK defect (M9 target):** the solver's closest-to-neutral servo-angle pick can override the continuity-based branch choice, causing the screw-routine servo snap at yaw=-35°; until M9 lands, avoid full-range yaw routines with hardware attached.
+- **The IK branch-flip defect (the screw-routine servo snap at yaw=-35°) is fixed** — root-caused and redesigned in overhaul step 3, pinned by sweep-continuity regression tests. Remaining known geometry issue: the Cone Tracing routine exits the physical workspace on 20 of 120 steps (pre-existing, now honestly reported per-servo); adjusting its envelope is an open decision.
 
 ## Things Claude has gotten wrong on this project
 
@@ -83,9 +87,11 @@ For shipped technical changes per milestone, see `CHANGELOG.md`. For milestone s
 ## Open questions
 
 **Open:**
+- **Hardware smoke tests gate the overhaul PR** — manual control, routines (verify the screw fix and return-home on hardware), vision mode, save-trim overlay, disconnect/reconnect behavior.
+- **Cone Tracing workspace exits** (20 of 120 steps, ratio ≈ −1.005; pre-existing, now visible): shrink the routine's tilt/radius or accept per-servo failure reporting during those steps. Physical-envelope decision — Hudson's call.
 - Hardware symmetry check after the servo 4 geometry fix (PR #15): on next power-up, verify servo 4 neutral/extremes mirror servo 1.
-- Camera exposure / HSV startup conflict — long-standing, unresolved; becomes tractable after M11 isolates camera lifecycle in one class.
-- Second-camera setup. Needs a real plan after M12. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
+- Camera exposure / HSV startup conflict — long-standing, unresolved; now tractable with the camera lifecycle isolated in `cv/camera_source.py` (overhaul step 4).
+- Second-camera setup. Needs a real plan now that the hardening phase is done. Hardware needs (camera, mounting, calibration approach), software needs (multi-tracker composition, 3D reconstruction math), GUI changes (second video pane).
 - Ball catching feasibility gated on sub-20ms loop benchmark. Benchmark on hardware before scoping.
 
 **Closed:**
@@ -111,11 +117,11 @@ Rough plan, will evolve. Each phase produces reviewable artifacts; each builds o
 5. **M5 — GUI Split + cleanup items** ✅ (May 10, 2026)
 6. **M6 — Vision Loop Cleanup + ball_controller move + comms/ retirement** ✅ (May 10, 2026)
 7. **M7 — Codex audit + integration** ✅ (May 12, 2026; merged)
-8. **M8 — Housekeeping** (hardening) — in review (June 11, 2026)
-9. **M9 — IK correctness + safety rail** — next up; highest-impact hardening milestone
-10. **M10 — Controller decomposition**
-11. **M11 — Vision pipeline split + tests**
-12. **M12 — GUI slimming + settings persistence**
+8. **M8 — Housekeeping** ✅ (merged via PR #16)
+9. **M9 — IK correctness + safety rail** ✅ (2026-07-22 overhaul, steps 2–3)
+10. **M10 — Controller decomposition** ✅ (2026-07-22 overhaul, step 5)
+11. **M11 — Vision pipeline split + tests** ✅ (2026-07-22 overhaul, step 4)
+12. **M12 — GUI slimming + settings persistence** ✅ (2026-07-22 overhaul, steps 5–6)
 13. **Phase 2: Second-camera setup** — scope after M12. Adds 3D ball tracking as the foundation for ball catching and bouncing.
 14. **Phase 3: Ball catching** — trajectory prediction from 3D state, platform pre-positioning. Requires sub-20ms loop benchmark first.
 15. **Phase 4: Ball bouncing** — timed platform impulse for vertical oscillation. Requires Phase 2.

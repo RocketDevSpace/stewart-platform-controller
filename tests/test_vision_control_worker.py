@@ -1,18 +1,132 @@
 """
 tests/test_vision_control_worker.py
 
-Unit tests for cv/vision_control_worker.py.
-
-Skips hardware-dependent tests; covers the backpressure mechanism and
-ControlSnapshot construction without requiring a live camera.
+Drives the worker's REAL _tick() with a fake CameraSource and fake tracker
+(no camera needed) — replacing the old tautology tests that asserted their
+own local variables. Covers: stale-frame skip, miss counting + filter
+reset, reacquire gating on the command path, snapshot backpressure through
+the real code path, and partial-init camera cleanup.
 """
 
 import sys
+from typing import Any
 
+import numpy as np
+
+from core.platform_state import BallState
+from cv.camera_source import CaptureStats
 from cv.vision_control_worker import ControlSnapshot, VisionControlWorker
+from settings import (
+    TRACKER_REACQUIRE_VALID_FRAMES,
+    VISION_MISS_NEUTRAL_AFTER_FRAMES,
+)
+
 
 # ---------------------------------------------------------------------------
-# ControlSnapshot construction
+# Fakes
+# ---------------------------------------------------------------------------
+
+
+class FakeCamera:
+    def __init__(self) -> None:
+        self.ts = 0.0
+        self.frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        self.closed = False
+
+    def advance(self) -> None:
+        self.ts += 1.0 / 30.0
+
+    def has_new_frame(self, since_ts: float) -> bool:
+        return self.ts > since_ts
+
+    def read_latest(self) -> tuple[np.ndarray, float] | None:
+        return self.frame.copy(), self.ts
+
+    def latest_frame_ts(self) -> float:
+        return self.ts
+
+    def stats(self) -> CaptureStats:
+        return CaptureStats(
+            backend="FAKE", period_ms=33.3, gray_mean=100.0,
+            fail_streak=0, slow_streak=0, policy_mode="manual",
+            software_gain=1.0,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeTracker:
+    """Returns a scripted sequence of BallState/None results."""
+
+    def __init__(self, results: list[BallState | None]) -> None:
+        self.results = list(results)
+        self.hsv_lower = np.array([10, 83, 125], dtype=np.uint8)
+        self.hsv_upper = np.array([28, 255, 255], dtype=np.uint8)
+
+    def process(
+        self, frame: np.ndarray, ts: float, brightness_gain: float = 1.0
+    ) -> BallState | None:
+        if self.results:
+            return self.results.pop(0)
+        return None
+
+    def debug_views(self) -> tuple[None, None, None]:
+        return None, None, None
+
+    def set_hsv_thresholds(self, *args: int) -> None:
+        pass
+
+
+class FakeController:
+    def __init__(self) -> None:
+        self.resets = 0
+
+    def compute_with_terms(
+        self, ball_state: BallState
+    ) -> tuple[float, float, dict]:
+        return 1.0, -1.0, {"kp": 0.045, "kd": 0.022}
+
+    def reset_motion_state(self) -> None:
+        self.resets += 1
+
+
+def _get_app() -> object:
+    from PyQt5.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    return app
+
+
+def _ball(x: float = 0.0, y: float = 0.0) -> BallState:
+    return BallState(x_mm=x, y_mm=y, vx_mm_s=0.0, vy_mm_s=0.0)
+
+
+def _make_worker(
+    results: list[BallState | None],
+    command_sender: Any = None,
+) -> tuple[VisionControlWorker, FakeCamera, FakeController]:
+    from core.ik_engine import IKEngine
+    _get_app()
+    worker = VisionControlWorker(
+        ik_solver=IKEngine(),
+        kp=0.045,
+        kd=0.022,
+        camera_index=0,
+        command_sender=command_sender,
+    )
+    camera = FakeCamera()
+    controller = FakeController()
+    worker.camera = camera  # type: ignore[assignment]
+    worker.ball_tracker = FakeTracker(results)  # type: ignore[assignment]
+    worker.ball_controller = controller  # type: ignore[assignment]
+    worker._running = True
+    return worker, camera, controller
+
+
+# ---------------------------------------------------------------------------
+# ControlSnapshot construction (kept: cheap contract checks)
 # ---------------------------------------------------------------------------
 
 
@@ -25,133 +139,236 @@ class TestControlSnapshot:
             servo_angles=[],
             ik_success=False,
             timings_ms={},
-            ik_result={},
+            ik_result=None,
             control_terms={},
             tracking_valid=False,
         )
         assert snap.tracking_valid is False
         assert snap.ball_state is None
         assert snap.miss_count == 0
-        assert snap.reason == ""
-        assert snap.camera_bgr is None
-        assert snap.warped_bgr is None
-        assert snap.mask_gray is None
-        assert snap.worker_emit_perf_ts == 0.0
 
-    def test_valid_snapshot_fields(self) -> None:
-        from core.platform_state import BallState
-        bs = BallState(x_mm=10.0, y_mm=-5.0, vx_mm_s=1.0, vy_mm_s=-2.0)
-        snap = ControlSnapshot(
-            timestamp=2.0,
-            ball_state=bs,
-            pose={"x": 0, "y": 0, "z": 50, "roll": 1.0, "pitch": -0.5, "yaw": 0},
-            servo_angles=[90, 90, 90, 90, 90, 90],
-            ik_success=True,
-            timings_ms={"ball_update": 3.1, "total": 5.0},
-            ik_result={"success": True},
-            control_terms={"kp": 0.045, "kd": 0.022},
-            tracking_valid=True,
-            reason="ok",
-            worker_emit_perf_ts=1234.5,
+
+# ---------------------------------------------------------------------------
+# Real _tick() behavior with fakes
+# ---------------------------------------------------------------------------
+
+
+class TestTickStaleFrame:
+    def test_stale_frame_skips_without_miss_or_reset(self) -> None:
+        worker, camera, controller = _make_worker([_ball()])
+        camera.advance()
+        worker._tick()                      # processes frame 1
+        misses_before = worker._miss_count
+        worker._tick()                      # SAME frame ts → stale skip
+        assert worker._miss_count == misses_before
+        assert controller.resets == 0
+
+    def test_new_frame_is_processed(self) -> None:
+        worker, camera, _ = _make_worker([_ball(), _ball()])
+        camera.advance()
+        worker._tick()
+        camera.advance()
+        worker._tick()
+        assert worker._valid_streak == 2
+
+
+class TestTickMissHandling:
+    def test_miss_increments_and_resets_streak(self) -> None:
+        worker, camera, controller = _make_worker([None, None, _ball()])
+        for _ in range(3):
+            camera.advance()
+            worker._tick()
+        assert worker._miss_count == 0          # reset by the valid frame
+        assert worker._valid_streak == 1
+        assert controller.resets == 1           # reset once on reacquire
+
+
+class TestReacquireGating:
+    def test_first_detections_after_loss_do_not_send(self) -> None:
+        sent: list = []
+        results: list[BallState | None] = [None] + [_ball()] * (
+            TRACKER_REACQUIRE_VALID_FRAMES + 2
         )
-        assert snap.tracking_valid is True
-        assert snap.ball_state is not None and snap.ball_state.x_mm == 10.0
-        assert snap.ik_success is True
-        assert snap.worker_emit_perf_ts == 1234.5
+        worker, camera, _ = _make_worker(results, command_sender=sent.append)
+        camera.advance()
+        worker._tick()                          # miss
+        for _ in range(TRACKER_REACQUIRE_VALID_FRAMES - 1):
+            camera.advance()
+            worker._tick()                      # gated valid frames
+        assert sent == []                       # nothing reached hardware
+        camera.advance()
+        worker._tick()                          # streak reaches threshold
+        assert len(sent) == 1
 
-
-# ---------------------------------------------------------------------------
-# VisionControlWorker backpressure (_snapshot_inflight flag)
-# ---------------------------------------------------------------------------
-
-
-def _get_app() -> object:
-    from PyQt5.QtWidgets import QApplication
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
-    return app
-
-
-def _make_worker() -> VisionControlWorker:
-    from core.ik_engine import IKEngine
-    _get_app()  # ensure QApplication exists before creating QObject
-    return VisionControlWorker(
-        ik_solver=IKEngine(),
-        z_provider=lambda: 0.0,
-        kp=0.045,
-        kd=0.022,
-        camera_index=0,
-        command_sender=None,
-    )
+    def test_gated_snapshots_carry_reason(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        results: list[BallState | None] = [None, _ball()]
+        worker, camera, _ = _make_worker(results)
+        worker.snapshot_ready.connect(snaps.append)
+        camera.advance()
+        worker._last_snapshot_emit_perf = -1e9
+        worker._tick()
+        worker.mark_snapshot_consumed()
+        camera.advance()
+        worker._last_snapshot_emit_perf = -1e9
+        worker._tick()
+        gated = [s for s in snaps if s.reason == "reacquire_gating"]
+        assert len(gated) == 1
 
 
 class TestBackpressure:
-    """
-    Test that _snapshot_inflight is set True when a snapshot is emitted and
-    cleared back to False when mark_snapshot_consumed() is called.
-
-    Does NOT start the worker (no camera required).
-    """
-
-    def test_inflight_starts_false(self) -> None:
-        worker = _make_worker()
-        assert worker._snapshot_inflight is False
-
-    def test_inflight_true_after_emit(self) -> None:
-        worker = _make_worker()
-        assert not worker._snapshot_inflight
-
-        snap = ControlSnapshot(
-            timestamp=0.0,
-            ball_state=None,
-            pose={},
-            servo_angles=[],
-            ik_success=False,
-            timings_ms={},
-            ik_result={},
-            control_terms={},
-            tracking_valid=False,
-        )
-        # Simulate what _tick does: set inflight, then emit
-        worker._snapshot_inflight = True
-        worker.snapshot_ready.emit(snap)
-
-        # Inflight must remain True until consumed
-        assert worker._snapshot_inflight is True
-
-    def test_inflight_cleared_after_consume(self) -> None:
-        worker = _make_worker()
-        worker._snapshot_inflight = True
+    def test_second_snapshot_blocked_until_consumed(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([None, None, None])
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9  # force emit cadence open
+        camera.advance()
+        worker._tick()
+        assert len(snaps) == 1                  # emitted, now inflight
+        camera.advance()
+        worker._last_snapshot_emit_perf = -1e9
+        worker._tick()
+        assert len(snaps) == 1                  # blocked while inflight
         worker.mark_snapshot_consumed()
-        assert worker._snapshot_inflight is False
+        camera.advance()
+        worker._last_snapshot_emit_perf = -1e9
+        worker._tick()
+        assert len(snaps) == 2                  # allowed again
 
-    def test_second_emit_blocked_while_inflight(self) -> None:
-        worker = _make_worker()
-        emitted: list = []
-        worker.snapshot_ready.connect(emitted.append)
+    def test_timings_contain_only_measured_keys(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([None])
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()
+        assert snaps, "no snapshot emitted"
+        # The 28 fabricated zero-filled trk_* keys are gone.
+        fabricated = [k for k in snaps[0].timings_ms if k.startswith("trk_")]
+        assert set(fabricated) <= {"trk_cap_period", "trk_gray_mean"}
 
-        snap = ControlSnapshot(
-            timestamp=0.0,
-            ball_state=None,
-            pose={},
-            servo_angles=[],
-            ik_success=False,
-            timings_ms={},
-            ik_result={},
-            control_terms={},
-            tracking_valid=False,
-        )
 
-        # First emission: inflight is False → emit proceeds
-        assert not worker._snapshot_inflight
-        worker._snapshot_inflight = True
-        worker.snapshot_ready.emit(snap)
+class TestSetZ:
+    def test_set_z_flows_into_commanded_pose(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball(), None])
+        worker.snapshot_ready.connect(snaps.append)
+        worker.set_z(12.0)
 
-        # While inflight, a second emission attempt must be skipped
-        should_emit = not worker._snapshot_inflight  # evaluates False
-        assert not should_emit  # confirms guard condition is correct
-
-        # After consume, emission is allowed again
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()                          # valid frame
         worker.mark_snapshot_consumed()
-        assert not worker._snapshot_inflight
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()                          # miss frame
+        assert len(snaps) == 2
+        assert snaps[0].pose["z"] == 12.0       # valid-path pose
+        assert snaps[1].pose["z"] == 12.0       # miss-path pose
+
+    def test_z_defaults_to_zero(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball()])
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()
+        assert snaps[0].pose["z"] == 0.0
+
+
+class TestNeutralFallback:
+    def test_sustained_misses_send_one_neutral_per_window(self) -> None:
+        sent: list[list[float]] = []
+        misses: list[BallState | None] = [None] * (
+            VISION_MISS_NEUTRAL_AFTER_FRAMES + 5
+        )
+        worker, camera, _ = _make_worker(misses, command_sender=sent.append)
+        for _ in range(VISION_MISS_NEUTRAL_AFTER_FRAMES - 1):
+            camera.advance()
+            worker._tick()
+        assert sent == []                       # below the miss threshold
+        for _ in range(6):
+            camera.advance()
+            worker._tick()
+        # Threshold crossed: exactly ONE neutral send inside the resend
+        # throttle window, no matter how many further misses arrive.
+        assert len(sent) == 1
+        assert len(sent[0]) == 6
+
+        # A new throttle window (simulated by rewinding the stamp) allows
+        # exactly one more.
+        worker.ball_tracker = FakeTracker([None, None])  # type: ignore[assignment]
+        worker._last_neutral_send = -1e9
+        camera.advance()
+        worker._tick()
+        camera.advance()
+        worker._tick()
+        assert len(sent) == 2
+
+    def test_neutral_send_ignores_reacquire_gate(self) -> None:
+        # The neutral fallback is the safety action: it must fire even
+        # though the reacquire gate is blocking normal command sends
+        # (valid_streak is 0 throughout a miss run).
+        sent: list[list[float]] = []
+        misses: list[BallState | None] = [None] * (
+            VISION_MISS_NEUTRAL_AFTER_FRAMES + 1
+        )
+        worker, camera, _ = _make_worker(misses, command_sender=sent.append)
+        for _ in range(VISION_MISS_NEUTRAL_AFTER_FRAMES + 1):
+            camera.advance()
+            worker._tick()
+        assert worker._valid_streak == 0
+        assert len(sent) == 1
+
+    def test_recovery_resets_miss_count_and_rearms(self) -> None:
+        sent: list[list[float]] = []
+        results: list[BallState | None] = (
+            [None] * (VISION_MISS_NEUTRAL_AFTER_FRAMES + 1) + [_ball()]
+        )
+        worker, camera, _ = _make_worker(results, command_sender=sent.append)
+        for _ in range(len(results)):
+            camera.advance()
+            worker._tick()
+        neutral_sends = len(sent)
+        assert worker._miss_count == 0          # cleared by the valid frame
+        # A fresh short miss run (below threshold) must NOT send neutral
+        # again even with the throttle window forced open.
+        worker.ball_tracker = FakeTracker([None])  # type: ignore[assignment]
+        worker._last_neutral_send = -1e9
+        camera.advance()
+        worker._tick()
+        assert len(sent) == neutral_sends
+
+
+class TestErrorRateLimit:
+    def test_persistent_tick_errors_are_rate_limited(self) -> None:
+        errors: list[str] = []
+        worker, camera, _ = _make_worker([])
+        worker.error.connect(errors.append)
+
+        class ExplodingTracker:
+            hsv_lower = np.array([0, 0, 0], dtype=np.uint8)
+            hsv_upper = np.array([0, 0, 0], dtype=np.uint8)
+
+            def process(self, *a: Any, **k: Any) -> None:
+                raise RuntimeError("boom")
+
+            def debug_views(self) -> tuple[None, None, None]:
+                return None, None, None
+
+        worker.ball_tracker = ExplodingTracker()  # type: ignore[assignment]
+        for _ in range(5):
+            camera.advance()
+            worker._tick()
+        assert len(errors) == 1                  # not 5
+
+
+class TestStopClosesCamera:
+    def test_stop_closes_camera_source(self) -> None:
+        worker, camera, _ = _make_worker([])
+        stopped: list[bool] = []
+        worker.stopped.connect(lambda: stopped.append(True))
+        worker.stop()
+        assert camera.closed is True
+        assert worker.camera is None
+        assert stopped == [True]

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from PyQt5.QtWidgets import QLabel, QTextEdit, QVBoxLayout, QWidget
 
+from settings import GUI_LOG_MAX_LINES
+
 
 class SerialMonitor(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -20,6 +22,11 @@ class SerialMonitor(QWidget):
         self._text.setPlaceholderText(
             "Arduino Serial Monitor output will appear here..."
         )
+        doc = self._text.document()
+        if doc is not None:
+            # Qt drops the oldest blocks automatically — the widget used
+            # to grow without bound over a long session.
+            doc.setMaximumBlockCount(GUI_LOG_MAX_LINES)
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Serial Monitor:"))

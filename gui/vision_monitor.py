@@ -30,10 +30,6 @@ _DARK_BORDER = "border: 1px solid #2a3b59; background: #0f1726;"
 _MIN_W = 480
 _MIN_H = 320
 
-# Assumed platform diameter — matches BallTracker default (240 mm).
-# px_per_mm is derived per-frame from the actual frame height.
-_PLATFORM_DIAMETER_MM = 240.0
-
 # Velocity arrow scale: 1 px per N mm/s
 _VEL_ARROW_SCALE = 8.0
 
@@ -50,33 +46,40 @@ _PD_VEC_SCALE_PX_PER_DEG = 18.0
 
 
 def _bgr_to_pixmap(bgr: np.ndarray, w: int, h: int) -> QPixmap:
-    rgb = bgr[..., ::-1].copy()
+    rgb = np.ascontiguousarray(bgr[..., ::-1])
+    # tobytes() copies, which also guarantees the buffer outlives the QImage.
     qimg = QImage(
-        rgb.data,
+        rgb.tobytes(),
         rgb.shape[1],
         rgb.shape[0],
         rgb.strides[0],
         QImage.Format_RGB888,
     )
     return QPixmap.fromImage(qimg).scaled(
-        w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
     )
 
 
-def _gray_to_pixmap(gray: np.ndarray, w: int, h: int) -> QPixmap:
+def _gray_to_bgr(gray: np.ndarray) -> np.ndarray:
+    """Stack a single-channel image to 3-channel; pass 3-channel through
+    (contiguous)."""
     if gray.ndim == 2:
-        gray3 = np.stack([gray, gray, gray], axis=2)
-    else:
-        gray3 = gray
+        return np.stack([gray, gray, gray], axis=2)
+    return np.ascontiguousarray(gray)
+
+
+def _gray_to_pixmap(gray3: np.ndarray, w: int, h: int) -> QPixmap:
+    """gray3 must already be 3-channel (see _gray_to_bgr)."""
+    gray3 = np.ascontiguousarray(gray3)
     qimg = QImage(
-        gray3.data,
+        gray3.tobytes(),
         gray3.shape[1],
         gray3.shape[0],
         gray3.strides[0],
         QImage.Format_RGB888,
     )
     return QPixmap.fromImage(qimg).scaled(
-        w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
     )
 
 
@@ -113,10 +116,11 @@ def _draw_warped_overlays(
     target_x_mm: float = 0.0,
     target_y_mm: float = 0.0,
     control_terms: dict | None = None,
+    platform_size_mm: float = 240.0,
 ) -> np.ndarray:
     frame = bgr.copy()
     h, w = frame.shape[:2]
-    px_per_mm = h / _PLATFORM_DIAMETER_MM
+    px_per_mm = h / platform_size_mm
     cx = w // 2
     cy = h // 2
 
@@ -218,22 +222,22 @@ class VisionMonitorWindow(QWidget):
     """Floating window with three camera-view QLabels."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent, Qt.Window)
+        super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("Vision Monitor")
         self.setStyleSheet("background: #0b0f16;")
 
         self._warped_label = QLabel("Warped: Disabled")
-        self._warped_label.setAlignment(Qt.AlignCenter)
+        self._warped_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._warped_label.setMinimumSize(_MIN_W, _MIN_H * 2)
         self._warped_label.setStyleSheet(_DARK_BORDER)
 
         self._camera_label = QLabel("Camera: Disabled")
-        self._camera_label.setAlignment(Qt.AlignCenter)
+        self._camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._camera_label.setMinimumSize(_MIN_W, _MIN_H)
         self._camera_label.setStyleSheet(_DARK_BORDER)
 
         self._mask_label = QLabel("HSV Mask: Disabled")
-        self._mask_label.setAlignment(Qt.AlignCenter)
+        self._mask_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._mask_label.setMinimumSize(_MIN_W, _MIN_H)
         self._mask_label.setStyleSheet(_DARK_BORDER)
 
@@ -254,12 +258,14 @@ class VisionMonitorWindow(QWidget):
         target_x_mm: float = 0.0,
         target_y_mm: float = 0.0,
         control_terms: dict | None = None,
+        platform_size_mm: float = 240.0,
     ) -> None:
         if bgr is None:
             self._warped_label.setText("Warped: Disabled")
             return
         frame = _draw_warped_overlays(
             bgr, ball_state, target_x_mm, target_y_mm, control_terms,
+            platform_size_mm,
         )
         w = self._warped_label.width()
         h = self._warped_label.height()
@@ -278,11 +284,7 @@ class VisionMonitorWindow(QWidget):
         if gray is None:
             self._mask_label.setText("HSV Mask: Disabled")
             return
-        if gray.ndim == 2:
-            gray3: np.ndarray = np.stack([gray, gray, gray], axis=2)
-        else:
-            gray3 = gray
-        frame = _draw_mask_overlays(gray3)
+        frame = _draw_mask_overlays(_gray_to_bgr(gray))
         w = self._mask_label.width()
         h = self._mask_label.height()
         self._mask_label.setPixmap(_gray_to_pixmap(frame, w, h))

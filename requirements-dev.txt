@@ -1,7 +1,7 @@
 # Development / CI dependencies — install with: pip install -r requirements-dev.txt
-# CI (.github/workflows/ci.yml) installs these individually plus
-# opencv-python-headless instead of opencv-contrib-python (no display server).
-pytest>=8.0
-flake8>=7.0
-mypy>=1.8
-types-pyserial>=3.5
+# CI installs exactly this file plus requirements.txt (see .github/workflows/ci.yml),
+# so CI and local dev share one dependency definition.
+pytest>=8.0,<10
+flake8>=7.0,<8
+mypy>=1.8,<3
+types-pyserial>=3.5,<4

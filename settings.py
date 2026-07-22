@@ -1,9 +1,18 @@
 # =============================================================================
+# User-settings overlay (M12)
+# =============================================================================
+# Per-machine overrides live in user_settings.json (untracked; see
+# settings_store.OVERRIDABLE_KEYS for the whitelist). Loaded once at import;
+# overridable keys below read from _OV with the committed value as default.
+import settings_store as _settings_store
+
+_OV = _settings_store.load_user_overrides()
+
+# =============================================================================
 # Serial
 # =============================================================================
-SERIAL_PORT = "COM4"
+SERIAL_PORT = str(_OV.get("SERIAL_PORT", "COM4"))
 SERIAL_BAUD = 115200
-SERIAL_QUEUE_MAX = 256
 
 # =============================================================================
 # Safety limits
@@ -11,16 +20,23 @@ SERIAL_QUEUE_MAX = 256
 MAX_TILT_DEG = 8.0                      # maximum platform tilt in vision mode
 
 SAFETY_LIMITS = {
-    "max_angle": 180,
-    "min_angle": 0,
-    "odd_servo_max": 170,   # servos 0, 2, 4
-    "even_servo_min": 10,   # servos 1, 3, 5
+    "max_angle": 180,       # global ceiling, all servos (enforced in core/safety.py)
+    "min_angle": 0,         # global floor, all servos (enforced in core/safety.py)
+    "odd_servo_max": 170,   # extra ceiling for INDICES 0, 2, 4 (mirrored mount)
+    "even_servo_min": 10,   # extra floor for INDICES 1, 3, 5 (mirrored mount)
 }
+
+# Largest per-servo jump (deg) sent as an instant write (firmware speedDelay 0).
+# Bigger jumps are sent with SERVO_LARGE_MOVE_SPEED_DELAY_MS so the FIRMWARE
+# ramps the move (1 deg per speedDelay ms, all servos concurrently; firmware
+# clamps speedDelay to 0-20 and acks only after the ramp — see firmware/README.md).
+SERVO_SLEW_INSTANT_MAX_DEG = 12.0
+SERVO_LARGE_MOVE_SPEED_DELAY_MS = 5     # -> 200 deg/s hardware ramp on big moves
 
 # =============================================================================
 # Camera
 # =============================================================================
-CAMERA_INDEX = 1                        # 0 = integrated, 1 = USB camera
+CAMERA_INDEX = int(_OV.get("CAMERA_INDEX", 1))   # 0 = integrated, 1 = USB camera
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_BUFFER_SIZE = 1
@@ -58,12 +74,12 @@ TRACKER_MIN_CIRCULARITY = 0.0           # 0 disables circularity check
 TRACKER_MIN_FILL_RATIO = 0.0            # 0 disables fill ratio check
 
 # HSV defaults (orange ball)
-TRACKER_HSV_H_MIN = 10
-TRACKER_HSV_H_MAX = 28
-TRACKER_HSV_S_MIN = 83
-TRACKER_HSV_S_MAX = 255
-TRACKER_HSV_V_MIN = 125
-TRACKER_HSV_V_MAX = 255
+TRACKER_HSV_H_MIN = int(_OV.get("TRACKER_HSV_H_MIN", 10))
+TRACKER_HSV_H_MAX = int(_OV.get("TRACKER_HSV_H_MAX", 28))
+TRACKER_HSV_S_MIN = int(_OV.get("TRACKER_HSV_S_MIN", 83))
+TRACKER_HSV_S_MAX = int(_OV.get("TRACKER_HSV_S_MAX", 255))
+TRACKER_HSV_V_MIN = int(_OV.get("TRACKER_HSV_V_MIN", 125))
+TRACKER_HSV_V_MAX = int(_OV.get("TRACKER_HSV_V_MAX", 255))
 
 # low-pass weight on raw velocity (0=frozen, 1=raw); ~6 Hz cutoff at 30 fps; tunable
 BALL_VEL_FILTER_ALPHA: float = 0.55
@@ -71,16 +87,18 @@ BALL_VEL_FILTER_ALPHA: float = 0.55
 # =============================================================================
 # PD controller
 # =============================================================================
-PD_DEFAULT_KP = 0.045
-PD_DEFAULT_KD = 0.022
+PD_DEFAULT_KP = float(_OV.get("PD_DEFAULT_KP", 0.045))
+PD_DEFAULT_KD = float(_OV.get("PD_DEFAULT_KD", 0.022))
+PD_MAX_TILT_RATE_DEG_S = 300.0          # slew ("tilt rate") limit on commanded tilt
+PD_D_TERM_LIMIT_DEG = 2.5               # derivative-term contribution cap
 BALL_TARGET_DEFAULT_X_MM = 0.0
 BALL_TARGET_DEFAULT_Y_MM = 0.0
 
 # =============================================================================
 # Manual trim / Auto-trim
 # =============================================================================
-MANUAL_ROLL_TRIM_DEG = -0.8
-MANUAL_PITCH_TRIM_DEG = 4.6
+MANUAL_ROLL_TRIM_DEG = float(_OV.get("MANUAL_ROLL_TRIM_DEG", 0.0))
+MANUAL_PITCH_TRIM_DEG = float(_OV.get("MANUAL_PITCH_TRIM_DEG", 0.0))
 
 AUTO_TRIM_ENABLED = False
 AUTO_TRIM_KI_DEG_PER_MM_S = 0.008
@@ -100,7 +118,6 @@ AUTO_TRIM_SETTLE_RADIUS_LPF_ALPHA = 0.75
 # =============================================================================
 PD_AUTOTUNE_ENABLED = False
 PD_AUTOTUNE_AUTO_APPLY = False
-PD_AUTOTUNE_TRIGGER_RADIUS_MM = 35.0
 PD_AUTOTUNE_SETTLE_RADIUS_MM = 6.0
 PD_AUTOTUNE_SETTLE_SPEED_MM_S = 18.0
 PD_AUTOTUNE_SETTLE_HOLD_S = 0.35
@@ -125,16 +142,20 @@ AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 # Loop rates
 # =============================================================================
 CONTROL_LOOP_INTERVAL_MS = 20
-VISION_LOOP_INTERVAL_MS = 20            # legacy QTimer interval (pre-M7 worker)
-VISUALIZER_THREAD_INTERVAL_S = 0.03    # legacy background draw thread interval
+ROUTINE_RETURN_HOME_S = 1.0             # ease-back-to-neutral duration after routines
 VISION_LOOP_HZ = 120
 VISUALIZER_HZ = 25
 GUI_SNAPSHOT_HZ = 30
 
 # =============================================================================
+# Vision neutral-pose fallback (safety action on sustained ball loss)
+# =============================================================================
+VISION_MISS_NEUTRAL_AFTER_FRAMES = 20   # consecutive misses before neutral send
+VISION_NEUTRAL_RESEND_S = 0.5           # min seconds between neutral resends
+
+# =============================================================================
 # GUI / logging
 # =============================================================================
 GUI_LOG_MAX_LINES = 500
-TIMING_PLOT_POINTS = 300
 LOG_EVERY_N = 30                        # log every N vision frames
 DEBUG_PRINTS = True

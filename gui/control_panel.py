@@ -9,6 +9,8 @@ to handlers that own the logic.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
@@ -28,6 +30,7 @@ from routines.routines import ROUTINES
 from settings import (
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
+    GUI_LOG_MAX_LINES,
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     PD_DEFAULT_KD,
@@ -126,7 +129,7 @@ class ControlPanel(QWidget):
         ag.setContentsMargins(6, 10, 6, 6)
         for ax in AXES:
             lbl = QLabel(f"{ax}: 0")
-            sld = QSlider(QtCore.Qt.Horizontal)
+            sld = QSlider(QtCore.Qt.Orientation.Horizontal)
             sld.setMinimum(-100)
             sld.setMaximum(100)
             sld.setValue(0)
@@ -161,7 +164,7 @@ class ControlPanel(QWidget):
         ]
         for display, attr, lo, hi, default in _hsv_defs:
             lbl = QLabel(f"{display}: {default}")
-            sld = QSlider(QtCore.Qt.Horizontal)
+            sld = QSlider(QtCore.Qt.Orientation.Horizontal)
             sld.setRange(lo, hi)
             sld.setValue(default)
             sld.setMaximumHeight(20)
@@ -188,29 +191,14 @@ class ControlPanel(QWidget):
         tg.setSpacing(2)
         tg.setContentsMargins(6, 10, 6, 6)
 
-        self._target_x_label = QLabel(
-            f"Target X: {BALL_TARGET_DEFAULT_X_MM:.0f} mm"
+        self._target_x_label, self._target_x_slider = self._make_scaled_slider(
+            tg, "Target X: {:.0f} mm", -120, 120,
+            float(BALL_TARGET_DEFAULT_X_MM), 1.0, self._on_target_changed,
         )
-        self._target_x_slider = QSlider(QtCore.Qt.Horizontal)
-        self._target_x_slider.setMinimum(-120)
-        self._target_x_slider.setMaximum(120)
-        self._target_x_slider.setValue(int(BALL_TARGET_DEFAULT_X_MM))
-        self._target_x_slider.setMaximumHeight(20)
-        self._target_x_slider.valueChanged.connect(self._on_target_changed)
-        tg.addWidget(self._target_x_label)
-        tg.addWidget(self._target_x_slider)
-
-        self._target_y_label = QLabel(
-            f"Target Y: {BALL_TARGET_DEFAULT_Y_MM:.0f} mm"
+        self._target_y_label, self._target_y_slider = self._make_scaled_slider(
+            tg, "Target Y: {:.0f} mm", -120, 120,
+            float(BALL_TARGET_DEFAULT_Y_MM), 1.0, self._on_target_changed,
         )
-        self._target_y_slider = QSlider(QtCore.Qt.Horizontal)
-        self._target_y_slider.setMinimum(-120)
-        self._target_y_slider.setMaximum(120)
-        self._target_y_slider.setValue(int(BALL_TARGET_DEFAULT_Y_MM))
-        self._target_y_slider.setMaximumHeight(20)
-        self._target_y_slider.valueChanged.connect(self._on_target_changed)
-        tg.addWidget(self._target_y_label)
-        tg.addWidget(self._target_y_slider)
 
         target_group.setLayout(tg)
         layout.addWidget(target_group)
@@ -221,30 +209,18 @@ class ControlPanel(QWidget):
         tr.setSpacing(2)
         tr.setContentsMargins(6, 10, 6, 6)
 
-        self._trim_roll_label = QLabel(f"Roll Trim: {MANUAL_ROLL_TRIM_DEG:.2f}°")
-        self._trim_roll_slider = QSlider(QtCore.Qt.Horizontal)
-        self._trim_roll_slider.setMinimum(-1000)
-        self._trim_roll_slider.setMaximum(1000)
-        self._trim_roll_slider.setValue(int(MANUAL_ROLL_TRIM_DEG * 100))
-        self._trim_roll_slider.setMaximumHeight(20)
-        self._trim_roll_slider.valueChanged.connect(self._on_trim_changed)
-        tr.addWidget(self._trim_roll_label)
-        tr.addWidget(self._trim_roll_slider)
-
-        self._trim_pitch_label = QLabel(
-            f"Pitch Trim: {MANUAL_PITCH_TRIM_DEG:.2f}°"
+        self._trim_roll_label, self._trim_roll_slider = self._make_scaled_slider(
+            tr, "Roll Trim: {:.2f}°", -1000, 1000,
+            float(MANUAL_ROLL_TRIM_DEG), 100.0, self._on_trim_changed,
         )
-        self._trim_pitch_slider = QSlider(QtCore.Qt.Horizontal)
-        self._trim_pitch_slider.setMinimum(-1000)
-        self._trim_pitch_slider.setMaximum(1000)
-        self._trim_pitch_slider.setValue(int(MANUAL_PITCH_TRIM_DEG * 100))
-        self._trim_pitch_slider.setMaximumHeight(20)
-        self._trim_pitch_slider.valueChanged.connect(self._on_trim_changed)
-        tr.addWidget(self._trim_pitch_label)
-        tr.addWidget(self._trim_pitch_slider)
+        self._trim_pitch_label, self._trim_pitch_slider = self._make_scaled_slider(
+            tr, "Pitch Trim: {:.2f}°", -1000, 1000,
+            float(MANUAL_PITCH_TRIM_DEG), 100.0, self._on_trim_changed,
+        )
 
-        self._auto_trim_btn = QPushButton("Auto-Trim: OFF")
-        self._auto_trim_btn.clicked.connect(self._on_auto_trim_toggled)
+        self._auto_trim_btn = self._make_toggle_button(
+            "Auto-Trim", self._on_auto_trim_toggled
+        )
         tr.addWidget(self._auto_trim_btn)
 
         self._calibrate_home_btn = QPushButton("Calibrate Home")
@@ -252,11 +228,15 @@ class ControlPanel(QWidget):
         tr.addWidget(self._calibrate_home_btn)
 
         self._reset_trim_btn = QPushButton("Reset Trim to Config")
-        self._reset_trim_btn.clicked.connect(self.reset_trim_clicked.emit)
+        self._reset_trim_btn.clicked.connect(
+            lambda: self.reset_trim_clicked.emit()
+        )
         tr.addWidget(self._reset_trim_btn)
 
         self._save_trim_btn = QPushButton("Save Trim as Default")
-        self._save_trim_btn.clicked.connect(self.save_trim_as_default_clicked.emit)
+        self._save_trim_btn.clicked.connect(
+            lambda: self.save_trim_as_default_clicked.emit()
+        )
         tr.addWidget(self._save_trim_btn)
 
         trim_group.setLayout(tr)
@@ -268,36 +248,30 @@ class ControlPanel(QWidget):
         tune.setSpacing(2)
         tune.setContentsMargins(6, 10, 6, 6)
 
-        self._kp_label = QLabel(f"Kp: {PD_DEFAULT_KP:.3f}")
-        self._kp_slider = QSlider(QtCore.Qt.Horizontal)
-        self._kp_slider.setMinimum(0)
-        self._kp_slider.setMaximum(300)  # supports PD_AUTOTUNE_MAX_KP = 0.250
-        self._kp_slider.setValue(int(PD_DEFAULT_KP * 1000))
-        self._kp_slider.setMaximumHeight(20)
-        self._kp_slider.valueChanged.connect(self._on_kp_changed)
-        tune.addWidget(self._kp_label)
-        tune.addWidget(self._kp_slider)
+        # Kp max 300 supports PD_AUTOTUNE_MAX_KP = 0.250
+        self._kp_label, self._kp_slider = self._make_scaled_slider(
+            tune, "Kp: {:.3f}", 0, 300,
+            float(PD_DEFAULT_KP), 1000.0, self._on_kp_changed,
+        )
+        self._kd_label, self._kd_slider = self._make_scaled_slider(
+            tune, "Kd: {:.3f}", 0, 100,
+            float(PD_DEFAULT_KD), 1000.0, self._on_kd_changed,
+        )
 
-        self._kd_label = QLabel(f"Kd: {PD_DEFAULT_KD:.3f}")
-        self._kd_slider = QSlider(QtCore.Qt.Horizontal)
-        self._kd_slider.setMinimum(0)
-        self._kd_slider.setMaximum(100)
-        self._kd_slider.setValue(int(PD_DEFAULT_KD * 1000))
-        self._kd_slider.setMaximumHeight(20)
-        self._kd_slider.valueChanged.connect(self._on_kd_changed)
-        tune.addWidget(self._kd_label)
-        tune.addWidget(self._kd_slider)
-
-        self._autotune_enable_btn = QPushButton("AutoTune: OFF")
-        self._autotune_enable_btn.clicked.connect(self._on_autotune_enable)
+        self._autotune_enable_btn = self._make_toggle_button(
+            "AutoTune", self._on_autotune_enable
+        )
         tune.addWidget(self._autotune_enable_btn)
 
         self._autotune_apply_btn = QPushButton("Apply Now")
-        self._autotune_apply_btn.clicked.connect(self.autotune_apply_clicked.emit)
+        self._autotune_apply_btn.clicked.connect(
+            lambda: self.autotune_apply_clicked.emit()
+        )
         tune.addWidget(self._autotune_apply_btn)
 
-        self._autotune_auto_apply_btn = QPushButton("Auto-Apply: OFF")
-        self._autotune_auto_apply_btn.clicked.connect(self._on_autotune_auto_apply)
+        self._autotune_auto_apply_btn = self._make_toggle_button(
+            "Auto-Apply", self._on_autotune_auto_apply
+        )
         tune.addWidget(self._autotune_auto_apply_btn)
 
         tune_group.setLayout(tune)
@@ -305,6 +279,48 @@ class ControlPanel(QWidget):
 
         layout.addStretch()
         return layout
+
+    # ------------------------------------------------------------------
+    # Widget-construction helpers
+    # ------------------------------------------------------------------
+
+    def _make_scaled_slider(
+        self,
+        layout: QVBoxLayout,
+        label_fmt: str,
+        minimum: int,
+        maximum: int,
+        initial: float,
+        scale: float,
+        on_change: Callable[..., None],
+        orientation: QtCore.Qt.Orientation = QtCore.Qt.Orientation.Horizontal,
+    ) -> tuple[QLabel, QSlider]:
+        """Build a label + slider pair for a float value stored as integer
+        slider ticks (float value * scale). label_fmt is a str.format
+        template taking the float value. Adds both widgets to layout."""
+        lbl = QLabel(label_fmt.format(initial))
+        sld = QSlider(orientation)
+        sld.setMinimum(minimum)
+        sld.setMaximum(maximum)
+        sld.setValue(round(initial * scale))
+        sld.setMaximumHeight(20)
+        sld.valueChanged.connect(on_change)
+        layout.addWidget(lbl)
+        layout.addWidget(sld)
+        return lbl, sld
+
+    def _make_toggle_button(
+        self, base: str, on_click: Callable[[], None]
+    ) -> QPushButton:
+        """Build an ON/OFF toggle button starting OFF."""
+        btn = QPushButton()
+        self._set_toggle_text(btn, base, False)
+        btn.clicked.connect(lambda: on_click())
+        return btn
+
+    @staticmethod
+    def _set_toggle_text(btn: QPushButton, base: str, active: bool) -> None:
+        btn.setText(f"{base}: {'ON' if active else 'OFF'}")
 
     # ------------------------------------------------------------------
     # Column 3: routines, vision mode, command I/O, serial monitor
@@ -328,7 +344,9 @@ class ControlPanel(QWidget):
         rg.addWidget(self._demo_list)
 
         self._cancel_routine_btn = QPushButton("❌ Cancel Routine")
-        self._cancel_routine_btn.clicked.connect(self.routine_cancelled.emit)
+        self._cancel_routine_btn.clicked.connect(
+            lambda: self.routine_cancelled.emit()
+        )
         self._cancel_routine_btn.setEnabled(False)
         rg.addWidget(self._cancel_routine_btn)
 
@@ -354,7 +372,7 @@ class ControlPanel(QWidget):
 
         self._open_vision_monitor_btn = QPushButton("Open Vision Monitor")
         self._open_vision_monitor_btn.clicked.connect(
-            self.open_vision_monitor_clicked.emit
+            lambda: self.open_vision_monitor_clicked.emit()
         )
         vg.addWidget(self._open_vision_monitor_btn)
 
@@ -368,7 +386,7 @@ class ControlPanel(QWidget):
         ig.setContentsMargins(6, 10, 6, 6)
 
         self._send_button = QPushButton("SEND TO ARDUINO")
-        self._send_button.clicked.connect(self.send_clicked.emit)
+        self._send_button.clicked.connect(lambda: self.send_clicked.emit())
         ig.addWidget(self._send_button)
 
         ig.addWidget(QLabel("Command Preview:"))
@@ -378,6 +396,11 @@ class ControlPanel(QWidget):
             "Command preview will appear here..."
         )
         self._preview_output.setMaximumHeight(80)
+        doc = self._preview_output.document()
+        if doc is not None:
+            # Qt drops the oldest blocks automatically — replaces the manual
+            # cursor-based trimming MainWindow used to run per snapshot.
+            doc.setMaximumBlockCount(GUI_LOG_MAX_LINES)
         ig.addWidget(self._preview_output)
 
         ig.addWidget(QLabel("Direct Serial Command:"))
@@ -452,8 +475,8 @@ class ControlPanel(QWidget):
 
     def _on_auto_trim_toggled(self) -> None:
         self._auto_trim_active = not self._auto_trim_active
-        self._auto_trim_btn.setText(
-            "Auto-Trim: ON" if self._auto_trim_active else "Auto-Trim: OFF"
+        self._set_toggle_text(
+            self._auto_trim_btn, "Auto-Trim", self._auto_trim_active
         )
         self.auto_trim_toggled.emit(self._auto_trim_active)
 
@@ -466,15 +489,15 @@ class ControlPanel(QWidget):
 
     def _on_autotune_enable(self) -> None:
         self._autotune_enabled = not self._autotune_enabled
-        self._autotune_enable_btn.setText(
-            "AutoTune: ON" if self._autotune_enabled else "AutoTune: OFF"
+        self._set_toggle_text(
+            self._autotune_enable_btn, "AutoTune", self._autotune_enabled
         )
         self.autotune_enable_clicked.emit(self._autotune_enabled)
 
     def _on_autotune_auto_apply(self) -> None:
         self._autotune_auto_apply = not self._autotune_auto_apply
-        self._autotune_auto_apply_btn.setText(
-            "Auto-Apply: ON" if self._autotune_auto_apply else "Auto-Apply: OFF"
+        self._set_toggle_text(
+            self._autotune_auto_apply_btn, "Auto-Apply", self._autotune_auto_apply
         )
         self.autotune_auto_apply_clicked.emit(self._autotune_auto_apply)
 
@@ -507,6 +530,14 @@ class ControlPanel(QWidget):
     def set_cancel_enabled(self, enabled: bool) -> None:
         self._cancel_routine_btn.setEnabled(enabled)
 
+    def set_manual_controls_enabled(self, enabled: bool) -> None:
+        """Enable/disable every manual command source (routine dropdown, SEND,
+        raw serial box). Vision mode disables them all: exactly one command
+        source may own the hardware at a time."""
+        self._demo_list.setEnabled(enabled)
+        self._send_button.setEnabled(enabled)
+        self._raw_serial_input.setEnabled(enabled)
+
     def set_vision_active(self, active: bool) -> None:
         self._vision_active = active
         if active:
@@ -520,6 +551,29 @@ class ControlPanel(QWidget):
         return {
             AXIS_KEYS[ax]: self._sliders[ax].value() for ax in AXES
         }
+
+    def get_hsv(self) -> tuple[int, int, int, int, int, int]:
+        """Current HSV threshold slider values (hmin, hmax, smin, smax,
+        vmin, vmax)."""
+        return (
+            self._hsv_h_min_slider.value(),
+            self._hsv_h_max_slider.value(),
+            self._hsv_s_min_slider.value(),
+            self._hsv_s_max_slider.value(),
+            self._hsv_v_min_slider.value(),
+            self._hsv_v_max_slider.value(),
+        )
+
+    def any_slider_down(self, group: str) -> bool:
+        """True while the user is dragging any slider in the group
+        ("target", "trim", or "gains"). MainWindow's worker->GUI syncs
+        skip updates mid-drag so they don't fight the user's hand."""
+        groups: dict[str, tuple[QSlider, ...]] = {
+            "target": (self._target_x_slider, self._target_y_slider),
+            "trim": (self._trim_roll_slider, self._trim_pitch_slider),
+            "gains": (self._kp_slider, self._kd_slider),
+        }
+        return any(sld.isSliderDown() for sld in groups[group])
 
     def set_slider_values(self, pose: dict) -> None:
         """Mirror a pose to the sliders without re-emitting valueChanged."""
@@ -567,42 +621,40 @@ class ControlPanel(QWidget):
 
     def sync_kp_kd(self, kp: float, kd: float) -> None:
         self._kp_slider.blockSignals(True)
-        self._kp_slider.setValue(int(kp * 1000))
+        self._kp_slider.setValue(round(kp * 1000))
         self._kp_label.setText(f"Kp: {kp:.3f}")
         self._kp_slider.blockSignals(False)
 
         self._kd_slider.blockSignals(True)
-        self._kd_slider.setValue(int(kd * 1000))
+        self._kd_slider.setValue(round(kd * 1000))
         self._kd_label.setText(f"Kd: {kd:.3f}")
         self._kd_slider.blockSignals(False)
 
     def sync_target(self, x_mm: float, y_mm: float) -> None:
         self._target_x_slider.blockSignals(True)
-        self._target_x_slider.setValue(int(x_mm))
+        self._target_x_slider.setValue(round(x_mm))
         self._target_x_label.setText(f"Target X: {x_mm:.0f} mm")
         self._target_x_slider.blockSignals(False)
 
         self._target_y_slider.blockSignals(True)
-        self._target_y_slider.setValue(int(y_mm))
+        self._target_y_slider.setValue(round(y_mm))
         self._target_y_label.setText(f"Target Y: {y_mm:.0f} mm")
         self._target_y_slider.blockSignals(False)
 
     def sync_trim(self, roll_deg: float, pitch_deg: float) -> None:
         self._trim_roll_slider.blockSignals(True)
-        self._trim_roll_slider.setValue(int(roll_deg * 100))
+        self._trim_roll_slider.setValue(round(roll_deg * 100))
         self._trim_roll_label.setText(f"Roll Trim: {roll_deg:.2f}°")
         self._trim_roll_slider.blockSignals(False)
 
         self._trim_pitch_slider.blockSignals(True)
-        self._trim_pitch_slider.setValue(int(pitch_deg * 100))
+        self._trim_pitch_slider.setValue(round(pitch_deg * 100))
         self._trim_pitch_label.setText(f"Pitch Trim: {pitch_deg:.2f}°")
         self._trim_pitch_slider.blockSignals(False)
 
     def sync_auto_trim_button(self, active: bool) -> None:
         self._auto_trim_active = active
-        self._auto_trim_btn.setText(
-            "Auto-Trim: ON" if active else "Auto-Trim: OFF"
-        )
+        self._set_toggle_text(self._auto_trim_btn, "Auto-Trim", active)
 
     def sync_calibrate_button(self, calibrating: bool) -> None:
         self._calibrating_home = calibrating
@@ -612,12 +664,10 @@ class ControlPanel(QWidget):
 
     def sync_autotune_buttons(self, enabled: bool, auto_apply: bool) -> None:
         self._autotune_enabled = enabled
-        self._autotune_enable_btn.setText(
-            "AutoTune: ON" if enabled else "AutoTune: OFF"
-        )
+        self._set_toggle_text(self._autotune_enable_btn, "AutoTune", enabled)
         self._autotune_auto_apply = auto_apply
-        self._autotune_auto_apply_btn.setText(
-            "Auto-Apply: ON" if auto_apply else "Auto-Apply: OFF"
+        self._set_toggle_text(
+            self._autotune_auto_apply_btn, "Auto-Apply", auto_apply
         )
 
     def sync_hsv(

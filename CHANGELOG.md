@@ -8,6 +8,107 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Two bodies of work on branch `overhaul/safety-ik-vision-gui`, merging as one
+PR: the 2026-07-20 firmware capture and the 2026-07-22 six-step overhaul
+(absorbs milestones M9–M12; driven by the five-agent full-repo review — see
+`docs/code-review-2026-07-22.md` for the finding-by-finding record).
+
+### Added
+- `firmware/` — captured Uno firmware (2026-07-20): byte-for-byte flash dump
+  (`flash_dump_2026-07-20.hex`, ground truth), reconstructed
+  `stewart_platform_uno.ino` sketch (original source was never committed),
+  `wiring_check.py` bench utility, and `firmware/README.md` with the pin map
+  (servo i → D2+i), servo clocking vs `config.py` geometry, and the verified
+  serial protocol semantics.
+- `docs/code-review-2026-07-22.md` — full-repo review record; every finding
+  maps to the overhaul step that addressed it.
+- `core/safety.py::select_speed_delay` — large-move ramp policy (step 2):
+  jumps over `SERVO_SLEW_INSTANT_MAX_DEG` are sent with a firmware
+  `speedDelay` so the ramp happens in hardware; applies to manual sends too.
+- `core/platform_state.py::IKResult` — frozen dataclass replacing the untyped
+  IK result dict (step 3): per-servo `servo_status`, complete failure shape,
+  neutral placeholders for failed servos.
+- `cv/camera_source.py` — camera lifecycle split out of the tracker (step 4):
+  backend probe, capture thread, runtime exposure policy, software gain;
+  two-phase init (no I/O in `__init__`).
+- `control/setpoint.py`, `control/auto_trim.py`, `control/autotune.py`,
+  `control/pd_core.py` — controller decomposition (step 5): `ball_controller`
+  becomes a ~300-line facade; injected clock throughout makes the state
+  machines testable.
+- `settings_store.py` + untracked `user_settings.json` — per-machine settings
+  overlay (step 5): 12-key whitelist, atomic writes, corrupt input degrades
+  to defaults; `settings.py` applies the overlay at import.
+- `control/pose_commander.py` + `gui/timing_plot.py` — GUI slimming (step 6):
+  zero IK call sites left in `gui/`; timing plot extracted with persistent
+  Line2D artists.
+- Test suite 90 → 206: fake-serial `SerialManager` suite, golden-value +
+  sweep-continuity IK suites, synthetic-frame ArUco/tracker pipeline tests,
+  `CameraSource` fake-capture tests, controller characterization suite with
+  fake clock, settings store/overlay tests.
+
+### Changed
+- Tooling (step 1): local `mypy .` works (missing `cv/__init__.py` had broken
+  it); CI installs from requirements files with PyQt5 present for mypy (local
+  == CI); major-version ceilings on dependencies; `setup.cfg` exclude lists
+  now empty — every module linted and type-checked.
+- `hardware/serial_manager.py` rewritten (step 2): write lock, read loop
+  survives callback exceptions, link death reported via disconnect callback,
+  double-connect guard, `send_latest()` latest-wins writer thread for
+  streaming setpoints; connect() waits for the firmware `[READY]` banner
+  (3 s cap, old-firmware fallback) instead of a fixed 2 s sleep (step 6).
+- `kinematics/ik_solver.py` rewritten (step 3): branch seeding by servo-angle
+  validity, symmetric elbow handling with a single continuity-driven choice;
+  out-of-range angles are per-servo failures, never silent clamps.
+- Send-mode routines ease back to neutral on completion and cancel (step 3,
+  approved behavior change); IK failures during playback are counted and
+  surfaced in the GUI; routine labels state their real envelopes.
+- `cv/ball_tracker.py` rewritten as pure detection (step 4):
+  `process(frame, ts, gain) -> BallState | None`; no camera, no threads;
+  worker migrated off all private reach-ins onto the public API; the 28
+  zero-filled `trk_*` placeholder telemetry keys removed.
+- Vision-mode reacquire gating moved into the worker command path, counting
+  real processed frames (step 3); neutral-pose fallback moved into the worker
+  miss branch on real frame counts (step 6).
+- GUI (step 6): non-blocking serial connect on a background thread;
+  mode mutual exclusion (vision locks routines/SEND/raw box, step 2); raw
+  commands routed through validated `ServoDriver.send_raw` (step 2);
+  `visualizer3d` and the timing plot use persistent artists + `draw_idle`
+  instead of full rebuilds on the GUI thread; log widgets capped.
+- `main.py` (step 2): custom `sys.excepthook` logs the traceback, attempts a
+  ramped-neutral emergency shutdown, and disconnects — instead of PyQt5's
+  `qFatal()` abort with servos live.
+
+### Fixed
+- IK branch-flip defect (M5's screw-routine servo snap at yaw=-35°):
+  root-caused and redesigned; screw max step is now 2.7° where it commanded
+  an instantaneous 180° snap (step 3).
+- Stale ArUco homography could be served forever after marker loss; now
+  bounded by `TRACKER_MAX_ARUCO_HOLD_FRAMES` with cache invalidation
+  (step 4). Also: capture release race (segfault vector), torn-frame copy,
+  position-filter reset on loss, `TRACKER_WARP_SIZE_PX` finally honored,
+  exposure probes no longer starve the pipeline.
+- Dead `SAFETY_LIMITS` global min/max keys now enforced: every servo is
+  clamped 0–180 with length/finiteness validation on the single send path
+  (step 2); the three duplicated inline clamp copies removed.
+- `closeEvent` deadlock (guaranteed 3 s hang + "QThread destroyed while
+  running" on close with vision active) (step 2).
+- Save-trim regex rewrite of `settings.py` — which had corrupted trim values
+  with unrounded repr floats — replaced by the overlay (step 5).
+- Telemetry honesty: `frame_to_cmd` and `serial_enqueue` plot lines had never
+  displayed a real measurement; timing-plot history was sized off the wrong
+  rate by 4x (steps 4/6).
+- Slider sync no longer fights the user mid-drag; autotune double-apply race
+  guarded; vision UI fully resets on disable (step 6).
+
+### Removed
+- Dead config (`SERIAL_QUEUE_MAX`, `VISION_LOOP_INTERVAL_MS`, and 3 more),
+  the `stewart_control` conftest alias, and dead tracker/controller state
+  (step 1/4/5).
+- `BallController.compute()` — divergent from the `compute_with_terms()` path
+  production actually ran; its 16 headline tests migrated to the real path,
+  tautological tests deleted (step 5).
+- Dead `ServoAngles` contract and `solve_ik()` wrapper (step 3).
+
 ---
 
 ## [Milestone-8] - 2026-06-11
