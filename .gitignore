@@ -31,3 +31,6 @@ Thumbs.db
 
 # Autotune session log
 autotune_session.log
+
+# Per-machine settings overlay (M12)
+user_settings.json

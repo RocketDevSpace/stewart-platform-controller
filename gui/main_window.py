@@ -14,7 +14,6 @@ thread lifecycle, GUI sync, timing plot, and neutral-pose fallback.
 
 from __future__ import annotations
 
-import pathlib
 import time
 from collections import deque
 
@@ -29,6 +28,7 @@ from PyQt5.QtWidgets import (
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+import settings_store
 from control.routine_runner import RoutineRunner
 from core.ik_engine import IKEngine
 from core.platform_state import Pose
@@ -84,10 +84,6 @@ _TIMING_COLORS = {
 }
 _TIMING_WINDOW_S = 30.0
 _PLOT_UPDATE_EVERY = 5
-
-
-def _settings_path() -> pathlib.Path:
-    return pathlib.Path(__file__).parent.parent / "settings.py"
 
 
 class MainWindow(QWidget):
@@ -519,25 +515,15 @@ class MainWindow(QWidget):
     def _on_save_trim_as_default(self) -> None:
         roll = self._trim_roll_deg
         pitch = self._trim_pitch_deg
-        settings_path = _settings_path()
         try:
-            text = settings_path.read_text(encoding="utf-8")
-            import re
-            text = re.sub(
-                r"^(MANUAL_ROLL_TRIM_DEG\s*=\s*)[\-0-9.]+",
-                rf"\g<1>{roll}",
-                text, flags=re.MULTILINE,
-            )
-            text = re.sub(
-                r"^(MANUAL_PITCH_TRIM_DEG\s*=\s*)[\-0-9.]+",
-                rf"\g<1>{pitch}",
-                text, flags=re.MULTILINE,
-            )
-            settings_path.write_text(text, encoding="utf-8")
+            settings_store.save_user_overrides({
+                "MANUAL_ROLL_TRIM_DEG": float(roll),
+                "MANUAL_PITCH_TRIM_DEG": float(pitch),
+            })
             self.control_panel.append_preview(
-                f"[TRIM] saved roll={roll:.2f}° pitch={pitch:.2f}° to settings.py"
+                f"[TRIM] saved roll={roll:.2f}° pitch={pitch:.2f}° to user_settings.json"
             )
-        except Exception as exc:
+        except OSError as exc:
             self.control_panel.append_preview(f"[TRIM] save failed: {exc}")
 
     def _on_autotune_enable_clicked(self, enabled: bool) -> None:

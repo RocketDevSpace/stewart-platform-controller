@@ -1,7 +1,17 @@
 # =============================================================================
+# User-settings overlay (M12)
+# =============================================================================
+# Per-machine overrides live in user_settings.json (untracked; see
+# settings_store.OVERRIDABLE_KEYS for the whitelist). Loaded once at import;
+# overridable keys below read from _OV with the committed value as default.
+import settings_store as _settings_store
+
+_OV = _settings_store.load_user_overrides()
+
+# =============================================================================
 # Serial
 # =============================================================================
-SERIAL_PORT = "COM4"
+SERIAL_PORT = str(_OV.get("SERIAL_PORT", "COM4"))
 SERIAL_BAUD = 115200
 
 # =============================================================================
@@ -26,7 +36,7 @@ SERVO_LARGE_MOVE_SPEED_DELAY_MS = 5     # -> 200 deg/s hardware ramp on big move
 # =============================================================================
 # Camera
 # =============================================================================
-CAMERA_INDEX = 1                        # 0 = integrated, 1 = USB camera
+CAMERA_INDEX = int(_OV.get("CAMERA_INDEX", 1))   # 0 = integrated, 1 = USB camera
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_BUFFER_SIZE = 1
@@ -64,12 +74,12 @@ TRACKER_MIN_CIRCULARITY = 0.0           # 0 disables circularity check
 TRACKER_MIN_FILL_RATIO = 0.0            # 0 disables fill ratio check
 
 # HSV defaults (orange ball)
-TRACKER_HSV_H_MIN = 10
-TRACKER_HSV_H_MAX = 28
-TRACKER_HSV_S_MIN = 83
-TRACKER_HSV_S_MAX = 255
-TRACKER_HSV_V_MIN = 125
-TRACKER_HSV_V_MAX = 255
+TRACKER_HSV_H_MIN = int(_OV.get("TRACKER_HSV_H_MIN", 10))
+TRACKER_HSV_H_MAX = int(_OV.get("TRACKER_HSV_H_MAX", 28))
+TRACKER_HSV_S_MIN = int(_OV.get("TRACKER_HSV_S_MIN", 83))
+TRACKER_HSV_S_MAX = int(_OV.get("TRACKER_HSV_S_MAX", 255))
+TRACKER_HSV_V_MIN = int(_OV.get("TRACKER_HSV_V_MIN", 125))
+TRACKER_HSV_V_MAX = int(_OV.get("TRACKER_HSV_V_MAX", 255))
 
 # low-pass weight on raw velocity (0=frozen, 1=raw); ~6 Hz cutoff at 30 fps; tunable
 BALL_VEL_FILTER_ALPHA: float = 0.55
@@ -77,16 +87,18 @@ BALL_VEL_FILTER_ALPHA: float = 0.55
 # =============================================================================
 # PD controller
 # =============================================================================
-PD_DEFAULT_KP = 0.045
-PD_DEFAULT_KD = 0.022
+PD_DEFAULT_KP = float(_OV.get("PD_DEFAULT_KP", 0.045))
+PD_DEFAULT_KD = float(_OV.get("PD_DEFAULT_KD", 0.022))
+PD_MAX_TILT_RATE_DEG_S = 300.0          # slew ("tilt rate") limit on commanded tilt
+PD_D_TERM_LIMIT_DEG = 2.5               # derivative-term contribution cap
 BALL_TARGET_DEFAULT_X_MM = 0.0
 BALL_TARGET_DEFAULT_Y_MM = 0.0
 
 # =============================================================================
 # Manual trim / Auto-trim
 # =============================================================================
-MANUAL_ROLL_TRIM_DEG = -0.8
-MANUAL_PITCH_TRIM_DEG = 4.6
+MANUAL_ROLL_TRIM_DEG = float(_OV.get("MANUAL_ROLL_TRIM_DEG", 0.0))
+MANUAL_PITCH_TRIM_DEG = float(_OV.get("MANUAL_PITCH_TRIM_DEG", 0.0))
 
 AUTO_TRIM_ENABLED = False
 AUTO_TRIM_KI_DEG_PER_MM_S = 0.008
