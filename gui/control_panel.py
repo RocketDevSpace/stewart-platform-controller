@@ -507,6 +507,14 @@ class ControlPanel(QWidget):
     def set_cancel_enabled(self, enabled: bool) -> None:
         self._cancel_routine_btn.setEnabled(enabled)
 
+    def set_manual_controls_enabled(self, enabled: bool) -> None:
+        """Enable/disable every manual command source (routine dropdown, SEND,
+        raw serial box). Vision mode disables them all: exactly one command
+        source may own the hardware at a time."""
+        self._demo_list.setEnabled(enabled)
+        self._send_button.setEnabled(enabled)
+        self._raw_serial_input.setEnabled(enabled)
+
     def set_vision_active(self, active: bool) -> None:
         self._vision_active = active
         if active:

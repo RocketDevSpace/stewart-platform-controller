@@ -16,6 +16,13 @@ SAFETY_LIMITS = {
     "even_servo_min": 10,   # extra floor for INDICES 1, 3, 5 (mirrored mount)
 }
 
+# Largest per-servo jump (deg) sent as an instant write (firmware speedDelay 0).
+# Bigger jumps are sent with SERVO_LARGE_MOVE_SPEED_DELAY_MS so the FIRMWARE
+# ramps the move (1 deg per speedDelay ms, all servos concurrently; firmware
+# clamps speedDelay to 0-20 and acks only after the ramp — see firmware/README.md).
+SERVO_SLEW_INSTANT_MAX_DEG = 12.0
+SERVO_LARGE_MOVE_SPEED_DELAY_MS = 5     # -> 200 deg/s hardware ramp on big moves
+
 # =============================================================================
 # Camera
 # =============================================================================

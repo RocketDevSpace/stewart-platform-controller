@@ -84,12 +84,16 @@ class TestSendAngles:
         assert sent_bytes == b"S,90,90,90,90,90,90,0\n"
 
     def test_servo_0_clipped_to_170_before_send(self) -> None:
-        """Servo 0 at 180 must be clipped to 170 by send_angles."""
+        """Servo 0 at 180 must be clipped to 170 by send_angles.
+
+        An 80 deg jump from the boot pose exceeds SERVO_SLEW_INSTANT_MAX_DEG,
+        so the command carries the large-move speedDelay (firmware ramp).
+        """
         driver, mock_serial = make_driver()
         angles = [180.0, 90.0, 90.0, 90.0, 90.0, 90.0]
         driver.send_angles(angles)
         sent_bytes = mock_serial.send.call_args[0][0]
-        assert sent_bytes == b"S,170,90,90,90,90,90,0\n"
+        assert sent_bytes == b"S,170,90,90,90,90,90,5\n"
 
     def test_servo_1_clipped_to_10_before_send(self) -> None:
         """Servo 1 below 10 must be clipped to 10 by send_angles."""
@@ -97,20 +101,98 @@ class TestSendAngles:
         angles = [90.0, 0.0, 90.0, 90.0, 90.0, 90.0]
         driver.send_angles(angles)
         sent_bytes = mock_serial.send.call_args[0][0]
-        assert sent_bytes == b"S,90,10,90,90,90,90,0\n"
+        assert sent_bytes == b"S,90,10,90,90,90,90,5\n"
 
     def test_all_servos_clipped_simultaneously(self) -> None:
         driver, mock_serial = make_driver()
         angles = [180.0, 0.0, 180.0, 0.0, 180.0, 0.0]
         driver.send_angles(angles)
         sent_bytes = mock_serial.send.call_args[0][0]
-        assert sent_bytes == b"S,170,10,170,10,170,10,0\n"
+        assert sent_bytes == b"S,170,10,170,10,170,10,5\n"
 
     def test_serial_send_receives_bytes_not_str(self) -> None:
         driver, mock_serial = make_driver()
         driver.send_angles(all_90())
         sent_arg = mock_serial.send.call_args[0][0]
         assert isinstance(sent_arg, bytes)
+
+    def test_small_move_sent_instant(self) -> None:
+        """Jumps within SERVO_SLEW_INSTANT_MAX_DEG go out with speedDelay 0."""
+        driver, mock_serial = make_driver()
+        driver.send_angles([95.0, 90.0, 90.0, 90.0, 90.0, 90.0])
+        assert mock_serial.send.call_args[0][0] == b"S,95,90,90,90,90,90,0\n"
+
+    def test_slew_tracks_last_sent_pose(self) -> None:
+        """After a successful send, deltas are measured from the NEW pose."""
+        driver, mock_serial = make_driver()
+        driver.send_angles([100.0, 90.0, 90.0, 90.0, 90.0, 90.0])  # 10 deg, instant
+        driver.send_angles([110.0, 90.0, 90.0, 90.0, 90.0, 90.0])  # 10 more, instant
+        assert mock_serial.send.call_args[0][0] == b"S,110,90,90,90,90,90,0\n"
+
+    def test_failed_send_does_not_update_last_sent(self) -> None:
+        driver, mock_serial = make_driver(send_return=False)
+        driver.send_angles([100.0, 90.0, 90.0, 90.0, 90.0, 90.0])
+        mock_serial.send.return_value = True
+        # Previous send failed, so the reference pose is still boot (90s):
+        # a 10 deg total move stays instant.
+        driver.send_angles([100.0, 90.0, 90.0, 90.0, 90.0, 90.0])
+        assert mock_serial.send.call_args[0][0] == b"S,100,90,90,90,90,90,0\n"
+
+    def test_streaming_uses_send_latest(self) -> None:
+        driver, mock_serial = make_driver()
+        mock_serial.send_latest.return_value = True
+        driver.send_angles(all_90(), streaming=True)
+        mock_serial.send_latest.assert_called_once()
+        mock_serial.send.assert_not_called()
+
+    def test_wrong_length_raises(self) -> None:
+        driver, mock_serial = make_driver()
+        with pytest.raises(ValueError):
+            driver.send_angles([90.0] * 5)
+        mock_serial.send.assert_not_called()
+
+    def test_non_finite_angle_raises(self) -> None:
+        driver, mock_serial = make_driver()
+        with pytest.raises(ValueError):
+            driver.send_angles([float("nan"), 90.0, 90.0, 90.0, 90.0, 90.0])
+        mock_serial.send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# send_raw — validated raw-command path (GUI raw box routes here)
+# ---------------------------------------------------------------------------
+
+class TestSendRaw:
+    def test_valid_raw_command_sent_with_newline(self) -> None:
+        driver, mock_serial = make_driver()
+        assert driver.send_raw("S,95,90,90,90,90,90") is True
+        assert mock_serial.send.call_args[0][0] == b"S,95,90,90,90,90,90,0\n"
+
+    def test_raw_without_prefix_rejected(self) -> None:
+        driver, mock_serial = make_driver()
+        assert driver.send_raw("hello") is False
+        mock_serial.send.assert_not_called()
+
+    def test_raw_wrong_field_count_rejected(self) -> None:
+        driver, mock_serial = make_driver()
+        assert driver.send_raw("S,90,90") is False
+        mock_serial.send.assert_not_called()
+
+    def test_raw_non_numeric_rejected(self) -> None:
+        driver, mock_serial = make_driver()
+        assert driver.send_raw("S,a,b,c,d,e,f,0") is False
+        mock_serial.send.assert_not_called()
+
+    def test_raw_out_of_range_angle_clipped(self) -> None:
+        driver, mock_serial = make_driver()
+        assert driver.send_raw("S,300,90,90,90,90,90,0") is True
+        # 300 -> 170 (odd_servo_max), and the 80 deg jump gets the ramp delay
+        assert mock_serial.send.call_args[0][0] == b"S,170,90,90,90,90,90,5\n"
+
+    def test_raw_explicit_speed_delay_respected(self) -> None:
+        driver, mock_serial = make_driver()
+        assert driver.send_raw("S,95,90,90,90,90,90,7") is True
+        assert mock_serial.send.call_args[0][0] == b"S,95,90,90,90,90,90,7\n"
 
 
 # ---------------------------------------------------------------------------

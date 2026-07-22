@@ -414,13 +414,12 @@ class VisionControlWorker(QtCore.QObject):
             )
             t4 = time.perf_counter()
 
-            servo_angles: list[int] = []
+            servo_angles: list[float] = []
             if ik_result.get("success", False):
                 self._prev_arm_points = ik_result.get("arm_points")
-                servo_angles = [
-                    max(0, min(180, int(round(a))))
-                    for a in ik_result["servo_angles_deg"]
-                ]
+                # No inline clamping: the ServoDriver send path applies the
+                # single safety clip in core/safety.py.
+                servo_angles = [float(a) for a in ik_result["servo_angles_deg"]]
 
             t_cmd0 = time.perf_counter()
             if servo_angles and self._command_sender is not None:

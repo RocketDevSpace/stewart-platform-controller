@@ -92,6 +92,7 @@ def _settings_path() -> pathlib.Path:
 
 class MainWindow(QWidget):
     serial_line_received = QtCore.pyqtSignal(str)
+    serial_link_lost = QtCore.pyqtSignal(str)
 
     # Routed to VisionControlWorker (connected when worker starts)
     vision_gains_updated = QtCore.pyqtSignal(float, float)
@@ -116,6 +117,11 @@ class MainWindow(QWidget):
         self._serial.connect()
         self._serial.set_receive_callback(
             lambda line: self.serial_line_received.emit(line)
+        )
+        # Bridge unexpected link loss (USB unplug, I/O error) onto the GUI
+        # thread — the callback fires on a background serial thread.
+        self._serial.set_disconnect_callback(
+            lambda reason: self.serial_link_lost.emit(reason)
         )
         self._servo = ServoDriver(self._serial)
 
@@ -191,6 +197,7 @@ class MainWindow(QWidget):
 
         # --- Wire signals ---
         self.serial_line_received.connect(self.serial_monitor.append_line)
+        self.serial_link_lost.connect(self._on_serial_link_lost)
 
         # ControlPanel — original signals
         self.control_panel.slider_changed.connect(self._on_slider_changed)
@@ -273,11 +280,19 @@ class MainWindow(QWidget):
         still_going = self.routine_runner.tick()
         if not still_going and not self.routine_runner.is_running:
             self._routine_timer.stop()
-            self.control_panel.set_sliders_enabled(True)
-            self.control_panel.set_send_enabled(True)
+            # Never re-enable manual controls that vision mode has locked.
+            if not self._vision_enabled:
+                self.control_panel.set_sliders_enabled(True)
+                self.control_panel.set_send_enabled(True)
             self.control_panel.set_cancel_enabled(False)
 
     def _on_routine_selected(self, name: str) -> None:
+        if self._vision_enabled:
+            self.control_panel.append_preview(
+                "[MODE] Routines disabled while vision mode is active."
+            )
+            self.control_panel.reset_routine_selector()
+            return
         self.control_panel.append_preview(f"[INFO] Previewing routine: {name}")
 
         current = self.control_panel.get_slider_values()
@@ -305,8 +320,9 @@ class MainWindow(QWidget):
             self.control_panel.append_preview("[INFO] Routine preview cancelled.")
         self.routine_runner.cancel()
         self._routine_timer.stop()
-        self.control_panel.set_sliders_enabled(True)
-        self.control_panel.set_send_enabled(True)
+        if not self._vision_enabled:
+            self.control_panel.set_sliders_enabled(True)
+            self.control_panel.set_send_enabled(True)
         self.control_panel.set_cancel_enabled(False)
         self.control_panel.reset_routine_selector()
         self.visualizer.update_platform(self.control_panel.get_slider_values())
@@ -321,6 +337,11 @@ class MainWindow(QWidget):
         self.visualizer.update_platform(pose)
 
     def _on_send_clicked(self) -> None:
+        if self._vision_enabled:
+            self.control_panel.append_preview(
+                "[MODE] Manual send disabled while vision mode is active."
+            )
+            return
         routine_name = self.control_panel.current_routine()
         if routine_name != ROUTINE_PLACEHOLDER:
             if not self.routine_runner.load(routine_name):
@@ -371,15 +392,26 @@ class MainWindow(QWidget):
         self.visualizer.prev_arm_points = ik_result.get("arm_points")
 
     def _on_raw_command_sent(self, cmd: str) -> None:
+        if self._vision_enabled:
+            self.control_panel.append_preview(
+                "[MODE] Raw send disabled while vision mode is active."
+            )
+            return
         if not self.control_panel.confirm(
             "Confirm Send",
             f"Send the following command to Arduino?\n{cmd}",
         ):
             self.control_panel.append_preview("[INFO] Send canceled by user.")
             return
-        self._serial.send(cmd.encode())
-        self.serial_monitor.append_command(cmd)
-        self.control_panel.append_preview(f"[INFO] Command sent: {cmd}")
+        # ServoDriver validates, safety-clips, ramps large jumps, and appends
+        # the newline terminator — raw text must not bypass those rails.
+        if self._servo.send_raw(cmd):
+            self.serial_monitor.append_command(cmd)
+            self.control_panel.append_preview(f"[INFO] Command sent: {cmd}")
+        else:
+            self.control_panel.append_preview(
+                f"[ERROR] Raw command rejected or send failed: {cmd}"
+            )
         self.control_panel.clear_raw_input()
 
     # ------------------------------------------------------------------
@@ -547,6 +579,11 @@ class MainWindow(QWidget):
     def _enable_vision_mode(self) -> None:
         if self._vision_enabled or self._vision_starting:
             return
+        # Mode mutual exclusion: exactly one command source may own the
+        # hardware. Cancel any running routine, then lock out every manual
+        # command path (sliders, routines, SEND, raw box).
+        if self.routine_runner.is_running:
+            self._on_routine_cancelled()
         self._vision_enabled = True
         self._vision_starting = True
         self._vision_counter = 0
@@ -557,6 +594,7 @@ class MainWindow(QWidget):
         self._timing_timestamps.clear()
         self.control_panel.set_vision_active(True)
         self.control_panel.set_sliders_enabled(False)
+        self.control_panel.set_manual_controls_enabled(False)
         self._vision_monitor.show()
         self._start_vision_worker()
         self.control_panel.append_preview("[INFO] Vision mode enabled.")
@@ -589,7 +627,11 @@ class MainWindow(QWidget):
             camera_index=CAMERA_INDEX,
             loop_hz=VISION_LOOP_HZ,
             snapshot_hz=GUI_SNAPSHOT_HZ,
-            command_sender=self._servo.send_angles,
+            # Streaming path: latest-wins depth-1 queue, never blocks the
+            # vision loop on serial I/O, stale setpoints are coalesced away.
+            command_sender=lambda angles: self._servo.send_angles(
+                angles, streaming=True
+            ),
             roll_offset=self._trim_roll_deg,
             pitch_offset=self._trim_pitch_deg,
             auto_trim_enabled=self._auto_trim_enabled,
@@ -699,8 +741,18 @@ class MainWindow(QWidget):
         self._vision_starting = False
         self.control_panel.set_vision_active(False)
         self.control_panel.set_sliders_enabled(True)
+        self.control_panel.set_manual_controls_enabled(True)
         self.control_panel.sync_calibrate_button(False)
         self.control_panel.append_preview("[INFO] Vision mode disabled.")
+
+    def _on_serial_link_lost(self, reason: str) -> None:
+        self.control_panel.append_preview(
+            f"[SERIAL] Link lost ({reason}). Reconnect the Arduino and "
+            "restart the app."
+        )
+        self.serial_monitor.append_line(f"[LINK LOST] {reason}")
+        if self._vision_enabled:
+            self._disable_vision_mode()
 
     def _on_vision_error(self, msg: str) -> None:
         self.control_panel.append_preview(f"[VISION ERROR] {msg}")
@@ -769,7 +821,9 @@ class MainWindow(QWidget):
                     )
                 return
 
-            safe_angles = [max(0, min(180, int(a))) for a in snapshot.servo_angles]
+            # For the trace log only — clamping happens in core/safety via
+            # ServoDriver on the actual send path.
+            safe_angles = [int(round(a)) for a in snapshot.servo_angles]
 
             # Visualizer at VISUALIZER_HZ
             now_perf = time.perf_counter()
@@ -860,10 +914,8 @@ class MainWindow(QWidget):
                        roll=0.0, pitch=0.0, yaw=0.0)
         ik = self._ik.solve(neutral, None)
         if ik.get("success"):
-            safe: list[float] = [
-                float(max(0, min(180, int(round(a))))) for a in ik["servo_angles_deg"]
-            ]
-            self._servo.send_angles(safe)
+            # Safety clamping happens inside send_angles (core/safety).
+            self._servo.send_angles(list(ik["servo_angles_deg"]))
 
     # ------------------------------------------------------------------
     # Sync methods — push worker state back to GUI without feedback loops
@@ -1039,14 +1091,46 @@ class MainWindow(QWidget):
         except TypeError:
             pass
 
-        if self._vision_worker is not None:
+        if self._vision_worker is not None and self._vision_thread is not None:
+            # The worker's stop handshake is a chain of QUEUED cross-thread
+            # signals (stop → stopped → quit → finished), all of which need
+            # the GUI event loop to dispatch. QThread.wait() here would block
+            # that loop and deadlock until timeout — so instead spin a local
+            # QEventLoop until the thread finishes (3 s guard).
+            waiter = QtCore.QEventLoop()
+            self._vision_thread.finished.connect(waiter.quit)
+            timeout_guard = QtCore.QTimer(self)
+            timeout_guard.setSingleShot(True)
+            timeout_guard.timeout.connect(waiter.quit)
+            timeout_guard.start(3000)
             self._disable_vision_mode()
-            if self._vision_thread is not None:
-                if not self._vision_thread.wait(3000):
-                    self.control_panel.append_preview(
-                        "[WARN] Vision thread did not stop within 3 s."
-                    )
+            waiter.exec_()
+            timeout_guard.stop()
+            thread = self._vision_thread
+            if thread is not None and thread.isRunning():
+                # Timed out: force the event loop down and give it a moment.
+                thread.quit()
+                thread.wait(1000)
 
         self._vision_monitor.close()
         self._serial.disconnect()
         event.accept()  # type: ignore[attr-defined]
+
+    def emergency_shutdown(self) -> None:
+        """Crash-path cleanup (called by main.py's excepthook): stop timers,
+        ramp the platform to neutral, and drop the serial link. Must never
+        raise."""
+        try:
+            self._routine_timer.stop()
+        except Exception:
+            pass
+        try:
+            # Neutral servo pose == firmware boot pose; the large-move policy
+            # in ServoDriver turns this into a gentle hardware ramp.
+            self._servo.send_angles([90.0] * 6)
+        except Exception:
+            pass
+        try:
+            self._serial.disconnect()
+        except Exception:
+            pass
