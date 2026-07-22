@@ -44,6 +44,8 @@ from settings import (
     TRACKER_HSV_V_MIN,
     TRACKER_REACQUIRE_VALID_FRAMES,
     TRACKER_WARP_SIZE_PX,
+    VISION_MISS_NEUTRAL_AFTER_FRAMES,
+    VISION_NEUTRAL_RESEND_S,
 )
 
 # Timing dicts contain ONLY genuinely measured values — the 28 zero-filled
@@ -99,7 +101,6 @@ class VisionControlWorker(QtCore.QObject):
     def __init__(
         self,
         ik_solver: IKEngine,
-        z_provider: Callable[[], float],
         kp: float = PD_DEFAULT_KP,
         kd: float = PD_DEFAULT_KD,
         max_tilt_deg: float = MAX_TILT_DEG,
@@ -114,7 +115,9 @@ class VisionControlWorker(QtCore.QObject):
         super().__init__()
 
         self._ik = ik_solver
-        self._z_provider = z_provider
+        # z setpoint pushed from the GUI via the set_z slot (queued signal
+        # delivery replaces the old cross-thread z_provider lambda).
+        self._z_setpoint = 0.0
         self._loop_hz = max(1, int(loop_hz))
         self._snapshot_hz = max(1, int(snapshot_hz))
         self._command_sender = command_sender
@@ -141,6 +144,7 @@ class VisionControlWorker(QtCore.QObject):
         self._prev_arm_points: np.ndarray | None = None
         self._last_frame_ts = 0.0
         self._last_error_emit = 0.0
+        self._last_neutral_send = 0.0
 
         self.camera: CameraSource | None = None
         self.ball_tracker: BallTracker | None = None
@@ -219,6 +223,7 @@ class VisionControlWorker(QtCore.QObject):
         self._last_snapshot_emit_perf = 0.0
         self._prev_arm_points = None
         self._last_frame_ts = 0.0
+        self._last_neutral_send = 0.0
 
         self._timer = QtCore.QTimer(self)
         self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
@@ -249,6 +254,11 @@ class VisionControlWorker(QtCore.QObject):
     # ------------------------------------------------------------------
     # Configuration slots (can be called while running)
     # ------------------------------------------------------------------
+
+    @QtCore.pyqtSlot(float)
+    def set_z(self, z_mm: float) -> None:
+        """Store the platform z setpoint used for every commanded pose."""
+        self._z_setpoint = float(z_mm)
 
     @QtCore.pyqtSlot(float, float)
     def set_gains(self, kp: float, kd: float) -> None:
@@ -372,13 +382,18 @@ class VisionControlWorker(QtCore.QObject):
                 self._was_missing = True
                 self._valid_streak = 0
 
+                # Neutral-pose fallback: on sustained ball loss, level the
+                # platform (throttled). This is the SAFETY action — it runs
+                # outside the reacquire gate and needs no tracking_valid.
+                self._maybe_send_neutral()
+
                 timings_ms = self._build_miss_timings(t0, t1, loop_start, latest_ts)
                 snapshot = ControlSnapshot(
                     timestamp=time.time(),
                     ball_state=None,
                     pose={
                         "x": 0.0, "y": 0.0,
-                        "z": float(self._z_provider()),
+                        "z": self._z_setpoint,
                         "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
                     },
                     servo_angles=[],
@@ -414,7 +429,7 @@ class VisionControlWorker(QtCore.QObject):
             )
             t3 = time.perf_counter()
 
-            z = float(self._z_provider())
+            z = self._z_setpoint
             pose = {
                 "x": 0.0, "y": 0.0, "z": z,
                 "roll": roll_deg, "pitch": pitch_deg, "yaw": 0.0,
@@ -489,6 +504,37 @@ class VisionControlWorker(QtCore.QObject):
             if (now - self._last_error_emit) >= 1.0:
                 self._last_error_emit = now
                 self.error.emit(str(exc))
+
+    # ------------------------------------------------------------------
+    # Neutral-pose fallback
+    # ------------------------------------------------------------------
+
+    def _maybe_send_neutral(self) -> None:
+        """Send a level pose at the current z after sustained misses.
+
+        Fires once the miss streak reaches VISION_MISS_NEUTRAL_AFTER_FRAMES
+        and then at most every VISION_NEUTRAL_RESEND_S. The throttle stamp
+        advances on every attempt (matching the previous GUI-side policy)
+        so an unsolvable pose cannot spam IK at loop rate.
+        """
+        if self._miss_count < VISION_MISS_NEUTRAL_AFTER_FRAMES:
+            return
+        now = time.perf_counter()
+        if (now - self._last_neutral_send) <= VISION_NEUTRAL_RESEND_S:
+            return
+        self._last_neutral_send = now
+        ik = self._ik.solve(
+            Pose(x=0.0, y=0.0, z=self._z_setpoint,
+                 roll=0.0, pitch=0.0, yaw=0.0),
+            None,
+        )
+        if ik.success and self._command_sender is not None:
+            try:
+                # Safety clamping happens inside the send path (core/safety
+                # via ServoDriver).
+                self._command_sender([float(a) for a in ik.servo_angles_deg])
+            except Exception as exc:
+                self.error.emit(f"neutral send failed: {exc}")
 
     # ------------------------------------------------------------------
     # Timing helpers

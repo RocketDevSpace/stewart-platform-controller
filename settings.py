@@ -148,9 +148,14 @@ VISUALIZER_HZ = 25
 GUI_SNAPSHOT_HZ = 30
 
 # =============================================================================
+# Vision neutral-pose fallback (safety action on sustained ball loss)
+# =============================================================================
+VISION_MISS_NEUTRAL_AFTER_FRAMES = 20   # consecutive misses before neutral send
+VISION_NEUTRAL_RESEND_S = 0.5           # min seconds between neutral resends
+
+# =============================================================================
 # GUI / logging
 # =============================================================================
 GUI_LOG_MAX_LINES = 500
-TIMING_PLOT_POINTS = 300
 LOG_EVERY_N = 30                        # log every N vision frames
 DEBUG_PRINTS = True

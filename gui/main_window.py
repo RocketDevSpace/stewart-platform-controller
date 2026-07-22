@@ -2,26 +2,27 @@
 gui/main_window.py
 
 Top-level application window.  Wires the clean modules together:
-  SerialManager + ServoDriver + IKEngine + RoutineRunner +
-  StewartVisualizer + ControlPanel + SerialMonitor +
+  SerialManager + ServoDriver + IKEngine + PoseCommander + RoutineRunner +
+  StewartVisualizer + ControlPanel + SerialMonitor + TimingPlotWidget +
   VisionControlWorker (in its own QThread) + VisionMonitorWindow.
 
 Vision loop ownership: VisionControlWorker runs in _vision_thread.
 Snapshots arrive via snapshot_ready signal → _on_control_snapshot().
-The worker owns BallTracker and BallController; this file owns the
-thread lifecycle, GUI sync, timing plot, and neutral-pose fallback.
+The worker owns BallTracker + BallController AND the neutral-pose
+fallback policy; this file owns the thread lifecycle and GUI sync only.
+All IK solves and servo sends go through control/pose_commander.py —
+gui/ files contain no control logic (hard constraint 5).
 """
 
 from __future__ import annotations
 
+import threading
 import time
-from collections import deque
 
 import numpy as np
-from PyQt5 import QtCore, QtGui
+from PyQt5 import QtCore
 from PyQt5.QtWidgets import (
     QHBoxLayout,
-    QLabel,
     QVBoxLayout,
     QWidget,
 )
@@ -29,12 +30,14 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 import settings_store
+from control.pose_commander import PoseCommander
 from control.routine_runner import RoutineRunner
 from core.ik_engine import IKEngine
 from core.platform_state import Pose
 from cv.vision_control_worker import ControlSnapshot, VisionControlWorker
 from gui.control_panel import ControlPanel, DARK_QSS, ROUTINE_PLACEHOLDER
 from gui.serial_monitor import SerialMonitor
+from gui.timing_plot import TimingPlotWidget
 from gui.vision_monitor import VisionMonitorWindow
 from hardware.serial_manager import SerialManager
 from hardware.servo_driver import ServoDriver
@@ -44,7 +47,6 @@ from settings import (
     BALL_TARGET_DEFAULT_Y_MM,
     CAMERA_INDEX,
     CONTROL_LOOP_INTERVAL_MS,
-    GUI_LOG_MAX_LINES,
     GUI_SNAPSHOT_HZ,
     LOG_EVERY_N,
     MANUAL_PITCH_TRIM_DEG,
@@ -54,47 +56,24 @@ from settings import (
     PD_DEFAULT_KP,
     SERIAL_BAUD,
     SERIAL_PORT,
-    TIMING_PLOT_POINTS,
     VISION_LOOP_HZ,
     VISUALIZER_HZ,
 )
 from visualization.visualizer3d import StewartVisualizer
 
-_TIMING_KEYS = [
-    "ball_update",
-    "pd_compute",
-    "ik_solve",
-    "serial_enqueue",
-    "visualizer_gui",
-    "frame_to_worker_ms",
-    "worker_to_gui_ms",
-    "frame_to_cmd",
-    "total",
-]
-_TIMING_COLORS = {
-    "ball_update":       "#38bdf8",
-    "pd_compute":        "#34d399",
-    "ik_solve":          "#f43f5e",
-    "serial_enqueue":    "#a78bfa",
-    "visualizer_gui":    "#f59e0b",
-    "frame_to_worker_ms": "#0ea5e9",
-    "worker_to_gui_ms":  "#64748b",
-    "frame_to_cmd":      "#22d3ee",
-    "total":             "#e2e8f0",
-}
-_TIMING_WINDOW_S = 30.0
-_PLOT_UPDATE_EVERY = 5
-
 
 class MainWindow(QWidget):
     serial_line_received = QtCore.pyqtSignal(str)
     serial_link_lost = QtCore.pyqtSignal(str)
+    # Emitted from the background connect thread → handled on the GUI thread
+    serial_connect_finished = QtCore.pyqtSignal(bool)
 
     # Routed to VisionControlWorker (connected when worker starts)
     vision_gains_updated = QtCore.pyqtSignal(float, float)
     vision_hsv_updated = QtCore.pyqtSignal(int, int, int, int, int, int)
     vision_target_updated = QtCore.pyqtSignal(float, float)
     vision_trim_updated = QtCore.pyqtSignal(float, float)
+    vision_z_updated = QtCore.pyqtSignal(float)
     vision_auto_trim_enabled = QtCore.pyqtSignal(bool)
     vision_trim_reset_requested = QtCore.pyqtSignal()
     vision_calibrate_home_set = QtCore.pyqtSignal(bool)
@@ -103,14 +82,16 @@ class MainWindow(QWidget):
     vision_pd_autotune_apply = QtCore.pyqtSignal()
     vision_snapshot_consumed = QtCore.pyqtSignal()
 
-    def __init__(self, ik_solver: object = None) -> None:  # noqa: ARG002
+    def __init__(self) -> None:
         super().__init__()
         self.setStyleSheet(DARK_QSS)  # app-wide dark theme; cascades to all children
 
         # --- Core engines ---
+        # Constructed DISCONNECTED: SerialManager.connect() blocks ~2 s on
+        # the Arduino boot handshake, so it runs on a background thread
+        # after the window is built (see end of __init__).
         self._ik = IKEngine()
         self._serial = SerialManager(SERIAL_PORT, SERIAL_BAUD)
-        self._serial.connect()
         self._serial.set_receive_callback(
             lambda line: self.serial_line_received.emit(line)
         )
@@ -120,6 +101,7 @@ class MainWindow(QWidget):
             lambda reason: self.serial_link_lost.emit(reason)
         )
         self._servo = ServoDriver(self._serial)
+        self._commander = PoseCommander(self._ik, self._servo)
 
         # --- Visualizer ---
         self._figure = Figure(facecolor="#0f1726")
@@ -129,24 +111,7 @@ class MainWindow(QWidget):
         self.visualizer = StewartVisualizer(self._canvas)
 
         # --- Timing plot ---
-        self._timing_figure = Figure(figsize=(5, 2.2))
-        self._timing_figure.patch.set_facecolor("#0f1726")
-        self._timing_ax = self._timing_figure.add_subplot(111)
-        self._timing_canvas = FigureCanvas(self._timing_figure)
-        self._timing_canvas.setFixedHeight(210)
-        self._init_timing_plot_style()
-
-        self._timing_summary_label = QLabel(
-            "Vision Timing Avg (ms): waiting for data..."
-        )
-        self._timing_summary_label.setMaximumHeight(22)
-
-        timing_capacity = max(TIMING_PLOT_POINTS, int(VISION_LOOP_HZ * 35))
-        self._timing_history: dict[str, deque] = {
-            k: deque(maxlen=timing_capacity) for k in _TIMING_KEYS
-        }
-        self._timing_timestamps: deque = deque(maxlen=timing_capacity)
-        self._y_zoom = 1.0
+        self._timing_plot = TimingPlotWidget()
 
         # --- View widgets ---
         self.control_panel = ControlPanel()
@@ -165,11 +130,9 @@ class MainWindow(QWidget):
         self._vision_thread: QtCore.QThread | None = None
         self._vision_worker: VisionControlWorker | None = None
         self._vision_enabled = False
-        self._vision_starting = False
         self._vision_counter = 0
         self._vision_z_setpoint = 0.0
         self._last_visualizer_update = 0.0
-        self._last_neutral_send = 0.0
 
         # Mirror of control_panel settings (for routing to worker)
         self._kp = PD_DEFAULT_KP
@@ -184,6 +147,9 @@ class MainWindow(QWidget):
         self._pd_autotune_enabled = False
         self._pd_autotune_auto_apply = False
         self._pd_autotune_has_suggestion = False
+        # Worker-ack guard: after Apply Now, ignore has_suggestion=True from
+        # stale snapshots until the worker reports has_suggestion False.
+        self._autotune_apply_pending = False
 
         # --- Routine timer ---
         self._routine_timer = QtCore.QTimer()
@@ -193,6 +159,7 @@ class MainWindow(QWidget):
         # --- Wire signals ---
         self.serial_line_received.connect(self.serial_monitor.append_line)
         self.serial_link_lost.connect(self._on_serial_link_lost)
+        self.serial_connect_finished.connect(self._on_serial_connect_finished)
 
         # ControlPanel — original signals
         self.control_panel.slider_changed.connect(self._on_slider_changed)
@@ -229,39 +196,50 @@ class MainWindow(QWidget):
             self._vision_monitor.show
         )
 
-        # Timing canvas scroll → y-zoom
-        self._timing_canvas.mpl_connect("scroll_event", self._on_timing_scroll)
-
         # --- Layout ---
         right_layout = QVBoxLayout()
         right_layout.addWidget(self._canvas, stretch=3)
-        right_layout.addWidget(self._timing_summary_label, stretch=0)
-        right_layout.addWidget(self._timing_canvas, stretch=1)
+        right_layout.addWidget(self._timing_plot, stretch=1)
 
         layout = QHBoxLayout()
         layout.addWidget(self.control_panel, stretch=0)
         layout.addLayout(right_layout, stretch=1)
         self.setLayout(layout)
 
-    # ------------------------------------------------------------------
-    # Timing plot
-    # ------------------------------------------------------------------
-
-    def _init_timing_plot_style(self) -> None:
-        self._timing_ax.set_facecolor("#0f1726")
-        self._timing_ax.set_title(
-            "Vision Loop Timings (30s)", color="#d6e2ff", fontsize=8
+        # --- Non-blocking serial connect ---
+        # SerialManager stays the owner of the connect/boot-wait logic; the
+        # GUI only moves the blocking call off the GUI thread so the window
+        # shows immediately. ServoDriver sends fail gracefully (return
+        # False) until the link is up.
+        self._serial_connect_thread = threading.Thread(
+            target=self._connect_serial_blocking,
+            daemon=True,
+            name="serial-connect",
         )
-        self._timing_ax.tick_params(colors="#9fb4d9", labelsize=7)
-        self._timing_ax.grid(True, alpha=0.2, color="#2a3b59")
+        self._serial_connect_thread.start()
 
-    def _on_timing_scroll(self, event: object) -> None:
-        btn = getattr(event, "button", None)
-        if btn == "up":
-            self._y_zoom = max(0.2, self._y_zoom * 0.9)
-        elif btn == "down":
-            self._y_zoom = min(10.0, self._y_zoom * 1.1)
-        self._update_timing_diagnostics(force_redraw=True)
+    # ------------------------------------------------------------------
+    # Serial connect (background thread + GUI-thread completion slot)
+    # ------------------------------------------------------------------
+
+    def _connect_serial_blocking(self) -> None:
+        """Runs on the serial-connect thread. Never raises."""
+        try:
+            ok = self._serial.connect()
+        except Exception:
+            ok = False
+        self.serial_connect_finished.emit(ok)
+
+    def _on_serial_connect_finished(self, ok: bool) -> None:
+        if ok:
+            msg = f"[SERIAL] Connected on {SERIAL_PORT}"
+        else:
+            msg = (
+                f"[SERIAL] Connection on {SERIAL_PORT} FAILED — check the "
+                "cable and the port in settings.py, then restart the app."
+            )
+        self.control_panel.append_preview(msg)
+        self.serial_monitor.append_line(msg)
 
     # ------------------------------------------------------------------
     # Routine playback
@@ -297,7 +275,7 @@ class MainWindow(QWidget):
         self.control_panel.append_preview(f"[INFO] Previewing routine: {name}")
 
         current = self.control_panel.get_slider_values()
-        seed = self._ik.solve(
+        seed = self._commander.solve(
             Pose(**{k: float(v) for k, v in current.items()}),
             self.visualizer.prev_arm_points,
         )
@@ -343,6 +321,7 @@ class MainWindow(QWidget):
     def _on_slider_changed(self, axis: str, value: int) -> None:  # noqa: ARG002
         pose = self.control_panel.get_slider_values()
         self._vision_z_setpoint = float(pose["z"])
+        self.vision_z_updated.emit(self._vision_z_setpoint)
         self.visualizer.update_platform(pose)
 
     def _on_send_clicked(self) -> None:
@@ -367,7 +346,7 @@ class MainWindow(QWidget):
         pose = Pose(**{k: float(v) for k, v in pose_dict.items()})
 
         t0 = time.perf_counter()
-        ik_result = self._ik.solve(pose, self.visualizer.prev_arm_points)
+        ik_result = self._commander.solve(pose, self.visualizer.prev_arm_points)
         ik_ms = (time.perf_counter() - t0) * 1000
         self.control_panel.append_preview(
             f"[PROFILE] IK solve time = {ik_ms:.2f} ms"
@@ -379,8 +358,9 @@ class MainWindow(QWidget):
             )
             return
 
-        angles = list(ik_result.servo_angles_deg)
-        cmd_preview = self._servo.format_command(angles).strip()
+        cmd_preview = self._servo.format_command(
+            list(ik_result.servo_angles_deg)
+        ).strip()
 
         if not self.control_panel.confirm(
             "Confirm Send",
@@ -391,7 +371,7 @@ class MainWindow(QWidget):
 
         self.control_panel.append_preview(f"[SEND] {cmd_preview}")
         t1 = time.perf_counter()
-        ok = self._servo.send_angles(angles)
+        ok = self._commander.send(ik_result)
         send_ms = (time.perf_counter() - t1) * 1000
         if not ok:
             self.control_panel.append_preview("[SERIAL ERROR] Send failed.")
@@ -546,6 +526,10 @@ class MainWindow(QWidget):
             return
         self.vision_pd_autotune_apply.emit()
         self._pd_autotune_has_suggestion = False
+        # Snapshots emitted before the worker processed the apply still
+        # carry has_suggestion=True; ignore them until the worker acks
+        # with has_suggestion False (see _sync_autotune_from_terms).
+        self._autotune_apply_pending = True
 
     def _on_autotune_auto_apply_clicked(self, enabled: bool) -> None:
         self._pd_autotune_auto_apply = enabled
@@ -578,7 +562,9 @@ class MainWindow(QWidget):
             self._disable_vision_mode()
 
     def _enable_vision_mode(self) -> None:
-        if self._vision_enabled or self._vision_starting:
+        if self._vision_enabled or self._vision_thread is not None:
+            # Already enabled, or the previous worker thread is still
+            # winding down — never run two workers.
             return
         # Mode mutual exclusion: exactly one command source may own the
         # hardware. Stop any running routine IMMEDIATELY (no wind-down —
@@ -590,12 +576,9 @@ class MainWindow(QWidget):
             self.control_panel.set_cancel_enabled(False)
             self.control_panel.reset_routine_selector()
         self._vision_enabled = True
-        self._vision_starting = True
         self._vision_counter = 0
         self._last_visualizer_update = 0.0
-        for k in _TIMING_KEYS:
-            self._timing_history[k].clear()
-        self._timing_timestamps.clear()
+        self._timing_plot.reset()
         self.control_panel.set_vision_active(True)
         self.control_panel.set_sliders_enabled(False)
         self.control_panel.set_manual_controls_enabled(False)
@@ -607,12 +590,10 @@ class MainWindow(QWidget):
         if not self._vision_enabled and self._vision_worker is None:
             return
         self._vision_enabled = False
-        self._home_calibration_active = False
-        self.control_panel.sync_calibrate_button(False)
         self._stop_vision_worker_async()
-        self._timing_summary_label.setText(
-            "Vision Timing Avg (ms): waiting for data..."
-        )
+        # The remaining UI reset (buttons, monitor window, timing plot)
+        # happens once the worker thread has actually finished — see
+        # _on_vision_thread_finished → _reset_vision_ui.
 
     # ------------------------------------------------------------------
     # Worker thread lifecycle
@@ -624,7 +605,6 @@ class MainWindow(QWidget):
         self._vision_thread = QtCore.QThread(self)
         self._vision_worker = VisionControlWorker(
             ik_solver=self._ik,
-            z_provider=lambda: self._vision_z_setpoint,
             kp=self._kp,
             kd=self._kd,
             max_tilt_deg=MAX_TILT_DEG,
@@ -653,6 +633,7 @@ class MainWindow(QWidget):
         self.vision_hsv_updated.connect(self._vision_worker.set_hsv)
         self.vision_target_updated.connect(self._vision_worker.set_target)
         self.vision_trim_updated.connect(self._vision_worker.set_trim)
+        self.vision_z_updated.connect(self._vision_worker.set_z)
         self.vision_auto_trim_enabled.connect(
             self._vision_worker.set_auto_trim_enabled
         )
@@ -679,21 +660,12 @@ class MainWindow(QWidget):
         self.vision_gains_updated.emit(self._kp, self._kd)
         self.vision_target_updated.emit(self._target_x_mm, self._target_y_mm)
         self.vision_trim_updated.emit(self._trim_roll_deg, self._trim_pitch_deg)
+        self.vision_z_updated.emit(self._vision_z_setpoint)
         self.vision_auto_trim_enabled.emit(self._auto_trim_enabled)
         self.vision_calibrate_home_set.emit(self._home_calibration_active)
         self.vision_pd_autotune_enabled.emit(self._pd_autotune_enabled)
         self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
-
-        # Push current HSV sliders
-        sld = self.control_panel
-        self.vision_hsv_updated.emit(
-            sld._hsv_h_min_slider.value(),
-            sld._hsv_h_max_slider.value(),
-            sld._hsv_s_min_slider.value(),
-            sld._hsv_s_max_slider.value(),
-            sld._hsv_v_min_slider.value(),
-            sld._hsv_v_max_slider.value(),
-        )
+        self.vision_hsv_updated.emit(*self.control_panel.get_hsv())
 
     def _stop_vision_worker_async(self) -> None:
         if self._vision_worker is None:
@@ -706,6 +678,7 @@ class MainWindow(QWidget):
             (self.vision_hsv_updated, self._vision_worker.set_hsv),
             (self.vision_target_updated, self._vision_worker.set_target),
             (self.vision_trim_updated, self._vision_worker.set_trim),
+            (self.vision_z_updated, self._vision_worker.set_z),
             (self.vision_auto_trim_enabled,
              self._vision_worker.set_auto_trim_enabled),
             (self.vision_trim_reset_requested, self._vision_worker.reset_trim),
@@ -742,12 +715,27 @@ class MainWindow(QWidget):
         self._vision_thread = None
         self._vision_worker = None
         self._vision_enabled = False
-        self._vision_starting = False
         self.control_panel.set_vision_active(False)
         self.control_panel.set_sliders_enabled(True)
         self.control_panel.set_manual_controls_enabled(True)
-        self.control_panel.sync_calibrate_button(False)
+        self._reset_vision_ui()
         self.control_panel.append_preview("[INFO] Vision mode disabled.")
+
+    def _reset_vision_ui(self) -> None:
+        """Return every piece of vision-mode UI state to its idle state.
+        Called exactly once per vision session, from
+        _on_vision_thread_finished."""
+        self._pd_autotune_enabled = False
+        self._pd_autotune_auto_apply = False
+        self._pd_autotune_has_suggestion = False
+        self._autotune_apply_pending = False
+        self.control_panel.sync_autotune_buttons(False, False)
+        self._home_calibration_active = False
+        self.control_panel.sync_calibrate_button(False)
+        # Close (hide) the monitor so it doesn't sit around showing the
+        # last frozen frames; reopening starts fresh.
+        self._vision_monitor.close()
+        self._timing_plot.reset()
 
     def _on_serial_link_lost(self, reason: str) -> None:
         self.control_panel.append_preview(
@@ -760,8 +748,6 @@ class MainWindow(QWidget):
 
     def _on_vision_error(self, msg: str) -> None:
         self.control_panel.append_preview(f"[VISION ERROR] {msg}")
-        if self._vision_starting:
-            self._vision_starting = False
 
     def _on_vision_camera_ready(self, info: dict) -> None:
         try:
@@ -778,9 +764,10 @@ class MainWindow(QWidget):
                 f"period={period:.1f}ms (~{fps:.1f} FPS) "
                 f"gray={float(info.get('gray', 0.0)):.1f}"
             )
-        except Exception:
-            pass
-        self._vision_starting = False
+        except Exception as exc:
+            self.control_panel.append_preview(
+                f"[CAMERA] camera-ready info malformed: {exc!r}"
+            )
 
     # ------------------------------------------------------------------
     # Snapshot handler
@@ -791,26 +778,26 @@ class MainWindow(QWidget):
             if not self._vision_enabled:
                 return
 
+            # Exactly one increment per processed snapshot, regardless of
+            # which branch below returns — keeps the LOG_EVERY_N cadence
+            # regular across miss/gate/fail/ok transitions.
+            self._vision_counter += 1
+
             self._update_camera_views(snapshot)
 
             if not snapshot.tracking_valid:
-                now = time.perf_counter()
-                miss = snapshot.miss_count
-                if miss >= 20 and (now - self._last_neutral_send) > 0.5:
-                    self._send_neutral_pose()
-                    self._last_neutral_send = now
-
-                self._vision_counter += 1
+                # Neutral-pose fallback on sustained misses is the WORKER's
+                # job (cv/vision_control_worker.py) — display only here.
                 if self._vision_counter % LOG_EVERY_N == 0:
                     self.control_panel.append_preview(
-                        f"[TRACK] no ball (miss={miss}) reason={snapshot.reason}"
+                        f"[TRACK] no ball (miss={snapshot.miss_count}) "
+                        f"reason={snapshot.reason}"
                     )
                 return
 
             # Reacquire gating is enforced in the WORKER's command path
             # (before any servo send); the snapshot reason is display-only.
             if snapshot.reason == "reacquire_gating":
-                self._vision_counter += 1
                 if self._vision_counter % LOG_EVERY_N == 0:
                     self.control_panel.append_preview(
                         "[TRACK] reacquire gating (commands held)"
@@ -818,7 +805,6 @@ class MainWindow(QWidget):
                 return
 
             if not snapshot.ik_success:
-                self._vision_counter += 1
                 if self._vision_counter % LOG_EVERY_N == 0:
                     self.control_panel.append_preview(
                         "[WARN] IK failed in vision loop."
@@ -849,24 +835,18 @@ class MainWindow(QWidget):
             self._sync_auto_trim_from_terms(terms)
             self._sync_home_calibration_from_terms(terms)
 
-            # Timing history — serial_enqueue arrives measured from the
-            # worker (it was previously overwritten with a nonexistent key,
-            # so that plot line had never shown a real number).
+            # Timing plot — derived metrics measured HERE are injected at
+            # the call site; the widget owns history/trim/redraw cadence.
             timings = dict(snapshot.timings_ms)
             timings["visualizer_gui"] = vis_ms
             wets = snapshot.worker_emit_perf_ts
             timings["worker_to_gui_ms"] = (
                 max(0.0, (now_perf - wets) * 1000.0) if wets > 0 else 0.0
             )
-            timings["frame_to_cmd"] = float(timings.get("frame_to_cmd_worker", 0.0))
-
-            now_wall = time.time()
-            self._timing_timestamps.append(now_wall)
-            for key in _TIMING_KEYS:
-                self._timing_history[key].append(float(timings.get(key, 0.0)))
-            self._trim_timing_history(now_wall)
-            self._update_timing_diagnostics()
-            self._vision_counter += 1
+            # "frame_to_cmd" arrives measured from the worker — it used to
+            # be overwritten here with a nonexistent "frame_to_cmd_worker"
+            # key, so that plot line had always rendered 0.
+            self._timing_plot.ingest(timings)
 
             # Autotune event log
             tune_evt = terms.get("pd_autotune_event")
@@ -909,24 +889,18 @@ class MainWindow(QWidget):
                         f"w2g={timings.get('worker_to_gui_ms', 0.0):.1f}ms "
                         f"angles={safe_angles}"
                     )
-
-            self._trim_preview_log()
         finally:
             self.vision_snapshot_consumed.emit()
 
-    def _send_neutral_pose(self) -> None:
-        neutral = Pose(x=0.0, y=0.0, z=self._vision_z_setpoint,
-                       roll=0.0, pitch=0.0, yaw=0.0)
-        ik = self._ik.solve(neutral, None)
-        if ik.success:
-            # Safety clamping happens inside send_angles (core/safety).
-            self._servo.send_angles(list(ik.servo_angles_deg))
-
     # ------------------------------------------------------------------
-    # Sync methods — push worker state back to GUI without feedback loops
+    # Sync methods — push worker state back to GUI without feedback loops.
+    # Each slider sync is skipped while the user is dragging that slider
+    # group (isSliderDown) so stale worker echoes don't fight the drag.
     # ------------------------------------------------------------------
 
     def _sync_gain_sliders_from_terms(self, terms: dict) -> None:
+        if self.control_panel.any_slider_down("gains"):
+            return
         kp = float(terms.get("kp", self._kp))
         kd = float(terms.get("kd", self._kd))
         if abs(kp - self._kp) > 1e-6 or abs(kd - self._kd) > 1e-6:
@@ -935,6 +909,8 @@ class MainWindow(QWidget):
             self.control_panel.sync_kp_kd(kp, kd)
 
     def _sync_target_from_terms(self, terms: dict) -> None:
+        if self.control_panel.any_slider_down("target"):
+            return
         tx = float(terms.get("target_x_mm", self._target_x_mm))
         ty = float(terms.get("target_y_mm", self._target_y_mm))
         if abs(tx - self._target_x_mm) > 0.5 or abs(ty - self._target_y_mm) > 0.5:
@@ -943,6 +919,8 @@ class MainWindow(QWidget):
             self.control_panel.sync_target(tx, ty)
 
     def _sync_trim_from_terms(self, terms: dict) -> None:
+        if self.control_panel.any_slider_down("trim"):
+            return
         roll = float(terms.get("roll_offset", self._trim_roll_deg))
         pitch = float(terms.get("pitch_offset", self._trim_pitch_deg))
         if abs(roll - self._trim_roll_deg) > 0.005 or abs(pitch - self._trim_pitch_deg) > 0.005:
@@ -974,6 +952,14 @@ class MainWindow(QWidget):
         has_suggestion = bool(
             terms.get("pd_autotune_has_suggestion", self._pd_autotune_has_suggestion)
         )
+        if self._autotune_apply_pending:
+            if has_suggestion:
+                # Stale snapshot emitted before the worker applied the
+                # suggestion — do not re-adopt it.
+                has_suggestion = False
+            else:
+                # Worker ack: the apply went through.
+                self._autotune_apply_pending = False
         changed = (
             enabled != self._pd_autotune_enabled
             or auto_apply != self._pd_autotune_auto_apply
@@ -996,6 +982,9 @@ class MainWindow(QWidget):
             target_x_mm=self._target_x_mm,
             target_y_mm=self._target_y_mm,
             control_terms=snapshot.control_terms if snapshot.tracking_valid else None,
+            # Matches BallTracker(platform_size_mm=240.0) in the worker;
+            # see config.PLATFORM_SIZE for the physical measurement.
+            platform_size_mm=240.0,
         )
         self._vision_monitor.update_camera(
             getattr(snapshot, "camera_bgr", None)
@@ -1003,86 +992,6 @@ class MainWindow(QWidget):
         self._vision_monitor.update_mask(
             getattr(snapshot, "mask_gray", None)
         )
-
-    # ------------------------------------------------------------------
-    # Timing diagnostics
-    # ------------------------------------------------------------------
-
-    def _trim_timing_history(self, now: float) -> None:
-        while (
-            self._timing_timestamps
-            and (now - self._timing_timestamps[0]) > _TIMING_WINDOW_S
-        ):
-            self._timing_timestamps.popleft()
-            for key in _TIMING_KEYS:
-                if self._timing_history[key]:
-                    self._timing_history[key].popleft()
-
-    def _update_timing_diagnostics(self, force_redraw: bool = False) -> None:
-        if not self._timing_history["total"]:
-            return
-        avgs = {}
-        for key in _TIMING_KEYS:
-            vals = self._timing_history[key]
-            avgs[key] = (sum(vals) / len(vals)) if vals else 0.0
-        self._timing_summary_label.setText(
-            "Vision Timing Avg (ms):  "
-            f"ball={avgs['ball_update']:.2f}  "
-            f"pd={avgs['pd_compute']:.2f}  "
-            f"ik={avgs['ik_solve']:.2f}  "
-            f"serQ={avgs['serial_enqueue']:.2f}  "
-            f"vis={avgs['visualizer_gui']:.2f}  "
-            f"f2w={avgs['frame_to_worker_ms']:.2f}  "
-            f"w2g={avgs['worker_to_gui_ms']:.2f}  "
-            f"f2c={avgs['frame_to_cmd']:.2f}  "
-            f"total={avgs['total']:.2f}  "
-            f"zoom={self._y_zoom:.2f}x"
-        )
-
-        if not force_redraw and (self._vision_counter % _PLOT_UPDATE_EVERY != 0):
-            return
-        if not self._timing_timestamps:
-            return
-
-        now_ref = self._timing_timestamps[-1]
-        x = [t - now_ref for t in self._timing_timestamps]
-        self._timing_ax.cla()
-        self._timing_ax.set_facecolor("#0f1726")
-        self._timing_ax.set_title(
-            "Vision Loop Timings (30s)", color="#d6e2ff", fontsize=8
-        )
-        self._timing_ax.tick_params(colors="#9fb4d9", labelsize=7)
-        self._timing_ax.grid(True, alpha=0.2, color="#2a3b59")
-        self._timing_ax.set_xlim(-_TIMING_WINDOW_S, 0.0)
-        self._timing_ax.set_xlabel("Time (s)", color="#9fb4d9", fontsize=7)
-        self._timing_ax.set_ylabel("ms", color="#9fb4d9", fontsize=7)
-
-        y_max = 1.0
-        for key in _TIMING_KEYS:
-            y = list(self._timing_history[key])
-            if y:
-                self._timing_ax.plot(
-                    x, y, label=key, linewidth=1.2, color=_TIMING_COLORS[key]
-                )
-                y_max = max(y_max, max(y))
-        self._timing_ax.set_ylim(0.0, y_max * self._y_zoom)
-        self._timing_ax.legend(loc="upper right", fontsize=6)
-        self._timing_canvas.draw_idle()
-
-    # ------------------------------------------------------------------
-    # Log trimming
-    # ------------------------------------------------------------------
-
-    def _trim_preview_log(self) -> None:
-        doc = self.control_panel._preview_output.document()
-        if doc is None:
-            return
-        cursor = QtGui.QTextCursor(doc)
-        while doc.blockCount() > GUI_LOG_MAX_LINES:
-            cursor.movePosition(QtGui.QTextCursor.Start)
-            cursor.select(QtGui.QTextCursor.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.deleteChar()
 
     # ------------------------------------------------------------------
     # Cleanup

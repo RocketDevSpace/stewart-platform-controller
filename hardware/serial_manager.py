@@ -32,9 +32,15 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# Post-open delay: opening the port toggles DTR, which resets the Arduino;
-# the firmware needs ~2 s to boot before it starts parsing commands.
+# Post-open boot wait: opening the port toggles DTR, which resets the
+# Arduino; the firmware needs ~2 s to boot before it starts parsing
+# commands. The current firmware prints "[READY]\n" when it is up, so
+# connect() poll-reads for that banner (up to _READY_WAIT_S) and returns
+# as soon as it arrives; if it never does (old firmware may not print
+# it), connect() falls back to the plain _ARDUINO_BOOT_DELAY_S wait.
 _ARDUINO_BOOT_DELAY_S = 2.0
+_READY_BANNER = "[READY]"
+_READY_WAIT_S = 3.0
 _WRITE_TIMEOUT_S = 0.5
 _THREAD_JOIN_TIMEOUT_S = 2.0
 
@@ -88,7 +94,9 @@ class SerialManager:
                 timeout=0.1,
                 write_timeout=_WRITE_TIMEOUT_S,
             )
-            time.sleep(_ARDUINO_BOOT_DELAY_S)  # allow Arduino reset after DTR toggle
+            # Arduino resets on the DTR toggle; wait for the firmware's
+            # "[READY]" banner instead of an open-loop sleep.
+            self._wait_for_ready_banner()
             logger.info("Connected to %s at %d baud", self._port, self._baud)
         except Exception as exc:
             logger.error("Could not connect: %s", exc)
@@ -187,6 +195,40 @@ class SerialManager:
     # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
+
+    def _wait_for_ready_banner(self) -> None:
+        """Poll-read for the firmware's "[READY]" boot banner.
+
+        Runs during connect(), BEFORE the reader thread starts, so reading
+        directly from the port here is safe (single reader). Returns as
+        soon as the banner arrives, or after _READY_WAIT_S without it
+        (old firmware may not print one — by then the plain boot delay
+        has elapsed anyway). If polling itself fails, falls back to
+        sleeping out the remainder of _ARDUINO_BOOT_DELAY_S.
+        """
+        start = time.monotonic()
+        buffer = ""
+        try:
+            while (time.monotonic() - start) < _READY_WAIT_S:
+                raw = self._ser.read(64)  # bounded by the port timeout
+                if raw:
+                    buffer += raw.decode("utf-8", errors="ignore")
+                    if _READY_BANNER in buffer:
+                        logger.info("Firmware ready banner received")
+                        return
+        except Exception as exc:
+            logger.warning(
+                "Ready-banner poll failed (%s); falling back to fixed "
+                "boot delay", exc,
+            )
+            remaining = _ARDUINO_BOOT_DELAY_S - (time.monotonic() - start)
+            if remaining > 0:
+                time.sleep(remaining)
+            return
+        logger.warning(
+            "No %s banner within %.1f s — assuming old firmware "
+            "(boot delay elapsed)", _READY_BANNER, _READY_WAIT_S,
+        )
 
     def _handle_link_error(self, reason: str) -> None:
         """Mark the link dead and notify the disconnect callback (once)."""

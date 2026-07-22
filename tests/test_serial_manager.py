@@ -31,7 +31,9 @@ class FakeSerial:
         self.is_open = True
         self.written: list[bytes] = []
         self.write_gate: threading.Event | None = None
-        self._rx: list[bytes] = []
+        # Serve the firmware boot banner so connect()'s ready poll
+        # returns immediately instead of waiting out its timeout.
+        self._rx: list[bytes] = [b"[READY]\n"]
         self._rx_lock = threading.Lock()
         self.read_error: Exception | None = None
         FakeSerial.instances.append(self)
@@ -67,6 +69,8 @@ def manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[sm.SerialManager]:
     FakeSerial.instances.clear()
     monkeypatch.setattr(sm, "serial", SimpleNamespace(Serial=FakeSerial))
     monkeypatch.setattr(sm, "_ARDUINO_BOOT_DELAY_S", 0.0)
+    # Bound the ready-banner poll so a missing banner can't stall a test.
+    monkeypatch.setattr(sm, "_READY_WAIT_S", 0.5)
     mgr = sm.SerialManager("FAKE", 115200)
     yield mgr
     mgr.disconnect()
@@ -94,6 +98,33 @@ class TestConnectionLifecycle:
 
     def test_send_without_connect_fails(self, manager: sm.SerialManager) -> None:
         assert manager.send(b"x\n") is False
+
+    def test_connect_consumes_ready_banner(self, manager: sm.SerialManager) -> None:
+        received: list[str] = []
+        manager.set_receive_callback(received.append)
+        assert manager.connect() is True
+        # The banner is eaten by the connect-time poll (before the reader
+        # thread starts) and must NOT be re-delivered as a received line.
+        time.sleep(0.05)
+        assert received == []
+
+    def test_connect_without_banner_still_succeeds(
+        self, manager: sm.SerialManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class NoBannerSerial(FakeSerial):
+            def __init__(self, port: str, baud: int, timeout: float = 0.1,
+                         write_timeout: float | None = None) -> None:
+                super().__init__(port, baud, timeout, write_timeout)
+                with self._rx_lock:
+                    self._rx.clear()
+
+        monkeypatch.setattr(sm, "serial", SimpleNamespace(Serial=NoBannerSerial))
+        t0 = time.monotonic()
+        assert manager.connect() is True
+        # Old firmware: no banner — connect waits out the (patched) ready
+        # window and still comes up connected.
+        assert time.monotonic() - t0 >= 0.4
+        assert manager.is_connected()
 
     def test_disconnect_joins_threads(self, manager: sm.SerialManager) -> None:
         manager.connect()

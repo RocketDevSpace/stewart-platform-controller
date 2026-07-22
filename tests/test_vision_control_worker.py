@@ -16,7 +16,10 @@ import numpy as np
 from core.platform_state import BallState
 from cv.camera_source import CaptureStats
 from cv.vision_control_worker import ControlSnapshot, VisionControlWorker
-from settings import TRACKER_REACQUIRE_VALID_FRAMES
+from settings import (
+    TRACKER_REACQUIRE_VALID_FRAMES,
+    VISION_MISS_NEUTRAL_AFTER_FRAMES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +111,6 @@ def _make_worker(
     _get_app()
     worker = VisionControlWorker(
         ik_solver=IKEngine(),
-        z_provider=lambda: 0.0,
         kp=0.045,
         kd=0.022,
         camera_index=0,
@@ -244,6 +246,98 @@ class TestBackpressure:
         # The 28 fabricated zero-filled trk_* keys are gone.
         fabricated = [k for k in snaps[0].timings_ms if k.startswith("trk_")]
         assert set(fabricated) <= {"trk_cap_period", "trk_gray_mean"}
+
+
+class TestSetZ:
+    def test_set_z_flows_into_commanded_pose(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball(), None])
+        worker.snapshot_ready.connect(snaps.append)
+        worker.set_z(12.0)
+
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()                          # valid frame
+        worker.mark_snapshot_consumed()
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()                          # miss frame
+        assert len(snaps) == 2
+        assert snaps[0].pose["z"] == 12.0       # valid-path pose
+        assert snaps[1].pose["z"] == 12.0       # miss-path pose
+
+    def test_z_defaults_to_zero(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball()])
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()
+        assert snaps[0].pose["z"] == 0.0
+
+
+class TestNeutralFallback:
+    def test_sustained_misses_send_one_neutral_per_window(self) -> None:
+        sent: list[list[float]] = []
+        misses: list[BallState | None] = [None] * (
+            VISION_MISS_NEUTRAL_AFTER_FRAMES + 5
+        )
+        worker, camera, _ = _make_worker(misses, command_sender=sent.append)
+        for _ in range(VISION_MISS_NEUTRAL_AFTER_FRAMES - 1):
+            camera.advance()
+            worker._tick()
+        assert sent == []                       # below the miss threshold
+        for _ in range(6):
+            camera.advance()
+            worker._tick()
+        # Threshold crossed: exactly ONE neutral send inside the resend
+        # throttle window, no matter how many further misses arrive.
+        assert len(sent) == 1
+        assert len(sent[0]) == 6
+
+        # A new throttle window (simulated by rewinding the stamp) allows
+        # exactly one more.
+        worker.ball_tracker = FakeTracker([None, None])  # type: ignore[assignment]
+        worker._last_neutral_send = -1e9
+        camera.advance()
+        worker._tick()
+        camera.advance()
+        worker._tick()
+        assert len(sent) == 2
+
+    def test_neutral_send_ignores_reacquire_gate(self) -> None:
+        # The neutral fallback is the safety action: it must fire even
+        # though the reacquire gate is blocking normal command sends
+        # (valid_streak is 0 throughout a miss run).
+        sent: list[list[float]] = []
+        misses: list[BallState | None] = [None] * (
+            VISION_MISS_NEUTRAL_AFTER_FRAMES + 1
+        )
+        worker, camera, _ = _make_worker(misses, command_sender=sent.append)
+        for _ in range(VISION_MISS_NEUTRAL_AFTER_FRAMES + 1):
+            camera.advance()
+            worker._tick()
+        assert worker._valid_streak == 0
+        assert len(sent) == 1
+
+    def test_recovery_resets_miss_count_and_rearms(self) -> None:
+        sent: list[list[float]] = []
+        results: list[BallState | None] = (
+            [None] * (VISION_MISS_NEUTRAL_AFTER_FRAMES + 1) + [_ball()]
+        )
+        worker, camera, _ = _make_worker(results, command_sender=sent.append)
+        for _ in range(len(results)):
+            camera.advance()
+            worker._tick()
+        neutral_sends = len(sent)
+        assert worker._miss_count == 0          # cleared by the valid frame
+        # A fresh short miss run (below threshold) must NOT send neutral
+        # again even with the throttle window forced open.
+        worker.ball_tracker = FakeTracker([None])  # type: ignore[assignment]
+        worker._last_neutral_send = -1e9
+        camera.advance()
+        worker._tick()
+        assert len(sent) == neutral_sends
 
 
 class TestErrorRateLimit:
