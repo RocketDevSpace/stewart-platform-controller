@@ -32,11 +32,47 @@ class PlantParams:
     """The identified (or assumed) plant."""
 
     g_eff: float = 171.0            # mm/s^2 of ball accel per deg of tilt
-    latency_s: float = 2.0 / 30.0   # full-loop command latency
+    latency_s: float = 2.0 / 30.0   # full-loop command latency (pure delay)
     stiction_deg: float = 0.06      # rolling-resistance cone, deg equiv
     warp_c_deg_per_mm: float = 0.0  # center-attracting bowl coefficient
     bias_roll_deg: float = 0.0      # constant tilt error (stale trim)
     bias_pitch_deg: float = 0.0
+    # First-order ACTUATOR lag (servo response), separate from the pure
+    # delay: the servos take tens of ms to reach a commanded angle,
+    # which rounds command edges. A fit that lacks this soaks the
+    # attenuation into a falsely LOW g_eff — the 2026-07-23 rig session
+    # fitted g=104 vs ~171 real and the gain design "compensated" into
+    # violent oscillation. tau=0 = ideal actuator (legacy behavior).
+    servo_tau_s: float = 0.0
+
+
+def lag_filter(series: np.ndarray, dt: float, tau_s: float) -> np.ndarray:
+    """First-order lag applied to a command series (offline/fit use)."""
+    if tau_s <= 0.0:
+        return series
+    alpha = 1.0 - math.exp(-dt / tau_s)
+    out = np.empty_like(series)
+    acc = float(series[0])
+    for i in range(len(series)):
+        acc += alpha * (float(series[i]) - acc)
+        out[i] = acc
+    return out
+
+
+class ServoLag:
+    """First-order actuator state for closed-loop sims."""
+
+    def __init__(self, tau_s: float, initial: float = 0.0) -> None:
+        self._tau = float(tau_s)
+        self.value = float(initial)
+
+    def step(self, cmd: float, dt: float) -> float:
+        if self._tau <= 0.0:
+            self.value = float(cmd)
+        else:
+            alpha = 1.0 - math.exp(-dt / self._tau)
+            self.value += alpha * (float(cmd) - self.value)
+        return self.value
 
 
 def apply_rolling_resistance(

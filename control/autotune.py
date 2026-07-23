@@ -46,6 +46,7 @@ from settings import (
     PD_AUTOTUNE_AUTO_APPLY,
     PD_AUTOTUNE_BALL_LOST_S,
     PD_AUTOTUNE_ENABLED,
+    PD_AUTOTUNE_G_EFF,
 )
 
 
@@ -352,7 +353,8 @@ class PDAutotuner:
                 self._thread_phase = ("designing", p)
 
         fit = fit_plant(
-            rows, self._script, progress_cb=fit_progress, cancel=self._cancel
+            rows, self._script, progress_cb=fit_progress,
+            cancel=self._cancel, prior_g_eff=float(PD_AUTOTUNE_G_EFF),
         )
         if fit is None:
             with self._lock:

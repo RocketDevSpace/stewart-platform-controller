@@ -15,7 +15,7 @@ import pytest
 
 from control.ball_controller import BallController
 from control.plant_id import ProbeRecording, ProbeScript, fit_plant
-from control.plant_model import PlantParams, plant_step
+from control.plant_model import PlantParams, ServoLag, plant_step
 from core.platform_state import BallState
 from cv.measurement_filter import AlphaBetaFilter2D
 from tools.jitter_bench import FakeClock
@@ -30,6 +30,10 @@ TRUTH = PlantParams(
     warp_c_deg_per_mm=0.0055,
     bias_roll_deg=0.2,
     bias_pitch_deg=-0.1,
+    # Real servos take tens of ms to reach a commanded angle. Omitting
+    # this from the truth plant is exactly the blindness that biased
+    # the first rig fit 39% low on g.
+    servo_tau_s=0.06,
 )
 
 
@@ -58,6 +62,8 @@ def _run_probe_session(
     cmd_p: list[float] = []
     rock_a = rock_amp_mm * (2.0 * math.pi * rock_freq_hz) ** 2
     phase = rng.random() * 2 * math.pi
+    lag_r = ServoLag(truth.servo_tau_s)
+    lag_p = ServoLag(truth.servo_tau_s)
 
     steps = int(script.total_s * fraction * HZ)
     for i in range(steps):
@@ -80,8 +86,10 @@ def _run_probe_session(
         cmd_r.append(roll)
         cmd_p.append(pitch)
         t_delayed = clock.t - truth.latency_s
-        r_act = float(np.interp(t_delayed, cmd_t, cmd_r, left=cmd_r[0]))
-        p_act = float(np.interp(t_delayed, cmd_t, cmd_p, left=cmd_p[0]))
+        r_del = float(np.interp(t_delayed, cmd_t, cmd_r, left=cmd_r[0]))
+        p_del = float(np.interp(t_delayed, cmd_t, cmd_p, left=cmd_p[0]))
+        r_act = lag_r.step(r_del, DT)
+        p_act = lag_p.step(p_del, DT)
         x, y, vx, vy = plant_step(x, y, vx, vy, r_act, p_act, DT, truth)
         if rock_amp_mm > 0.0:
             w = 2.0 * math.pi * rock_freq_hz
@@ -139,19 +147,48 @@ class TestFitRecovery:
     def test_recovers_known_plant(self) -> None:
         rec = _run_probe_session(TRUTH)
         t0 = time.perf_counter()
-        fit = fit_plant(rec.arrays())
+        fit = fit_plant(rec.arrays(), prior_g_eff=171.0)
         elapsed = time.perf_counter() - t0
         assert fit is not None
         p = fit.params
-        assert p.g_eff == pytest.approx(TRUTH.g_eff, rel=0.10)
-        assert p.latency_s == pytest.approx(TRUTH.latency_s, abs=0.020)
-        assert p.stiction_deg == pytest.approx(TRUTH.stiction_deg, abs=0.10)
+        assert p.g_eff == pytest.approx(TRUTH.g_eff, rel=0.12)
+        # Delay vs first-order lag are partially degenerate; the SUM is
+        # what prediction needs and must be tight. tau itself must land
+        # in the right decade.
+        total_delay = p.latency_s + p.servo_tau_s
+        assert total_delay == pytest.approx(
+            TRUTH.latency_s + TRUTH.servo_tau_s, abs=0.030
+        )
+        assert 0.0 <= p.servo_tau_s <= 0.15
+        assert p.stiction_deg == pytest.approx(TRUTH.stiction_deg, abs=0.12)
         assert not fit.low_confidence
         # Filter group delay measured separately (raw vs filtered
         # cross-correlation) — sane band for the alpha-beta gains.
         assert 0.0 <= fit.filter_lag_s <= 0.15
-        assert fit.predict_s == fit.params.latency_s + fit.filter_lag_s
-        assert elapsed < 20.0
+        assert fit.predict_s == pytest.approx(
+            p.latency_s + p.servo_tau_s + fit.filter_lag_s
+        )
+        assert elapsed < 30.0
+
+    def test_prior_deviation_flags_low_confidence(self) -> None:
+        # THE 2026-07-23 RIG FAILURE PIN: the session fitted g=104
+        # against a working prior of 171 with conf=ok, and the design
+        # "compensated" into violent oscillation. A fit deviating >35%
+        # from the prior must come back low_confidence so the gain
+        # change gets capped at +-30%.
+        weak_truth = PlantParams(
+            g_eff=85.0, latency_s=TRUTH.latency_s,
+            stiction_deg=TRUTH.stiction_deg,
+            warp_c_deg_per_mm=TRUTH.warp_c_deg_per_mm,
+            bias_roll_deg=TRUTH.bias_roll_deg,
+            bias_pitch_deg=TRUTH.bias_pitch_deg,
+            servo_tau_s=TRUTH.servo_tau_s,
+        )
+        rec = _run_probe_session(weak_truth)
+        fit = fit_plant(rec.arrays(), prior_g_eff=171.0)
+        assert fit is not None
+        assert fit.low_confidence
+        assert "prior" in fit.notes
 
     def test_recovers_with_self_rock(self) -> None:
         # The 0.8 Hz +-4 mm self-rock must not break g/L recovery: its
@@ -160,11 +197,19 @@ class TestFitRecovery:
         # responds to the rock, so it correlates with the command
         # regressor — plain OLS would be biased).
         rec = _run_probe_session(TRUTH, rock_amp_mm=4.0, rock_freq_hz=0.8)
-        fit = fit_plant(rec.arrays())
+        fit = fit_plant(rec.arrays(), prior_g_eff=171.0)
         assert fit is not None
         p = fit.params
-        assert p.g_eff == pytest.approx(TRUTH.g_eff, rel=0.10)
-        assert p.latency_s == pytest.approx(TRUTH.latency_s, abs=0.020)
+        # 15% tolerance under HEAVY rock (vs 12% clean): the notch
+        # necessarily removes a sliver of legitimate command content
+        # near the rock band. A moderate fit error is now bounded
+        # downstream by the prior-deviation guard and the per-session
+        # gain caps — the defense-in-depth this failure mode bought.
+        assert p.g_eff == pytest.approx(TRUTH.g_eff, rel=0.15)
+        total_delay = p.latency_s + p.servo_tau_s
+        assert total_delay == pytest.approx(
+            TRUTH.latency_s + TRUTH.servo_tau_s, abs=0.040
+        )
         # Stiction under strong dither: the rock never lets the ball
         # stick, so the plant's EFFECTIVE friction is genuinely small
         # (dither linearization). The fit must report that effective

@@ -39,7 +39,7 @@ import numpy as np
 
 from control.patterns import circle
 from control.plant_id import PlantFit
-from control.plant_model import PlantParams, plant_step
+from control.plant_model import PlantParams, ServoLag, plant_step
 from core.platform_state import BallState
 from cv.measurement_filter import AlphaBetaFilter2D
 
@@ -57,7 +57,16 @@ _SCREEN_SEEDS = (11, 12)
 _CONFIRM_SEEDS = (11, 12, 13, 14, 15, 16)
 _KP_BOUNDS = (0.010, 0.150)
 _KD_BOUNDS = (0.005, 0.080)
-_KI_BOUNDS = (0.0, 0.080)
+# ki capped at 0.05 (was 0.080): the 2026-07-23 rig failure pinned the
+# winner at the old bound — an I-corner of ki/kp above ~1 rad/s eats
+# phase margin the fitted model can't see.
+_KI_BOUNDS = (0.0, 0.050)
+# Trust-but-bound (unconditional, even on confident fits): the same
+# failure "compensated" a phantom weak plant with kp 2.7x. One session
+# may move gains at most this much; a genuinely better tune is reached
+# by re-running from the new point.
+_MAX_STEP_FRAC = 1.6            # kp/kd multiplicative cap per session
+_MAX_KI_STEP = 0.02             # ki absolute cap per session
 
 
 class _Clock:
@@ -117,6 +126,8 @@ def _run_closed_loop(
     cmd_p: list[float] = []
     rock_a = rock_amp_mm * (2.0 * math.pi * max(rock_freq_hz, 0.1)) ** 2
     phase = rng.random() * 2.0 * math.pi
+    lag_r = ServoLag(plant.servo_tau_s)
+    lag_p = ServoLag(plant.servo_tau_s)
 
     steps = int(duration_s * HZ)
     for i in range(steps):
@@ -135,8 +146,12 @@ def _run_closed_loop(
         cmd_r.append(roll)
         cmd_p.append(pitch)
         td = clock.t - plant.latency_s
-        r_act = float(np.interp(td, cmd_t, cmd_r, left=cmd_r[0]))
-        p_act = float(np.interp(td, cmd_t, cmd_p, left=cmd_p[0]))
+        r_del = float(np.interp(td, cmd_t, cmd_r, left=cmd_r[0]))
+        p_del = float(np.interp(td, cmd_t, cmd_p, left=cmd_p[0]))
+        # Actuator lag: the servos take tens of ms to reach the delayed
+        # command — the fitted tau makes the design see it.
+        r_act = lag_r.step(r_del, DT)
+        p_act = lag_p.step(p_del, DT)
         x, y, vx, vy = plant_step(x, y, vx, vy, r_act, p_act, DT, plant)
         if rock_amp_mm > 0.0:
             w = 2.0 * math.pi * rock_freq_hz
@@ -373,14 +388,36 @@ def design_gains(
             win = g
             win_j = j
 
-    notes = ""
+    notes_parts = []
+    # Trust-but-bound: EVEN with a confident fit, one session may move
+    # gains only so far (the fitted model can be wrong in ways the
+    # residual cannot see — 2026-07-23: g fitted 39% low, design pushed
+    # kp 2.7x, rig oscillated violently). Re-running from the new point
+    # reaches a genuinely better tune stepwise, each step rig-verified.
+    capped = (
+        max(kp0 / _MAX_STEP_FRAC, min(kp0 * _MAX_STEP_FRAC, win[0])),
+        max(kd0 / _MAX_STEP_FRAC, min(kd0 * _MAX_STEP_FRAC, win[1])),
+        max(ki0 - _MAX_KI_STEP, min(ki0 + _MAX_KI_STEP, win[2])),
+    )
+    if capped != win:
+        notes_parts.append(
+            f"change capped (per-session bound {_MAX_STEP_FRAC:.1f}x)"
+        )
+        win = capped
+    if any(
+        abs(win[i] - b) < 1e-9
+        for i, bounds in enumerate((_KP_BOUNDS, _KD_BOUNDS, _KI_BOUNDS))
+        for b in bounds
+    ):
+        notes_parts.append("winner at a search bound")
     if fit.low_confidence:
-        # Low-confidence fit: cap the change at +-30% of current.
+        # Low-confidence fit: cap the change harder, at +-30% of current.
         kp_c = max(kp0 * 0.7, min(kp0 * 1.3, win[0]))
         kd_c = max(kd0 * 0.7, min(kd0 * 1.3, win[1]))
         ki_c = max(ki0 * 0.7, min(ki0 * 1.3 + 1e-4, win[2]))
         win = (kp_c, kd_c, ki_c)
-        notes = "low-confidence fit: gain change capped at +-30%"
+        notes_parts.append("low-confidence fit: gain change capped at +-30%")
+    notes = "; ".join(notes_parts)
 
     return GainDesign(
         kp=float(win[0]),

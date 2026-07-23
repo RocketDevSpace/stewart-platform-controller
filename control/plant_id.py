@@ -28,7 +28,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from control.plant_model import PlantParams, delayed_commands, replay_batch
+from control.plant_model import (
+    PlantParams,
+    delayed_commands,
+    lag_filter,
+    replay_batch,
+)
 
 HZ = 30.0
 DT = 1.0 / HZ
@@ -212,8 +217,13 @@ class PlantFit:
     @property
     def predict_s(self) -> float:
         """The prediction horizon this plant wants: pipeline latency +
-        measured filter lag (what CONTROL_PREDICT_S compensates)."""
-        return self.params.latency_s + self.filter_lag_s
+        actuator lag (a first-order lag's low-frequency group delay is
+        tau) + measured filter lag — what CONTROL_PREDICT_S compensates."""
+        return (
+            self.params.latency_s
+            + self.params.servo_tau_s
+            + self.filter_lag_s
+        )
 
 
 @dataclass
@@ -310,16 +320,18 @@ def _window_loss_batch(
     warp_c: np.ndarray,
     bias_r: np.ndarray,
     bias_p: np.ndarray,
+    servo_tau: np.ndarray | None = None,
 ) -> np.ndarray:
     """Total Huber loss per parameter combo, summed over all windows.
 
-    All parameter arrays share shape (C,). Latency must be constant
-    within the call (commands are shifted once) — callers loop distinct
-    latency values.
+    All parameter arrays share shape (C,). Latency and servo lag must
+    be constant within the call (commands are shifted/filtered once) —
+    callers loop distinct (latency, tau) values.
     """
     lat = float(latency[0])
-    roll_act = delayed_commands(rs.t, rs.roll, lat)
-    pitch_act = delayed_commands(rs.t, rs.pitch, lat)
+    tau = float(servo_tau[0]) if servo_tau is not None else 0.0
+    roll_act = lag_filter(delayed_commands(rs.t, rs.roll, lat), DT, tau)
+    pitch_act = lag_filter(delayed_commands(rs.t, rs.pitch, lat), DT, tau)
 
     w = rs.window_starts
     n_w = len(w)
@@ -362,7 +374,7 @@ def _loss_single(rs: _Resampled, p: PlantParams) -> float:
     return float(_window_loss_batch(
         rs, ones * p.g_eff, ones * p.latency_s, ones * p.stiction_deg,
         ones * p.warp_c_deg_per_mm, ones * p.bias_roll_deg,
-        ones * p.bias_pitch_deg,
+        ones * p.bias_pitch_deg, servo_tau=ones * p.servo_tau_s,
     )[0])
 
 
@@ -417,7 +429,7 @@ def _fft_notch(sig: np.ndarray, f0: float, width_hz: float) -> np.ndarray:
 
 
 def _regress_at_latency(
-    rs: _Resampled, lat: float, notch_hz: float = 0.0
+    rs: _Resampled, lat: float, notch_hz: float = 0.0, tau: float = 0.0
 ) -> tuple[PlantParams, float] | None:
     """Linear least-squares fit of the plant at a fixed latency.
 
@@ -434,9 +446,14 @@ def _regress_at_latency(
     # the acceleration below carries the position box-smoothing, so the
     # command and position regressors get the same box — a one-sided
     # smoothing mismatch attenuates the fitted g (measured: -12%).
+    # ACTUATED command: pure delay THEN first-order servo lag — the
+    # regressor must be what the plant actually felt, or the edge
+    # attenuation is misread as low g (rig-measured: g 104 vs ~171).
     kern = np.ones(5) / 5.0
-    roll_d = np.convolve(delayed_commands(rs.t, rs.roll, lat), kern, "same")
-    pitch_d = np.convolve(delayed_commands(rs.t, rs.pitch, lat), kern, "same")
+    roll_a = lag_filter(delayed_commands(rs.t, rs.roll, lat), DT, tau)
+    pitch_a = lag_filter(delayed_commands(rs.t, rs.pitch, lat), DT, tau)
+    roll_d = np.convolve(roll_a, kern, "same")
+    pitch_d = np.convolve(pitch_a, kern, "same")
 
     ax = np.asarray(np.gradient(rs.vx, DT))
     ay = np.asarray(np.gradient(rs.vy, DT))
@@ -500,6 +517,7 @@ def _regress_at_latency(
         warp_c_deg_per_mm=max(0.0, gc / g),
         bias_pitch_deg=gbp / g,
         bias_roll_deg=gbr / g,
+        servo_tau_s=float(tau),
     )
     resid = b - a @ theta
     return params, float(np.mean(resid ** 2))
@@ -510,6 +528,7 @@ def fit_plant(
     script: ProbeScript | None = None,
     progress_cb: Callable[[float], None] | None = None,
     cancel: threading.Event | None = None,
+    prior_g_eff: float | None = None,
 ) -> PlantFit | None:
     """Fit the plant to a probe recording. Returns None if cancelled or
     the recording is too short (< _MIN_COMPLETION of the script).
@@ -539,23 +558,39 @@ def fit_plant(
     lat_grid = np.arange(0.0, 0.201, 0.005)
     results: list[tuple[float, PlantParams] | None] = []
     scores: list[float] = []
-    for i, lat in enumerate(lat_grid):
+    tau_grid = (0.0, 0.03, 0.05, 0.08, 0.12)
+    combos = [(la, ta) for ta in tau_grid for la in lat_grid]
+    for i, (lat, tau) in enumerate(combos):
         if cancel is not None and cancel.is_set():
             return None
-        r = _regress_at_latency(rs, float(lat), notch_hz=notch_hz)
+        r = _regress_at_latency(
+            rs, float(lat), notch_hz=notch_hz, tau=float(tau)
+        )
         results.append(None if r is None else (r[1], r[0]))
         scores.append(math.inf if r is None else r[1])
         if progress_cb:
-            progress_cb(0.8 * (i + 1) / len(lat_grid))
+            progress_cb(0.8 * (i + 1) / len(combos))
     if all(math.isinf(s) for s in scores):
         return None
-    k = int(np.argmin(scores))
-    best = results[k]
-    assert best is not None
-    p = best[1]
-
-    # --- Stage 2: replay residual at the fit (confidence + report).
-    best_loss = _loss_single(rs, p)
+    # The per-sample regression SSE is nearly flat along the (tau, g)
+    # ridge (an over-smoothed regressor is partially compensated by a
+    # bigger g — measured: g wandering 100-210 along it). The REPLAY
+    # loss integrates the dynamics over 1.5 s windows, compounding g
+    # errors, so it separates the ridge: re-score the top candidates by
+    # replay and pick that winner.
+    order = np.argsort(scores)[:10]
+    best_loss = math.inf
+    p = None
+    for k in order:
+        cand = results[int(k)]
+        if cand is None:
+            continue
+        loss = _loss_single(rs, cand[1])
+        if loss < best_loss:
+            best_loss = loss
+            p = cand[1]
+    if p is None:
+        return None
     if progress_cb:
         progress_cb(1.0)
 
@@ -568,7 +603,15 @@ def fit_plant(
         p.g_eff <= 60.0 or p.g_eff >= 300.0
         or p.latency_s >= 0.199 or p.stiction_deg >= 0.79
     )
-    low_conf = (not improved) or on_bound or (
+    # PRIOR-DEVIATION GUARD (2026-07-23 rig failure): a fitted g far
+    # from the working prior means the model missed real dynamics —
+    # the design would "compensate" for a phantom weak/strong plant
+    # (measured: g fitted 104 vs ~171 real → kp 2.7x → oscillation).
+    prior_dev = (
+        prior_g_eff is not None and prior_g_eff > 0.0
+        and abs(p.g_eff - prior_g_eff) > 0.35 * prior_g_eff
+    )
+    low_conf = (not improved) or on_bound or prior_dev or (
         residual_rms > _RESIDUAL_CONFIDENCE_RATIO * max(noise_rms, 0.1)
     )
     notes = []
@@ -576,6 +619,10 @@ def fit_plant(
         notes.append("no improvement over nominal")
     if on_bound:
         notes.append("parameter on bound")
+    if prior_dev:
+        notes.append(
+            f"g {p.g_eff:.0f} deviates >35% from prior {prior_g_eff:.0f}"
+        )
     return PlantFit(
         params=p,
         residual_rms_mm=residual_rms,
