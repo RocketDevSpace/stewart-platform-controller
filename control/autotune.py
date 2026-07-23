@@ -1,153 +1,52 @@
 """
 control/autotune.py
 
-PDAutotuner — the PD autotune state machine (FG-10) plus the per-leg step
-response evaluator. Drives its leg/center targets through the injected
-SetpointArbiter override channel; gain ownership stays with the caller
-(gains are passed into update() and possibly-updated values returned).
+PDAutotuner — the SysID autotune pipeline (2026-07-23 rework):
 
-The per-session log path is injectable so tests can point it at tmp_path;
-production uses settings.AUTOTUNE_LOG_PATH, opened fresh per session.
+    idle → probing → computing (fit + design, background thread)
+         → suggestion_ready → idle
+
+The old step-test estimator (2-scalar-feature inversion of an ideal
+2nd-order model behind settle gates) is gone — it never completed a leg
+on the rig and random-walked against a known simulated plant. The
+replacement: run the ~78 s scripted probe (control/plant_id.ProbeScript,
+no settle gates) through the arbiter override channel while recording
+raw detections + sent commands; fit the plant (convex regression,
+control/plant_id.fit_plant); search kp/ki/kd on the fitted plant
+(control/gain_design.design_gains); suggest — with the identified plant
+numbers riding along so Apply can also calibrate the prediction horizon
+and integral deadband.
+
+Threading: the fit + design compute runs on a daemon threading.Thread
+owned by this object (precedent: MainWindow's serial-connect thread).
+The worker-thread update() is the ONLY mutator of public state; the
+compute thread communicates through a lock-guarded (phase, progress)
+mirror and a single-slot generation-tagged result. Cancellation is an
+Event checked inside fit/design chunk boundaries. No join() on the
+control thread. Tests can set `run_compute_inline = True` to execute
+the compute synchronously.
+
+Gain ownership stays with the caller exactly as before: gains are
+passed into update() and possibly-updated values returned.
 """
 import logging
 import math
+import threading
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
+from control.gain_design import GainDesign, design_gains
+from control.plant_id import PlantFit, ProbeRecording, ProbeScript, fit_plant
 from control.setpoint import SetpointArbiter
 from settings import (
     AUTOTUNE_LOG_PATH,
+    PD_AUTOTUNE_ABORT_RADIUS_MM,
     PD_AUTOTUNE_AUTO_APPLY,
+    PD_AUTOTUNE_BALL_LOST_S,
     PD_AUTOTUNE_ENABLED,
-    PD_AUTOTUNE_G_EFF,
-    PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC,
-    PD_AUTOTUNE_MAX_KD,
-    PD_AUTOTUNE_MAX_KP,
-    PD_AUTOTUNE_MIN_CROSS_S,
-    PD_AUTOTUNE_MIN_KD,
-    PD_AUTOTUNE_MIN_KP,
-    PD_AUTOTUNE_MIN_OVERSHOOT_RATIO,
-    PD_AUTOTUNE_MIN_TRIAL_S,
-    PD_AUTOTUNE_SETTLE_HOLD_S,
-    PD_AUTOTUNE_SETTLE_RADIUS_MM,
-    PD_AUTOTUNE_SETTLE_SPEED_MM_S,
-    PD_AUTOTUNE_STEP_MM,
-    PD_AUTOTUNE_TARGET_ZETA,
-    PD_AUTOTUNE_TIMEOUT_S,
-    PD_AUTOTUNE_WAIT_SETTLE_HOLD_S,
-    PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM,
-    PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S,
 )
-
-
-def _clamp(value: float, min_val: float, max_val: float) -> float:
-    return max(min(value, max_val), min_val)
-
-
-class _PDLegEvaluator:
-    """Evaluates a single leg of a two-target step test for PD autotune."""
-
-    def __init__(self) -> None:
-        self.active = False
-        self.start_ts = 0.0
-        self.last_ts = 0.0
-        self.settle_timer = 0.0
-        self.u_x = 0.0
-        self.u_y = 0.0
-        self.s0 = 0.0
-        self.min_s = 0.0
-        self.peak_abs_s = 0.0
-        self.iae = 0.0
-        self.sign_changes = 0
-        self.last_s: float | None = None
-        self.first_crossing_elapsed_s: float | None = None
-
-    def start(self, ts: float, x: float, y: float, tx: float, ty: float) -> bool:
-        ex = tx - x
-        ey = ty - y
-        e0 = math.hypot(ex, ey)
-        if e0 <= 1e-6:
-            return False
-        self.active = True
-        self.start_ts = ts
-        self.last_ts = ts
-        self.settle_timer = 0.0
-        self.u_x = ex / e0
-        self.u_y = ey / e0
-        self.s0 = e0
-        self.min_s = e0
-        self.peak_abs_s = e0
-        self.iae = 0.0
-        self.sign_changes = 0
-        self.last_s = e0
-        self.first_crossing_elapsed_s = None
-        return True
-
-    def observe(
-        self,
-        ts: float,
-        x: float,
-        y: float,
-        vx: float,
-        vy: float,
-        tx: float,
-        ty: float,
-        settle_radius_mm: float,
-        settle_speed_mm_s: float,
-        settle_hold_s: float,
-        min_trial_s: float,
-        timeout_s: float,
-    ) -> dict | None:
-        if not self.active:
-            return None
-        ex = tx - x
-        ey = ty - y
-        err = math.hypot(ex, ey)
-        speed = math.hypot(vx, vy)
-        dt = max(1e-4, min(0.1, ts - self.last_ts))
-        self.last_ts = ts
-
-        s = ex * self.u_x + ey * self.u_y
-        self.iae += abs(s) * dt
-        self.peak_abs_s = max(self.peak_abs_s, abs(s))
-        self.min_s = min(self.min_s, s)
-        if self.last_s is not None:
-            band = max(2.0, settle_radius_mm)
-            if abs(s) > band and abs(self.last_s) > band and (s * self.last_s) < 0.0:
-                self.sign_changes += 1
-            if self.first_crossing_elapsed_s is None and self.last_s > 0.0 and s <= 0.0:
-                self.first_crossing_elapsed_s = ts - self.start_ts
-        self.last_s = s
-
-        if err <= settle_radius_mm and speed <= settle_speed_mm_s:
-            self.settle_timer += dt
-        else:
-            self.settle_timer = 0.0
-
-        elapsed = ts - self.start_ts
-        settled = self.settle_timer >= settle_hold_s
-        timed_out = elapsed >= timeout_s
-        if elapsed < min_trial_s:
-            return None
-        if not settled and not timed_out:
-            return None
-
-        overshoot_mm = max(0.0, -self.min_s)
-        metrics: dict = {
-            "initial_offset_mm": self.s0,
-            "settle_time_s": elapsed,
-            "overshoot_mm": overshoot_mm,
-            "overshoot_ratio": overshoot_mm / max(self.s0, 1e-6),
-            "oscillation_crossings": float(self.sign_changes),
-            "iae_mm_s": self.iae,
-            "peak_abs_proj_mm": self.peak_abs_s,
-            "timed_out": 1.0 if timed_out and not settled else 0.0,
-            "target_x_mm": float(tx),
-            "target_y_mm": float(ty),
-            "first_crossing_elapsed_s": self.first_crossing_elapsed_s,
-        }
-        self.active = False
-        return metrics
 
 
 class PDAutotuner:
@@ -163,31 +62,39 @@ class PDAutotuner:
 
         self.enabled = bool(PD_AUTOTUNE_ENABLED)
         self.auto_apply = bool(PD_AUTOTUNE_AUTO_APPLY)
-        self.min_kp = float(PD_AUTOTUNE_MIN_KP)
-        self.max_kp = float(PD_AUTOTUNE_MAX_KP)
-        self.min_kd = float(PD_AUTOTUNE_MIN_KD)
-        self.max_kd = float(PD_AUTOTUNE_MAX_KD)
-        self.step_mm = float(PD_AUTOTUNE_STEP_MM)
-        self.g_eff = float(PD_AUTOTUNE_G_EFF)
-        self.target_zeta = float(PD_AUTOTUNE_TARGET_ZETA)
-        self.min_overshoot_ratio = float(PD_AUTOTUNE_MIN_OVERSHOOT_RATIO)
 
-        self.trial_count = 0
+        # Public suggestion surface (kept from the old estimator)
+        self.trial_count = 0            # completed probe segments
         self.last_message = ""
         self.has_suggestion = False
         self.suggested_kp = 0.0
         self.suggested_kd = 0.0
+        self.suggested_ki = 0.0
 
-        self._leg_eval = _PDLegEvaluator()
-        self._leg_index = 0
-        self._state = "idle"  # "wait_settle" | "measuring"
-        self._wait_settle_timer = 0.0
-        self._wait_settle_ts = 0.0
-        self._leg_initialized = False
+        # Pipeline state
+        self._state = "idle"            # probing|computing|suggestion_ready
+        self._script = ProbeScript()
+        self._recording: ProbeRecording | None = None
+        self._probe_start: float | None = None
+        self._last_valid_ts: float | None = None
+        self._out_since: float | None = None
+        self._last_segment = -1
         self._center_x_mm, self._center_y_mm = arbiter.active
+        self._gains_at_start = (0.0, 0.0, 0.0)
 
-        # Per-session autotune log: stable logger name; the file handler is
-        # swapped in fresh at each session start (path injectable for tests).
+        # Results
+        self.plant_fit: PlantFit | None = None
+        self._design: GainDesign | None = None
+
+        # Compute-thread handoff (see module docstring)
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._generation = 0
+        self._thread: threading.Thread | None = None
+        self._thread_phase = ("idle", 0.0)
+        self._thread_result: dict | None = None
+        self.run_compute_inline = False     # tests: synchronous compute
+
         self._log = logging.getLogger("stewart.autotune")
         self._log.propagate = False
 
@@ -195,23 +102,34 @@ class PDAutotuner:
     # Session control
     # ---------------------------
 
-    def clear_suggestion(self, kp: float, kd: float) -> None:
+    def clear_suggestion(
+        self, kp: float, kd: float, ki: float = 0.0
+    ) -> None:
         self.has_suggestion = False
         self.suggested_kp = float(kp)
         self.suggested_kd = float(kd)
+        self.suggested_ki = float(ki)
 
-    def take_recommendation(self, kp: float, kd: float) -> tuple[bool, float, float]:
-        """Consume the pending suggestion; returns (applied, kp, kd)."""
+    def take_recommendation(
+        self, kp: float, kd: float, ki: float
+    ) -> tuple[bool, float, float, float]:
+        """Consume the pending suggestion; returns (applied, kp, kd, ki)."""
         if not self.has_suggestion:
-            return False, float(kp), float(kd)
+            return False, float(kp), float(kd), float(ki)
         self.has_suggestion = False
-        return True, float(self.suggested_kp), float(self.suggested_kd)
+        return (
+            True,
+            float(self.suggested_kp),
+            float(self.suggested_kd),
+            float(self.suggested_ki),
+        )
 
     def set_center(self, x_mm: float, y_mm: float) -> None:
-        self._center_x_mm = float(x_mm)
-        self._center_y_mm = float(y_mm)
-        self._leg_initialized = False
-        self._leg_eval.active = False
+        """Session center follows target moves only OUTSIDE a probe —
+        the script owns the targets while probing."""
+        if self._state not in ("probing", "computing"):
+            self._center_x_mm = float(x_mm)
+            self._center_y_mm = float(y_mm)
 
     def _setup_session_log(self) -> None:
         log = self._log
@@ -229,247 +147,304 @@ class PDAutotuner:
             pass
 
     def set_enabled(
-        self, enabled: bool, auto_apply: bool | None, kp: float, kd: float
+        self,
+        enabled: bool,
+        auto_apply: bool | None,
+        kp: float,
+        kd: float,
+        ki: float = 0.0,
     ) -> bool:
-        """Enable/disable the autotune session. Returns True if the enabled
-        state changed. Gain stash/restore of auto-trim stays with the caller.
-        """
-        prev_enabled = self.enabled
+        """Enable/disable the session. Returns True if enabled changed."""
+        prev = self.enabled
         self.enabled = bool(enabled)
         if auto_apply is not None:
             self.auto_apply = bool(auto_apply)
-        changed = prev_enabled != self.enabled
+        changed = prev != self.enabled
         if changed:
-            self._leg_initialized = False
-            self._state = "idle"
-            self._leg_eval.active = False
             if self.enabled:
                 self._setup_session_log()
                 self._log.info(
-                    "SESSION START  kp=%.4f kd=%.4f  g_eff=%.1f zeta_target=%.2f"
-                    " step_mm=%.1f  max_kp=%.3f max_kd=%.3f"
-                    "  min_cross_s=%.2f max_gain_delta_frac=%.2f",
-                    kp, kd, self.g_eff,
-                    self.target_zeta, self.step_mm,
-                    self.max_kp, self.max_kd,
-                    PD_AUTOTUNE_MIN_CROSS_S, PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC,
+                    "SESSION START (SysID)  kp=%.4f kd=%.4f ki=%.4f  "
+                    "probe=%.1fs", kp, kd, ki, self._script.total_s,
                 )
                 manual_x, manual_y = self._arbiter.manual
                 self._center_x_mm = float(manual_x)
                 self._center_y_mm = float(manual_y)
-                # Pin the active target at the center (== manual) and stamp
-                # the change time, matching the pre-decomposition behavior.
                 self._arbiter.set_override(manual_x, manual_y)
+                self._state = "probing"
+                self._recording = ProbeRecording()
+                self._probe_start = None
+                self._last_valid_ts = None
+                self._out_since = None
+                self._last_segment = -1
+                self.trial_count = 0
+                self._gains_at_start = (float(kp), float(kd), float(ki))
+                self.plant_fit = None
+                self._design = None
+                self._generation += 1
+                self._cancel.clear()
+                with self._lock:
+                    self._thread_phase = ("probing", 0.0)
+                    self._thread_result = None
             else:
-                self._log.info(
-                    "SESSION END  trials=%d  final_kp=%.4f  final_kd=%.4f",
-                    self.trial_count, kp, kd,
-                )
+                self._log.info("SESSION END  state=%s", self._state)
+                self._cancel.set()
+                self._state = "idle"
+                self._recording = None
                 self._arbiter.clear_override()
         if (not self.enabled) or self.auto_apply:
             self.has_suggestion = False
         return changed
 
     # ---------------------------
-    # Gain inversion (FG-10)
-    # ---------------------------
-
-    def _autotune_leg_target(self, leg_index: int) -> tuple[float, float]:
-        d = self.step_mm
-        cx = self._center_x_mm
-        cy = self._center_y_mm
-        offsets = [(d, 0.0), (-d, 0.0), (0.0, d), (0.0, -d)]
-        ox, oy = offsets[int(leg_index) % 4]
-        return cx + ox, cy + oy
-
-    def _compute_pd_from_metrics(
-        self, metrics: dict, kp: float, kd: float
-    ) -> tuple[float, float, str]:
-        overshoot_ratio = float(metrics.get("overshoot_ratio", 0.0))
-        settle_s = float(metrics.get("settle_time_s", 1.0))
-        t_cross = metrics.get("first_crossing_elapsed_s")
-        timed_out = bool(metrics.get("timed_out", 0.0) > 0.5)
-        g = self.g_eff
-        zeta_target = self.target_zeta
-
-        if timed_out:
-            rationale = "timeout: hold gains"
-            return (
-                _clamp(kp, self.min_kp, self.max_kp),
-                _clamp(kd, self.min_kd, self.max_kd),
-                rationale,
-            )
-
-        if overshoot_ratio >= self.min_overshoot_ratio:
-            ln_os = math.log(max(overshoot_ratio, 1e-9))
-            zeta_obs = -ln_os / math.sqrt(math.pi ** 2 + ln_os ** 2)
-            zeta_obs = _clamp(zeta_obs, 0.05, 0.99)
-        else:
-            zeta_obs = zeta_target
-            rationale = "overdamped: using target zeta"
-
-        if t_cross is not None and t_cross >= PD_AUTOTUNE_MIN_CROSS_S:
-            wd = math.pi / t_cross
-            zeta_for_wn = _clamp(zeta_obs, 0.05, 0.999)
-            wn = wd / math.sqrt(1.0 - zeta_for_wn ** 2)
-            rationale = f"underdamped zeta={zeta_obs:.2f} wn={wn:.2f} (crossing)"
-        else:
-            wn = 5.8 / max(settle_s, 0.05)
-            rationale = f"overdamped wn={wn:.2f} (settle fallback)"
-
-        kp_new = wn ** 2 / g
-        kd_new = 2.0 * zeta_target * wn / g
-
-        # Cap gain change to MAX_GAIN_DELTA_FRAC of current value per trial.
-        # Absolute floor of 0.001 prevents the window from collapsing to [0,0]
-        # when kp or kd is zero (e.g. user zeroed kd before enabling).
-        max_frac = float(PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC)
-        kp_step = max(kp * max_frac, 0.001)
-        kd_step = max(kd * max_frac, 0.001)
-        kp_new = _clamp(kp_new, kp - kp_step, kp + kp_step)
-        kd_new = _clamp(kd_new, kd - kd_step, kd + kd_step)
-
-        kp_new = _clamp(kp_new, self.min_kp, self.max_kp)
-        kd_new = _clamp(kd_new, self.min_kd, self.max_kd)
-        return kp_new, kd_new, rationale
-
-    # ---------------------------
-    # Per-frame update (FG-10)
+    # Per-frame update (worker thread — sole public-state mutator)
     # ---------------------------
 
     def update(
-        self, x: float, y: float, vx: float, vy: float, kp: float, kd: float
-    ) -> tuple[float, float, dict | None]:
-        """Advance the autotune state machine one frame.
+        self,
+        x: float,
+        y: float,
+        vx: float,
+        vy: float,
+        kp: float,
+        kd: float,
+        ki: float,
+        raw_x: float | None = None,
+        raw_y: float | None = None,
+    ) -> tuple[float, float, float, dict | None]:
+        """Advance the pipeline one valid frame.
 
-        Returns (kp, kd, event): the possibly auto-applied gains and an
-        event dict on state transitions (None otherwise).
+        Returns (kp, kd, ki, event): possibly auto-applied gains and an
+        event dict on transitions (None otherwise).
         """
         if not self.enabled:
-            return kp, kd, None
+            return kp, kd, ki, None
         now = self._clock()
 
-        if not self._leg_initialized:
-            self._leg_index = 0
-            self._arbiter.set_override(self._center_x_mm, self._center_y_mm)
-            self._state = "wait_settle"
-            self._wait_settle_timer = 0.0
-            self._wait_settle_ts = now
-            self._leg_initialized = True
-            self._log.info(
-                "WAIT_SETTLE  leg=%d  center=(%.1f,%.1f)",
-                self._leg_index, self._center_x_mm, self._center_y_mm,
+        if self._state == "probing":
+            return self._update_probing(
+                now, x, y, vx, vy,
+                x if raw_x is None else raw_x,
+                y if raw_y is None else raw_y,
+                kp, kd, ki,
             )
-            msg = "autotune: waiting for ball to settle at center"
-            self.last_message = msg
-            return kp, kd, {"type": "wait_settle_started", "message": msg}
+        if self._state == "computing":
+            return self._update_computing(kp, kd, ki)
+        return kp, kd, ki, None
 
-        if self._state == "wait_settle":
-            err = math.hypot(self._center_x_mm - x, self._center_y_mm - y)
-            speed = math.hypot(vx, vy)
-            dt = max(1e-4, min(0.1, now - self._wait_settle_ts))
-            self._wait_settle_ts = now
-            within_r = err <= PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM
-            within_v = speed <= PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S
-            if within_r and within_v:
-                self._wait_settle_timer += dt
-            else:
-                self._wait_settle_timer = 0.0
-            if self._wait_settle_timer < PD_AUTOTUNE_WAIT_SETTLE_HOLD_S:
-                return kp, kd, None
-            tx, ty = self._autotune_leg_target(self._leg_index)
-            self._arbiter.set_override(tx, ty)
-            self._leg_eval.start(now, x, y, tx, ty)
-            self._state = "measuring"
-            self._log.info(
-                "LEG %d START  target=(%.1f,%.1f)  ball=(%.1f,%.1f)  s0=%.1f",
-                self._leg_index, tx, ty, x, y, self._leg_eval.s0,
-            )
-            msg = f"autotune: leg {self._leg_index} started target=({tx:.1f},{ty:.1f})"
-            self.last_message = msg
-            return kp, kd, {"type": "trial_started", "message": msg}
+    def record_command(self, roll_cmd: float, pitch_cmd: float) -> None:
+        """Complete the probe row begun by update() (called after the
+        PID compute in the same frame — exact command/frame pairing)."""
+        if self._state == "probing" and self._recording is not None:
+            self._recording.complete_row(roll_cmd, pitch_cmd)
 
-        active_x, active_y = self._arbiter.active
-        metrics = self._leg_eval.observe(
-            now, x, y, vx, vy,
-            active_x, active_y,
-            settle_radius_mm=PD_AUTOTUNE_SETTLE_RADIUS_MM,
-            settle_speed_mm_s=PD_AUTOTUNE_SETTLE_SPEED_MM_S,
-            settle_hold_s=PD_AUTOTUNE_SETTLE_HOLD_S,
-            min_trial_s=PD_AUTOTUNE_MIN_TRIAL_S,
-            timeout_s=PD_AUTOTUNE_TIMEOUT_S,
-        )
-        if metrics is None:
-            return kp, kd, None
-
-        self.trial_count += 1
-        kp_before = float(kp)
-        kd_before = float(kd)
-        kp_new, kd_new, rationale = self._compute_pd_from_metrics(metrics, kp, kd)
-        changed = (abs(kp_new - kp) > 1e-9) or (abs(kd_new - kd) > 1e-9)
-
-        kp_out = float(kp)
-        kd_out = float(kd)
-        if changed and self.auto_apply:
-            kp_out = float(kp_new)
-            kd_out = float(kd_new)
-            self.has_suggestion = False
-            self.suggested_kp = float(kp_out)
-            self.suggested_kd = float(kd_out)
-            action = f"applied kp={kp_out:.4f}, kd={kd_out:.4f}"
-        elif changed:
-            self.has_suggestion = True
-            self.suggested_kp = float(kp_new)
-            self.suggested_kd = float(kd_new)
-            action = f"suggest kp={kp_new:.4f}, kd={kd_new:.4f}"
-        else:
-            self.has_suggestion = False
-            self.suggested_kp = float(kp)
-            self.suggested_kd = float(kd)
-            action = "hold gains"
-
-        self._leg_index = (self._leg_index + 1) % 4
+    def _abort(self, reason: str) -> dict:
+        self._log.info("PROBE ABORT: %s", reason)
+        self._state = "idle"
+        self._recording = None
         self._arbiter.set_override(self._center_x_mm, self._center_y_mm)
-        self._state = "wait_settle"
-        self._wait_settle_timer = 0.0
-        self._wait_settle_ts = now
+        msg = f"autotune probe aborted: {reason}"
+        self.last_message = msg
+        return {"type": "probe_aborted", "message": msg, "reason": reason}
 
-        completed_leg = (self._leg_index - 1) % 4
-        tc = metrics["first_crossing_elapsed_s"]
-        tc_str = f"{tc:.3f}s" if tc is not None else "None"
-        self._log.info(
-            "LEG %d DONE  settle=%.3fs  OS=%.4f  t_cross=%s  crossings=%.0f  iae=%.1f",
-            completed_leg,
-            metrics["settle_time_s"], metrics["overshoot_ratio"],
-            tc_str, metrics["oscillation_crossings"], metrics["iae_mm_s"],
-        )
-        self._log.info(
-            "  -> kp %.4f->%.4f  kd %.4f->%.4f  [%s]  %s",
-            kp_before, kp_new, kd_before, kd_new, action, rationale,
+    def _update_probing(
+        self,
+        now: float,
+        x: float,
+        y: float,
+        vx: float,
+        vy: float,
+        raw_x: float,
+        raw_y: float,
+        kp: float,
+        kd: float,
+        ki: float,
+    ) -> tuple[float, float, float, dict | None]:
+        event: dict | None = None
+        if self._probe_start is None:
+            self._probe_start = now
+            self._last_valid_ts = now
+            msg = (
+                f"autotune: probe started ({self._script.total_s:.0f}s "
+                "scripted sequence)"
+            )
+            self.last_message = msg
+            event = {"type": "probe_started", "message": msg}
+
+        # Ball-lost abort: update() only runs on valid frames, so a gap
+        # means sustained tracking loss.
+        assert self._last_valid_ts is not None
+        if now - self._last_valid_ts > PD_AUTOTUNE_BALL_LOST_S:
+            return kp, kd, ki, self._abort("ball lost")
+        self._last_valid_ts = now
+
+        # Out-of-bounds: recenter immediately; abort if it persists.
+        r = math.hypot(x - self._center_x_mm, y - self._center_y_mm)
+        if r > PD_AUTOTUNE_ABORT_RADIUS_MM:
+            if self._out_since is None:
+                self._out_since = now
+                self._arbiter.set_override(
+                    self._center_x_mm, self._center_y_mm
+                )
+            elif now - self._out_since > 2.0:
+                return kp, kd, ki, self._abort("out of bounds")
+            return kp, kd, ki, event
+        self._out_since = None
+
+        elapsed = now - self._probe_start
+        seg = self._script.segment_index(elapsed)
+        if seg != self._last_segment:
+            tx, ty = self._script.target_at(elapsed)
+            self._arbiter.set_override(
+                self._center_x_mm + tx, self._center_y_mm + ty
+            )
+            self._last_segment = seg
+            self.trial_count = seg
+        with self._lock:
+            self._thread_phase = ("probing", self._script.progress(elapsed))
+
+        assert self._recording is not None
+        tgt_x, tgt_y = self._arbiter.active
+        self._recording.begin_row(
+            now, raw_x, raw_y, x, y, vx, vy, tgt_x, tgt_y
         )
 
+        if elapsed >= self._script.total_s:
+            self._state = "computing"
+            self._arbiter.set_override(self._center_x_mm, self._center_y_mm)
+            rows = self._recording.arrays()
+            self._recording = None
+            self._start_compute(rows, kp, kd, ki)
+            msg = "autotune: probe complete — fitting plant + designing gains"
+            self.last_message = msg
+            event = {"type": "probe_done", "message": msg}
+        return kp, kd, ki, event
+
+    def _start_compute(
+        self, rows: np.ndarray, kp: float, kd: float, ki: float
+    ) -> None:
+        gen = self._generation
+        with self._lock:
+            self._thread_phase = ("fitting", 0.0)
+            self._thread_result = None
+        if self.run_compute_inline:
+            self._compute(rows, kp, kd, ki, gen)
+            return
+        self._thread = threading.Thread(
+            target=self._compute,
+            args=(rows, kp, kd, ki, gen),
+            daemon=True,
+            name="autotune-compute",
+        )
+        self._thread.start()
+
+    def _compute(
+        self, rows: np.ndarray, kp: float, kd: float, ki: float, gen: int
+    ) -> None:
+        """Fit + design (background thread; inline in tests)."""
+
+        def fit_progress(p: float) -> None:
+            with self._lock:
+                self._thread_phase = ("fitting", p)
+
+        def design_progress(p: float) -> None:
+            with self._lock:
+                self._thread_phase = ("designing", p)
+
+        fit = fit_plant(
+            rows, self._script, progress_cb=fit_progress, cancel=self._cancel
+        )
+        if fit is None:
+            with self._lock:
+                self._thread_result = {"generation": gen, "error": "fit failed"}
+            return
+        with self._lock:
+            self._thread_phase = ("designing", 0.0)
+        design = design_gains(
+            fit, kp, kd, ki,
+            progress_cb=design_progress, cancel=self._cancel,
+        )
+        with self._lock:
+            if design is None:
+                self._thread_result = {
+                    "generation": gen, "error": "design cancelled",
+                }
+            else:
+                self._thread_result = {
+                    "generation": gen, "fit": fit, "design": design,
+                }
+
+    def _update_computing(
+        self, kp: float, kd: float, ki: float
+    ) -> tuple[float, float, float, dict | None]:
+        with self._lock:
+            result = self._thread_result
+            if result is not None:
+                self._thread_result = None
+        if result is None:
+            return kp, kd, ki, None
+        if result.get("generation") != self._generation:
+            return kp, kd, ki, None          # stale session — drop
+        if "error" in result:
+            self._state = "idle"
+            msg = f"autotune: {result['error']}"
+            self.last_message = msg
+            self._log.info("COMPUTE FAILED: %s", result["error"])
+            return kp, kd, ki, {"type": "compute_failed", "message": msg}
+
+        fit: PlantFit = result["fit"]
+        design: GainDesign = result["design"]
+        self.plant_fit = fit
+        self._design = design
+        self._state = "suggestion_ready"
+        self.suggested_kp = design.kp
+        self.suggested_kd = design.kd
+        self.suggested_ki = design.ki
+        self._log.info(
+            "SUGGESTION  kp=%.4f kd=%.4f ki=%.4f  J=%.3f  plant: g=%.1f "
+            "L=%.3fs stiction=%.2f  conf=%s %s",
+            design.kp, design.kd, design.ki, design.predicted_cost,
+            fit.params.g_eff, fit.params.latency_s, fit.params.stiction_deg,
+            "LOW" if fit.low_confidence else "ok", design.notes,
+        )
         msg = (
-            f"trial#{self.trial_count} "
-            f"settle={metrics['settle_time_s']:.2f}s "
-            f"overshoot={metrics['overshoot_ratio']:.2f} "
-            f"cross={metrics['oscillation_crossings']:.0f} "
-            f"iae={metrics['iae_mm_s']:.1f} -> {action} ({rationale})"
+            f"suggest kp={design.kp:.4f} kd={design.kd:.4f} "
+            f"ki={design.ki:.4f} (predicted J={design.predicted_cost:.2f}; "
+            f"plant g={fit.params.g_eff:.0f} L={fit.params.latency_s * 1000:.0f}ms "
+            f"stiction={fit.params.stiction_deg:.2f}deg"
+            f"{'; LOW CONFIDENCE' if fit.low_confidence else ''})"
         )
         self.last_message = msg
-        return kp_out, kd_out, {
-            "type": "trial_done",
+        event: dict = {
+            "type": "suggestion",
             "message": msg,
-            "metrics": metrics,
-            "kp_suggested": kp_new,
-            "kd_suggested": kd_new,
-            "applied": 1.0 if (changed and self.auto_apply) else 0.0,
+            "kp_suggested": design.kp,
+            "kd_suggested": design.kd,
+            "ki_suggested": design.ki,
+            "predicted_cost": design.predicted_cost,
+            "applied": 0.0,
         }
+        if self.auto_apply:
+            self.has_suggestion = False
+            event["applied"] = 1.0
+            event["message"] = "applied " + msg
+            self.last_message = event["message"]
+            return design.kp, design.kd, design.ki, event
+        self.has_suggestion = True
+        return kp, kd, ki, event
 
     # ---------------------------
-    # Telemetry (terms-dict keys — FROZEN, the GUI reads these)
+    # Telemetry (7 keys FROZEN from the old contract + additive)
     # ---------------------------
 
     def telemetry(self) -> dict[str, Any]:
+        with self._lock:
+            phase, progress = self._thread_phase
+        if not self.enabled:
+            phase, progress = "idle", 0.0
+        elif self._state == "suggestion_ready":
+            phase, progress = "suggestion_ready", 1.0
+        fit = self.plant_fit
         return {
             "pd_autotune_enabled": self.enabled,
             "pd_autotune_auto_apply": self.auto_apply,
@@ -478,4 +453,19 @@ class PDAutotuner:
             "pd_autotune_has_suggestion": self.has_suggestion,
             "pd_autotune_suggested_kp": self.suggested_kp,
             "pd_autotune_suggested_kd": self.suggested_kd,
+            # Additive (SysID rework)
+            "pd_autotune_suggested_ki": self.suggested_ki,
+            "pd_autotune_phase": phase,
+            "pd_autotune_progress": float(progress),
+            "pd_autotune_plant_g_eff": 0.0 if fit is None else fit.params.g_eff,
+            "pd_autotune_plant_latency_s": (
+                0.0 if fit is None else fit.params.latency_s
+            ),
+            "pd_autotune_plant_stiction_deg": (
+                0.0 if fit is None else fit.params.stiction_deg
+            ),
+            "pd_autotune_predict_s": 0.0 if fit is None else fit.predict_s,
+            "pd_autotune_predicted_cost": (
+                0.0 if self._design is None else self._design.predicted_cost
+            ),
         }

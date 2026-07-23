@@ -256,28 +256,22 @@ HOME_CAL_CONVERGE_MAX_RADIUS_MM = 15.0
 HOME_CAL_TIMEOUT_S = 30.0
 
 # =============================================================================
-# PD autotune
+# AutoTune (2026-07-23 SysID rework)
 # =============================================================================
+# The step-test estimator and its 13 gate/inversion settings were
+# deleted -- tuning is now a probe -> fit -> design pipeline
+# (control/plant_id.py + control/gain_design.py; probe script and
+# search bounds are module constants there, not user tunables). The
+# old estimator was convicted on evidence: zero legs ever completed on
+# the rig (its settle gates never opened), and it random-walked when
+# run against a known simulated plant.
 PD_AUTOTUNE_ENABLED = False
 PD_AUTOTUNE_AUTO_APPLY = False
-PD_AUTOTUNE_SETTLE_RADIUS_MM = 6.0
-PD_AUTOTUNE_SETTLE_SPEED_MM_S = 18.0
-PD_AUTOTUNE_SETTLE_HOLD_S = 0.35
-PD_AUTOTUNE_TIMEOUT_S = 6.0
-PD_AUTOTUNE_MIN_TRIAL_S = 0.8
-PD_AUTOTUNE_MIN_KP = 0.005
-PD_AUTOTUNE_MAX_KP = 0.250
-PD_AUTOTUNE_MIN_KD = 0.000
-PD_AUTOTUNE_MAX_KD = 0.100
-PD_AUTOTUNE_STEP_MM: float = 40.0          # step distance from center per leg
-PD_AUTOTUNE_G_EFF: float = 171.0           # effective platform gravity (mm/s²/°)
-PD_AUTOTUNE_TARGET_ZETA: float = 0.70      # desired closed-loop damping ratio
-PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM: float = 20.0  # pre-leg settle radius
-PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S: float = 20.0  # pre-leg settle speed
-PD_AUTOTUNE_WAIT_SETTLE_HOLD_S: float = 0.5      # pre-leg settle hold duration
-PD_AUTOTUNE_MIN_OVERSHOOT_RATIO: float = 0.02    # below this → treat as overdamped
-PD_AUTOTUNE_MIN_CROSS_S: float = 0.40           # ignore first_crossing faster than this
-PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC: float = 0.50   # max fractional change per trial
+# Effective plant gain (mm/s^2 per deg). Updated by Apply after a fit;
+# also feeds the path feedforward tilt divisor.
+PD_AUTOTUNE_G_EFF: float = float(_OV.get("PD_AUTOTUNE_G_EFF", 171.0))
+PD_AUTOTUNE_ABORT_RADIUS_MM = 70.0     # probe hard-abort radius
+PD_AUTOTUNE_BALL_LOST_S = 1.0          # valid-frame gap that aborts a probe
 AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 
 # =============================================================================

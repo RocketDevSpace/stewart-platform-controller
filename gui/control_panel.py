@@ -259,7 +259,8 @@ class ControlPanel(QWidget):
         tune.setSpacing(2)
         tune.setContentsMargins(6, 10, 6, 6)
 
-        # Kp max 300 supports PD_AUTOTUNE_MAX_KP = 0.250
+        # Kp max 300 (0.300) leaves headroom over the gain-design
+        # search's kp upper bound (0.150 — control/gain_design.py)
         self._kp_label, self._kp_slider = self._make_scaled_slider(
             tune, "Kp: {:.3f}", 0, 300,
             float(PD_DEFAULT_KP), 1000.0, self._on_kp_changed,

@@ -8,25 +8,34 @@ Rules under test:
 - Ball at positive x produces negative pitch (platform corrects toward center)
 - Ball at positive y produces positive roll (platform corrects toward center)
 - Output is clamped to [-max_tilt_deg, max_tilt_deg]
-- Autotune disables auto-trim on enable
-- Physics inversion produces correct kp/kd from step-response metrics
-- Autotune state machine advances from wait_settle to measuring after settling
+- Autotune (SysID rework 2026-07-23): enabling starts the scripted probe
+  through the override channel (target pinned at the manual center during
+  S0, no settle gates); ball-lost / out-of-bounds abort the probe; disable
+  clears the override and returns to idle
+- End-to-end: a full probe session against a KNOWN simulated plant must
+  recover its parameters and produce an applicable suggestion (the property
+  the old step-test estimator could not deliver)
 - Autotune session log goes to the injected path, opened fresh per session
 - Rest mode: resting output is exactly level + trim; auto-trim keeps
   integrating during rest and the resting output follows it; a fast
   disturbance regains near-full PD authority on the same call
 - D-term pins: no derivative kick on target steps; d-cap clamps
 """
-import math
+import random
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from control.autotune import PDAutotuner, _PDLegEvaluator
+from control.autotune import PDAutotuner
 from control.ball_controller import BallController
+from control.plant_model import PlantParams, plant_step
 from control.setpoint import SetpointArbiter
 from core.platform_state import BallState
+from cv.measurement_filter import AlphaBetaFilter2D
 from settings import PD_D_TERM_LIMIT_DEG
+
+DT = 1.0 / 30.0
 
 
 class _FakeClock:
@@ -170,195 +179,222 @@ class TestAutotuneFreezesIntegral:
         assert ctrl.auto_trim_enabled is False
 
 
-class TestComputePDFromMetrics:
-    KP = 0.075
-    KD = 0.030
+class TestAutotuneProbeLifecycle:
+    """SysID rework: enabling autotune starts the scripted probe
+    IMMEDIATELY (no settle gates) through the arbiter override channel.
+    These tests pin the probe's observable lifecycle through the
+    controller facade: start event, S0 center hold, the S0→S1 target
+    step, clean disable, and both abort paths."""
 
-    def _make_tuner(self, tmp_path: Path) -> PDAutotuner:
-        tuner = _make_tuner(log_path=str(tmp_path / "autotune_test.log"))
-        tuner.g_eff = 171.0
-        tuner.target_zeta = 0.70
-        tuner.min_kp = 0.005
-        tuner.max_kp = 0.250
-        tuner.min_kd = 0.0
-        tuner.max_kd = 0.100
-        tuner.min_overshoot_ratio = 0.02
-        # KP/KD chosen so neither the underdamped (~0.100) nor overdamped
-        # (~0.049) expected outputs hit the MAX_GAIN_DELTA_FRAC=0.50 fence
-        return tuner
-
-    def test_underdamped_exact_inversion(self, tmp_path: Path) -> None:
-        tuner = self._make_tuner(tmp_path)
-        # OS=0.163 → ζ_obs≈0.5; t_cross=0.877s → wd=π/0.877, wn≈4.135
-        # kp=wn²/g≈0.1 (within default max_kp=0.250)
-        t_cross = 0.877
-        wd = math.pi / t_cross
-        zeta_obs = 0.5
-        wn = wd / math.sqrt(1.0 - zeta_obs ** 2)
-        g = 171.0
-        zeta_target = 0.70
-        expected_kp = wn ** 2 / g
-        expected_kd = 2.0 * zeta_target * wn / g
-
-        metrics = {
-            "overshoot_ratio": 0.163,
-            "settle_time_s": 2.0,
-            "first_crossing_elapsed_s": t_cross,
-            "timed_out": 0.0,
-        }
-        kp, kd, rationale = tuner._compute_pd_from_metrics(metrics, self.KP, self.KD)
-        assert kp == pytest.approx(expected_kp, rel=0.02)
-        assert kd == pytest.approx(expected_kd, rel=0.02)
-        assert "crossing" in rationale
-
-    def test_overdamped_fallback_uses_settle_time(self, tmp_path: Path) -> None:
-        tuner = self._make_tuner(tmp_path)
-        settle_s = 2.0
-        g = 171.0
-        zeta_target = 0.70
-        wn = 5.8 / settle_s
-        expected_kp = wn ** 2 / g
-        expected_kd = 2.0 * zeta_target * wn / g
-
-        metrics = {
-            "overshoot_ratio": 0.005,  # below min_overshoot_ratio → overdamped
-            "settle_time_s": settle_s,
-            "first_crossing_elapsed_s": None,
-            "timed_out": 0.0,
-        }
-        kp, kd, rationale = tuner._compute_pd_from_metrics(metrics, self.KP, self.KD)
-        assert kp == pytest.approx(expected_kp, rel=0.02)
-        assert kd == pytest.approx(expected_kd, rel=0.02)
-        assert "fallback" in rationale
-
-    def test_timeout_holds_current_gains(self, tmp_path: Path) -> None:
-        tuner = self._make_tuner(tmp_path)
-        metrics = {
-            "overshoot_ratio": 0.0,
-            "settle_time_s": 10.0,
-            "first_crossing_elapsed_s": None,
-            "timed_out": 1.0,
-        }
-        kp, kd, rationale = tuner._compute_pd_from_metrics(metrics, 0.045, 0.022)
-        assert kp == pytest.approx(0.045)
-        assert kd == pytest.approx(0.022)
-        assert "timeout" in rationale
-
-    def test_output_is_clamped_to_bounds(self, tmp_path: Path) -> None:
-        tuner = self._make_tuner(tmp_path)
-        tuner.max_kp = 0.010
-        tuner.max_kd = 0.005
-        metrics = {
-            "overshoot_ratio": 0.163,
-            "settle_time_s": 0.1,  # very fast → huge wn
-            "first_crossing_elapsed_s": 0.05,
-            "timed_out": 0.0,
-        }
-        kp, kd, _ = tuner._compute_pd_from_metrics(metrics, self.KP, self.KD)
-        assert kp <= 0.010
-        assert kd <= 0.005
-
-    def test_short_crossing_uses_settle_fallback(self, tmp_path: Path) -> None:
-        tuner = self._make_tuner(tmp_path)
-        # t_cross below MIN_CROSS_S threshold — should fall through to settle fallback
-        metrics = {
-            "overshoot_ratio": 0.163,
-            "settle_time_s": 2.0,
-            "first_crossing_elapsed_s": 0.10,   # too short — ignored
-            "timed_out": 0.0,
-        }
-        kp, kd, rationale = tuner._compute_pd_from_metrics(metrics, self.KP, self.KD)
-        assert "fallback" in rationale
-
-    def test_gain_delta_is_capped(self, tmp_path: Path) -> None:
-        tuner = self._make_tuner(tmp_path)
-        kp0, kd0 = 0.045, 0.022
-        # t_cross=1.0 ≥ MIN_CROSS_S; OS=0.163 → wn≈3.63 → kp_raw≈0.077 > 0.045*1.5=0.0675
-        metrics = {
-            "overshoot_ratio": 0.163,
-            "settle_time_s": 2.0,
-            "first_crossing_elapsed_s": 1.0,   # above MIN_CROSS_S
-            "timed_out": 0.0,
-        }
-        kp, kd, _ = tuner._compute_pd_from_metrics(metrics, kp0, kd0)
-        from settings import PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC
-        assert kp <= kp0 * (1.0 + PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC) + 1e-9
-        assert kp >= kp0 * (1.0 - PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC) - 1e-9
-
-    def test_gain_delta_cap_kd_zero_can_move(self, tmp_path: Path) -> None:
-        # Regression: when kd == 0 the multiplicative window collapsed to
-        # [0, 0], locking kd at zero forever. The absolute floor (0.001) must
-        # allow kd to move off zero.
-        tuner = self._make_tuner(tmp_path)
-        metrics = {
-            "overshoot_ratio": 0.163,
-            "settle_time_s": 2.0,
-            "first_crossing_elapsed_s": 1.0,
-            "timed_out": 0.0,
-        }
-        _, kd, _ = tuner._compute_pd_from_metrics(metrics, 0.045, 0.0)
-        assert kd > 0.0, "kd must be able to move off zero"
-
-
-class TestAutotuneStateMachine:
-    def test_enable_enters_wait_settle(self, tmp_path: Path) -> None:
-        tuner = _make_tuner(log_path=str(tmp_path / "autotune_test.log"))
-        tuner.set_enabled(True, None, 0.045, 0.022)
-        # Prime the state machine with one call
-        tuner.update(0.0, 0.0, 0.0, 0.0, 0.045, 0.022)
-        assert tuner._state == "wait_settle"
-
-    def test_wait_settle_advances_to_measuring_after_hold(self, tmp_path: Path) -> None:
-        from settings import PD_AUTOTUNE_WAIT_SETTLE_HOLD_S
-        tuner = _make_tuner(log_path=str(tmp_path / "autotune_test.log"))
-        tuner.set_enabled(True, None, 0.045, 0.022)
-        tuner.update(0.0, 0.0, 0.0, 0.0, 0.045, 0.022)
-        assert tuner._state == "wait_settle"
-
-        # Force the timer past the threshold
-        tuner._wait_settle_timer = PD_AUTOTUNE_WAIT_SETTLE_HOLD_S + 0.1
-        tuner.update(0.0, 0.0, 0.0, 0.0, 0.045, 0.022)
-        assert tuner._state == "measuring"
-
-    def test_wait_settle_timer_resets_on_movement(self, tmp_path: Path) -> None:
-        tuner = _make_tuner(log_path=str(tmp_path / "autotune_test.log"))
-        tuner.set_enabled(True, None, 0.045, 0.022)
-        tuner.update(0.0, 0.0, 0.0, 0.0, 0.045, 0.022)
-        tuner._wait_settle_timer = 0.5
-
-        # Ball far from center → timer resets
-        tuner.update(100.0, 100.0, 50.0, 50.0, 0.045, 0.022)
-        assert tuner._wait_settle_timer == 0.0
-
-    def test_leg_targets_are_axis_aligned(self, tmp_path: Path) -> None:
-        tuner = _make_tuner(log_path=str(tmp_path / "autotune_test.log"))
-        tuner.set_center(0.0, 0.0)
-        targets = [tuner._autotune_leg_target(i) for i in range(4)]
-        # Each target should be on exactly one axis (one coord nonzero)
-        for tx, ty in targets:
-            assert (tx == 0.0) != (ty == 0.0), f"target ({tx},{ty}) not axis-aligned"
-
-    def test_first_crossing_recorded(self) -> None:
-        evaluator = _PDLegEvaluator()
-        # Start with ball at x=40 (step of 40mm along x axis)
-        evaluator.start(ts=0.0, x=0.0, y=0.0, tx=40.0, ty=0.0)
-        assert evaluator.first_crossing_elapsed_s is None
-
-        # Observe: ball still at positive projected error
-        evaluator.observe(
-            ts=0.5, x=20.0, y=0.0, vx=0.0, vy=0.0, tx=40.0, ty=0.0,
-            settle_radius_mm=5.0, settle_speed_mm_s=10.0,
-            settle_hold_s=0.3, min_trial_s=0.1, timeout_s=10.0,
+    def _probe_controller(self, clock: _FakeClock) -> BallController:
+        return BallController(
+            kp=0.045, kd=0.022, clock=clock, auto_trim_enabled=False
         )
-        assert evaluator.first_crossing_elapsed_s is None
 
-        # Observe: ball overshoots past target (projected error goes negative)
-        evaluator.observe(
-            ts=1.0, x=50.0, y=0.0, vx=0.0, vy=0.0, tx=40.0, ty=0.0,
-            settle_radius_mm=5.0, settle_speed_mm_s=10.0,
-            settle_hold_s=0.3, min_trial_s=0.1, timeout_s=10.0,
+    def test_enable_starts_probe_pinned_at_center(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)  # session log goes to tmp cwd
+        clock = _FakeClock()
+        ctrl = self._probe_controller(clock)
+        ctrl.set_pd_autotune(True)
+        clock.advance(DT)
+        _, _, terms = ctrl.compute_with_terms(_state())
+        event = terms.get("pd_autotune_event")
+        assert event is not None
+        assert event["type"] == "probe_started"
+        # S0 quiet hold: the override pins the target at the manual center.
+        assert (terms["target_x_mm"], terms["target_y_mm"]) == (0.0, 0.0)
+
+    def test_s0_to_s1_steps_target_10mm_x(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        clock = _FakeClock()
+        ctrl = self._probe_controller(clock)
+        ctrl.set_pd_autotune(True)
+        clock.advance(DT)
+        _, _, terms = ctrl.compute_with_terms(_state())
+        assert (terms["target_x_mm"], terms["target_y_mm"]) == (0.0, 0.0)
+        # Cross the 3.0 s S0→S1 boundary in sub-second hops (a valid-frame
+        # gap over 1 s would trip the ball-lost abort).
+        for _ in range(8):
+            clock.advance(0.45)
+            _, _, terms = ctrl.compute_with_terms(_state())
+        # S1 precheck: the active target moved to center + (10, 0).
+        assert (terms["target_x_mm"], terms["target_y_mm"]) == (10.0, 0.0)
+
+    def test_disable_mid_probe_restores_manual_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        clock = _FakeClock()
+        ctrl = self._probe_controller(clock)
+        ctrl.set_target(5.0, 7.0)  # manual target == session center
+        ctrl.set_pd_autotune(True)
+        clock.advance(DT)
+        _, _, terms = ctrl.compute_with_terms(_state(x=5.0, y=7.0))
+        assert (terms["target_x_mm"], terms["target_y_mm"]) == (5.0, 7.0)
+        # Advance into S1 so the override is visibly NOT the manual target.
+        for _ in range(8):
+            clock.advance(0.45)
+            _, _, terms = ctrl.compute_with_terms(_state(x=5.0, y=7.0))
+        assert (terms["target_x_mm"], terms["target_y_mm"]) == (15.0, 7.0)
+
+        ctrl.set_pd_autotune(False)
+        assert ctrl._autotuner._state == "idle"
+        # Override cleared: the manual target is active again, and further
+        # computes run without events or crashes.
+        clock.advance(DT)
+        _, _, terms = ctrl.compute_with_terms(_state(x=5.0, y=7.0))
+        assert (terms["target_x_mm"], terms["target_y_mm"]) == (5.0, 7.0)
+        assert "pd_autotune_event" not in terms
+
+    def test_ball_lost_aborts_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        clock = _FakeClock()
+        ctrl = self._probe_controller(clock)
+        ctrl.set_pd_autotune(True)
+        for _ in range(5):
+            clock.advance(DT)
+            ctrl.compute_with_terms(_state())
+        # update() only runs on valid frames: a 2 s silence (> the 1 s
+        # PD_AUTOTUNE_BALL_LOST_S gap) means sustained tracking loss.
+        clock.advance(2.0)
+        _, _, terms = ctrl.compute_with_terms(_state())
+        event = terms.get("pd_autotune_event")
+        assert event is not None
+        assert event["type"] == "probe_aborted"
+        assert event["reason"] == "ball lost"
+        assert ctrl._autotuner._state == "idle"
+
+    def test_out_of_bounds_aborts_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        clock = _FakeClock()
+        ctrl = self._probe_controller(clock)
+        ctrl.set_pd_autotune(True)
+        # Ball parked 100 mm out (> the 70 mm abort radius): the probe
+        # recenters immediately, then aborts once it persists > 2 s.
+        events: list[dict] = []
+        for _ in range(75):
+            clock.advance(DT)
+            _, _, terms = ctrl.compute_with_terms(_state(x=100.0))
+            if "pd_autotune_event" in terms:
+                events.append(terms["pd_autotune_event"])
+        assert events, "expected probe_started and probe_aborted events"
+        assert events[-1]["type"] == "probe_aborted"
+        assert events[-1]["reason"] == "out of bounds"
+        assert ctrl._autotuner._state == "idle"
+
+
+class TestAutotuneEndToEnd:
+    """The SysID killer test through the controller session: enable →
+    scripted probe against a KNOWN simulated plant → inline fit+design →
+    suggestion → apply. The fit must recover the true plant (this is the
+    property the old step-test estimator could not deliver) and Apply
+    must calibrate gains + prediction horizon + integral deadband."""
+
+    TRUTH = PlantParams(
+        g_eff=171.0,
+        latency_s=0.0667,
+        stiction_deg=0.30,
+        warp_c_deg_per_mm=0.0055,
+        bias_roll_deg=0.2,
+        bias_pitch_deg=-0.1,
+    )
+
+    def test_full_session_suggests_recovers_plant_and_applies(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)  # session log goes to tmp cwd
+        clock = _FakeClock()
+        ctrl = BallController(
+            kp=0.045, kd=0.022, ki=0.030, clock=clock,
+            auto_trim_enabled=False,
         )
-        assert evaluator.first_crossing_elapsed_s == pytest.approx(1.0)
+        # Synchronous fit+design on the frame after the probe completes
+        # (the app runs it on a background thread; tests must be
+        # deterministic).
+        ctrl._autotuner.run_compute_inline = True
+        ctrl.set_pd_autotune(True, auto_apply=False)
+
+        truth = self.TRUTH
+        filt = AlphaBetaFilter2D()
+        rng = random.Random(0)
+        x = y = vx = vy = 0.0
+        cmd_t: list[float] = []
+        cmd_r: list[float] = []
+        cmd_p: list[float] = []
+        events: list[dict] = []
+        terms: dict = {}
+        # Probe duration + margin: the frame where elapsed reaches
+        # total_s runs the inline fit+design; the next emits the
+        # suggestion event.
+        frames = int(ctrl._autotuner._script.total_s * 30.0) + 10
+        for _ in range(frames):
+            clock.advance(DT)
+            raw_x = x + rng.gauss(0, 0.2)
+            raw_y = y + rng.gauss(0, 0.2)
+            fx, fy, fvx, fvy = filt.update(raw_x, raw_y, clock.now)
+            roll, pitch, terms = ctrl.compute_with_terms(BallState(
+                x_mm=fx, y_mm=fy, vx_mm_s=fvx, vy_mm_s=fvy,
+                raw_x_mm=raw_x, raw_y_mm=raw_y,
+            ))
+            if "pd_autotune_event" in terms:
+                events.append(terms["pd_autotune_event"])
+            # Truth plant with CONTINUOUS latency on the command stream
+            # (same pattern as tests/test_plant_id._run_probe_session).
+            cmd_t.append(clock.now)
+            cmd_r.append(roll)
+            cmd_p.append(pitch)
+            t_delayed = clock.now - truth.latency_s
+            r_act = float(np.interp(t_delayed, cmd_t, cmd_r, left=cmd_r[0]))
+            p_act = float(np.interp(t_delayed, cmd_t, cmd_p, left=cmd_p[0]))
+            x, y, vx, vy = plant_step(x, y, vx, vy, r_act, p_act, DT, truth)
+
+        types = [e["type"] for e in events]
+        assert "probe_started" in types
+        assert "suggestion" in types
+        suggestion = next(e for e in events if e["type"] == "suggestion")
+        assert terms["pd_autotune_has_suggestion"] is True
+
+        # The fit recovered the KNOWN plant (closed-loop through-the-
+        # session tolerances: slightly wider than the direct plant_id
+        # test's).
+        fit = ctrl._autotuner.plant_fit
+        assert fit is not None
+        assert fit.params.g_eff == pytest.approx(truth.g_eff, rel=0.15)
+        assert fit.params.latency_s == pytest.approx(
+            truth.latency_s, abs=0.025
+        )
+        # The design never returns gains it measured as worse than today.
+        assert terms["pd_autotune_predicted_cost"] <= 1.0 + 1e-9
+
+        # Apply: gains land on the facade and the NEXT compute carries
+        # the transient applied event with the plant calibration payload.
+        applied, _, _ = ctrl.apply_pd_autotune_recommendation()
+        assert applied is True
+        assert ctrl.kp == pytest.approx(suggestion["kp_suggested"])
+        assert ctrl.kd == pytest.approx(suggestion["kd_suggested"])
+        assert ctrl.ki == pytest.approx(suggestion["ki_suggested"])
+
+        clock.advance(DT)
+        _, _, terms = ctrl.compute_with_terms(_state())
+        event = terms.get("pd_autotune_event")
+        assert event is not None
+        assert event["type"] == "applied"
+        # Confident fit: Apply also calibrated the prediction horizon
+        # (pipeline latency + measured filter lag, clamped to 0.15 s)
+        # and the integral deadband.
+        assert not fit.low_confidence
+        assert event["predict_s"] == pytest.approx(
+            max(0.0, min(0.15, fit.predict_s))
+        )
+        assert 1.0 <= event["deadband_mm"] <= 6.0
 
 
 class TestRestModeIntegration:
@@ -675,7 +711,7 @@ class TestAutotuneSessionLog:
         tuner = _make_tuner(log_path=str(log_file))
         tuner.set_enabled(True, None, 0.045, 0.022)
         assert log_file.exists()
-        assert "SESSION START" in log_file.read_text(encoding="utf-8")
+        assert "SESSION START (SysID)" in log_file.read_text(encoding="utf-8")
 
         tuner.set_enabled(False, None, 0.045, 0.022)
         text = log_file.read_text(encoding="utf-8")

@@ -37,12 +37,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from control.ball_controller import BallController
 from control.patterns import circle
 from control.plant_id import PlantFit
 from control.plant_model import PlantParams, plant_step
 from core.platform_state import BallState
 from cv.measurement_filter import AlphaBetaFilter2D
+
+if False:  # typing-only; runtime import is deferred (see _make_controller)
+    from control.ball_controller import BallController  # noqa: F401
 
 HZ = 30.0
 DT = 1.0 / HZ
@@ -79,7 +81,13 @@ class GainDesign:
     notes: str = ""
 
 
-def _make_controller(kp: float, kd: float, ki: float) -> BallController:
+def _make_controller(kp: float, kd: float, ki: float) -> "BallController":
+    # Deferred import: this module is imported by control/autotune.py,
+    # which control/ball_controller.py imports — a top-level import
+    # here would be circular. The design search runs long after all
+    # modules are initialized.
+    from control.ball_controller import BallController
+
     clock = _Clock()
     ctrl = BallController(
         kp=kp, kd=kd, ki=ki, clock=clock, auto_trim_enabled=True
@@ -89,7 +97,7 @@ def _make_controller(kp: float, kd: float, ki: float) -> BallController:
 
 
 def _run_closed_loop(
-    ctrl: BallController,
+    ctrl: "BallController",
     plant: PlantParams,
     duration_s: float,
     seed: int,

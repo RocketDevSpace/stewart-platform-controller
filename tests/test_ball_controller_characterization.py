@@ -111,6 +111,16 @@ TERMS_KEYS = frozenset({
     "pd_autotune_has_suggestion",
     "pd_autotune_suggested_kp",
     "pd_autotune_suggested_kd",
+    # ADDED 2026-07-23 (SysID autotune rework): additive telemetry from
+    # the probe→fit→design pipeline — the 7 keys above stay frozen.
+    "pd_autotune_suggested_ki",
+    "pd_autotune_phase",
+    "pd_autotune_progress",
+    "pd_autotune_plant_g_eff",
+    "pd_autotune_plant_latency_s",
+    "pd_autotune_plant_stiction_deg",
+    "pd_autotune_predict_s",
+    "pd_autotune_predicted_cost",
     "target_x_mm",
     "target_y_mm",
 })
@@ -318,19 +328,22 @@ class TestAutotuneCoordination:
 
         # I-term rework: autotune no longer flips the enable flag (no
         # stash/restore to get wrong) — the integral freeze is DERIVED
-        # from autotuner.enabled inside compute (leg evaluator assumes a
-        # pure PD step response; a frozen I is just a constant bias).
+        # from autotuner.enabled inside compute (the plant fit assumes a
+        # pure PID response with a constant bias; a frozen I is exactly
+        # that).
         ctrl.set_pd_autotune(True)
         assert ctrl.pd_autotune_enabled is True
         assert ctrl.auto_trim_enabled is True
 
-        # Ball settled at center: autotune advances to a leg target 40 mm away.
+        # SysID rework: the probe starts immediately — during the S0
+        # quiet hold the override pins the target at the session center
+        # (== the manual target).
         for _ in range(8):
             clock.advance(0.1)
             _, _, terms = ctrl.compute_with_terms(_state(x=5.0, y=7.0))
         assert terms["pd_autotune_enabled"] is True
         assert terms["i_frozen"] is True
-        assert (terms["target_x_mm"], terms["target_y_mm"]) != (5.0, 7.0)
+        assert (terms["target_x_mm"], terms["target_y_mm"]) == (5.0, 7.0)
 
         # Disable: the integral thaws AND the manual target is restored.
         ctrl.set_pd_autotune(False)
@@ -351,24 +364,22 @@ class TestAutotuneCoordination:
         ctrl.set_target(0.0, 0.0)
         ctrl.set_pd_autotune(True, auto_apply=False)
 
-        # Settle at center until the first leg starts (target steps to +40 mm).
-        for _ in range(8):
-            clock.advance(0.1)
-            _, _, terms = ctrl.compute_with_terms(_state())
-        assert (terms["target_x_mm"], terms["target_y_mm"]) != (0.0, 0.0)
-
-        # Ball sits exactly on the leg target: trial completes overdamped and
-        # (auto_apply off) leaves a suggestion.
-        for _ in range(12):
-            clock.advance(0.1)
-            _, _, terms = ctrl.compute_with_terms(_state(x=40.0))
-        assert terms["pd_autotune_trial_count"] == 1
+        # Simulate a finished design (running the real ~78 s probe +
+        # fit here would make a characterization test expensive — the
+        # pipeline itself is covered in test_ball_controller).
+        ctrl._autotuner.has_suggestion = True
+        ctrl._autotuner.suggested_kp = 0.060
+        ctrl._autotuner.suggested_kd = 0.025
+        ctrl._autotuner.suggested_ki = 0.020
+        clock.advance(0.1)
+        _, _, terms = ctrl.compute_with_terms(_state())
         assert terms["pd_autotune_has_suggestion"] is True
         assert terms["kp"] == pytest.approx(0.045)  # not applied
 
+        # A manual gain change invalidates the pending suggestion.
         ctrl.set_gains(0.05, 0.02)
         clock.advance(0.1)
-        _, _, terms = ctrl.compute_with_terms(_state(x=40.0))
+        _, _, terms = ctrl.compute_with_terms(_state())
         assert terms["pd_autotune_has_suggestion"] is False
         assert terms["kp"] == pytest.approx(0.05)
         assert terms["kd"] == pytest.approx(0.02)
