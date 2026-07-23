@@ -299,7 +299,7 @@ GUI_SNAPSHOT_HZ = 30
 # When non-empty, the vision worker appends "t,x,y" lines (perf_counter
 # seconds, ball x/y in mm) for every valid frame — input for
 # tools/jitter_bench.py --csv replay. Empty string = disabled.
-VISION_POSITION_LOG_PATH: str = "vision_positions.csv"  # TEMP: rig gate, do not commit
+VISION_POSITION_LOG_PATH: str = ""
 
 # =============================================================================
 # Vision neutral-pose fallback (safety action on sustained ball loss)
