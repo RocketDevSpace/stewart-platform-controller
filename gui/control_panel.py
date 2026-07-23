@@ -644,7 +644,7 @@ class ControlPanel(QWidget):
         groups: dict[str, tuple[QSlider, ...]] = {
             "target": (self._target_x_slider, self._target_y_slider),
             "trim": (self._trim_roll_slider, self._trim_pitch_slider),
-            "gains": (self._kp_slider, self._kd_slider),
+            "gains": (self._kp_slider, self._ki_slider, self._kd_slider),
         }
         return any(sld.isSliderDown() for sld in groups[group])
 
@@ -697,7 +697,7 @@ class ControlPanel(QWidget):
     # without triggering re-emission (blockSignals pattern).
     # ------------------------------------------------------------------
 
-    def sync_kp_kd(self, kp: float, kd: float) -> None:
+    def sync_kp_kd(self, kp: float, kd: float, ki: float | None = None) -> None:
         self._kp_slider.blockSignals(True)
         self._kp_slider.setValue(round(kp * 1000))
         self._kp_label.setText(f"Kp: {kp:.3f}")
@@ -707,6 +707,14 @@ class ControlPanel(QWidget):
         self._kd_slider.setValue(round(kd * 1000))
         self._kd_label.setText(f"Kd: {kd:.3f}")
         self._kd_slider.blockSignals(False)
+
+        # ki is optional so pre-SysID callers (kp/kd-only syncs) keep
+        # working; None means "leave the Ki slider alone".
+        if ki is not None:
+            self._ki_slider.blockSignals(True)
+            self._ki_slider.setValue(round(ki * 1000))
+            self._ki_label.setText(f"Ki: {ki:.3f}")
+            self._ki_slider.blockSignals(False)
 
     def sync_target(self, x_mm: float, y_mm: float) -> None:
         self._target_x_slider.blockSignals(True)

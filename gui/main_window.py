@@ -584,6 +584,47 @@ class MainWindow(QWidget):
                 "[AUTO HOME] timed out without converging — nothing saved"
             )
 
+    def _handle_autotune_applied_event(self, event: dict) -> None:
+        """Transient controller event: an autotune Apply landed. Persist
+        the applied gains — and, when the fit was confident enough to
+        calibrate them, the prediction horizon / integral deadband /
+        plant gain — to the settings overlay (the home_cal_event
+        pattern: persist the event payload, not GUI mirrors that can be
+        a frame stale)."""
+        kp = float(event.get("kp", self._kp))
+        kd = float(event.get("kd", self._kd))
+        ki = float(event.get("ki", self._ki))
+        overrides: dict = {
+            "PD_DEFAULT_KP": kp,
+            "PD_DEFAULT_KD": kd,
+            "PD_DEFAULT_KI": ki,
+        }
+        detail = f"kp={kp:.4f}, kd={kd:.4f}, ki={ki:.4f}"
+        # Calibration keys are present only when the plant fit was
+        # confident — persist exactly what was applied, nothing more.
+        if "predict_s" in event:
+            overrides["CONTROL_PREDICT_S"] = float(event["predict_s"])
+            detail += f", predict={float(event['predict_s']) * 1000.0:.0f}ms"
+        if "deadband_mm" in event:
+            overrides["PD_I_ERR_DEADBAND_MM"] = float(event["deadband_mm"])
+            detail += f", deadband={float(event['deadband_mm']):.1f}mm"
+        if "g_eff" in event:
+            overrides["PD_AUTOTUNE_G_EFF"] = float(event["g_eff"])
+            detail += f", g={float(event['g_eff']):.0f}"
+        try:
+            settings_store.save_user_overrides(overrides)
+            self.control_panel.append_preview(
+                f"[PID TUNE] applied + saved to user_settings.json ({detail})"
+            )
+        except OSError as exc:
+            self.control_panel.append_preview(
+                f"[PID TUNE] applied but save failed: {exc}"
+            )
+        self._kp = kp
+        self._kd = kd
+        self._ki = ki
+        self.control_panel.sync_kp_kd(kp, kd, ki)
+
     def _on_autotune_enable_clicked(self, enabled: bool) -> None:
         self._pd_autotune_enabled = enabled
         if not enabled:
@@ -1037,6 +1078,10 @@ class MainWindow(QWidget):
                 self.control_panel.append_preview(
                     f"[PID TUNE] {tune_evt.get('message', '')}"
                 )
+                # An Apply carries the persistence payload (gains +
+                # optional plant calibration) — save it to the overlay.
+                if tune_evt.get("type") == "applied":
+                    self._handle_autotune_applied_event(tune_evt)
 
             # Home-cal completion / Save-Trim fold events (transient)
             home_evt = terms.get("home_cal_event")
@@ -1092,10 +1137,16 @@ class MainWindow(QWidget):
             return
         kp = float(terms.get("kp", self._kp))
         kd = float(terms.get("kd", self._kd))
-        if abs(kp - self._kp) > 1e-6 or abs(kd - self._kd) > 1e-6:
+        ki = float(terms.get("ki", self._ki))
+        if (
+            abs(kp - self._kp) > 1e-6
+            or abs(kd - self._kd) > 1e-6
+            or abs(ki - self._ki) > 1e-6
+        ):
             self._kp = kp
             self._kd = kd
-            self.control_panel.sync_kp_kd(kp, kd)
+            self._ki = ki
+            self.control_panel.sync_kp_kd(kp, kd, ki)
 
     def _sync_target_from_terms(self, terms: dict) -> None:
         if self.control_panel.any_slider_down("target"):

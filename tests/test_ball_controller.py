@@ -29,6 +29,7 @@ import pytest
 
 from control.autotune import PDAutotuner
 from control.ball_controller import BallController
+from control.plant_id import PlantFit
 from control.plant_model import PlantParams, plant_step
 from control.setpoint import SetpointArbiter
 from core.platform_state import BallState
@@ -395,6 +396,63 @@ class TestAutotuneEndToEnd:
             max(0.0, min(0.15, fit.predict_s))
         )
         assert 1.0 <= event["deadband_mm"] <= 6.0
+
+
+class TestAutotuneAppliedEventPayload:
+    """The transient applied-event contract the GUI persistence layer
+    consumes (_handle_autotune_applied_event): a confident-fit Apply
+    must flag kp/kd/ki AND the plant calibration (predict_s /
+    deadband_mm / g_eff) on the NEXT compute — the GUI saves exactly
+    this payload to the settings overlay, so its shape is pinned here
+    without running the full probe session (the e2e test above covers
+    that path but not the gain keys)."""
+
+    def test_applied_event_carries_gains_and_calibration(self) -> None:
+        clock = _FakeClock()
+        ctrl = BallController(
+            kp=0.045, kd=0.022, ki=0.030, clock=clock,
+            auto_trim_enabled=False,
+        )
+        # Simulate a finished pipeline: suggestion pending + a confident
+        # plant fit already stored (skipping the probe keeps this fast).
+        ctrl._autotuner.has_suggestion = True
+        ctrl._autotuner.suggested_kp = 0.060
+        ctrl._autotuner.suggested_kd = 0.028
+        ctrl._autotuner.suggested_ki = 0.015
+        ctrl._autotuner.plant_fit = PlantFit(
+            params=PlantParams(
+                g_eff=160.0, latency_s=0.07, stiction_deg=0.30
+            ),
+            residual_rms_mm=0.5,
+            noise_rms_mm=0.2,
+            low_confidence=False,
+            rock_amp_mm=0.5,
+            rock_freq_hz=0.8,
+            windows_used=12,
+            filter_lag_s=0.03,
+        )
+
+        applied, _, _ = ctrl.apply_pd_autotune_recommendation()
+        assert applied is True
+
+        clock.advance(DT)
+        _, _, terms = ctrl.compute_with_terms(_state())
+        event = terms.get("pd_autotune_event")
+        assert event is not None
+        assert event["type"] == "applied"
+        assert event["kp"] == pytest.approx(0.060)
+        assert event["kd"] == pytest.approx(0.028)
+        assert event["ki"] == pytest.approx(0.015)
+        # Confident fit: the calibration payload rides along.
+        assert event["predict_s"] == pytest.approx(0.07 + 0.03)
+        assert event["deadband_mm"] == pytest.approx(
+            0.5 * 0.30 / 0.060  # half the P-only stick offset at new kp
+        )
+        assert event["g_eff"] == pytest.approx(160.0)
+        # Transient: the event does not repeat on the following compute.
+        clock.advance(DT)
+        _, _, terms = ctrl.compute_with_terms(_state())
+        assert "pd_autotune_event" not in terms
 
 
 class TestRestModeIntegration:

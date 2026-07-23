@@ -104,6 +104,7 @@ TERMS_KEYS = frozenset({
     "path_speed_mm_s",
     "kp",
     "kd",
+    "ki",  # ADDED 2026-07-23 (SysID rework: ki in the loop)
     "pd_autotune_enabled",
     "pd_autotune_auto_apply",
     "pd_autotune_trial_count",

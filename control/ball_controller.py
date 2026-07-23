@@ -8,7 +8,7 @@ BallController — facade over the decomposed ball-balancing controller
   PIDCore          (control/pid_core.py)     PID math, d-cap, integral,
                                            tilt clamp, slew
   TrimStore       (control/trim_store.py)  persistent trim offsets
-  PDAutotuner     (control/autotune.py)    step-test gain tuning sessions
+  PDAutotuner     (control/autotune.py)    SysID tuning: probe→fit→design
 
 Integral action lives INSIDE PIDCore (2026-07-23 I-term rework — the old
 gated AutoTrim integrator is gone). The `auto_trim_enabled` name is kept
@@ -700,6 +700,7 @@ class BallController:
             "rest_hold_elapsed_s": self._rest_gate.hold_elapsed_s,
             "kp": self.kp,
             "kd": self.kd,
+            "ki": self.ki,
             **self._autotuner.telemetry(),
             **self._path_follower.telemetry(),
             "target_x_mm": self.target_x_mm,

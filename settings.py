@@ -183,7 +183,7 @@ PD_I_ERR_ZERO_MM = 60.0              # zero integration at/above (linear)
 # 3-minute static hold, ~17 mm/s perpetual wander). Below DEADBAND the
 # integral stops (ramping to full by 2x DEADBAND): the ball parks
 # within the stiction scale, the integral goes flat, and rest engages.
-PD_I_ERR_DEADBAND_MM = 2.0
+PD_I_ERR_DEADBAND_MM = float(_OV.get("PD_I_ERR_DEADBAND_MM", 2.0))
 # Rest may only engage once the integral is flat (|dI/dt| EMA under
 # this). Resting parks the output at trim + I with P and D dropped —
 # resting on a still-converging integral is not an equilibrium and
@@ -209,7 +209,7 @@ REST_I_RATE_MAX_DEG_S = 0.02
 PATH_FF_ENABLED = True
 PATH_FF_LOOKAHEAD_S = 0.12           # evaluate ff ahead by the pipeline lag
 PATH_FF_TILT_MAX_DEG = 1.5           # cap (polyline corners spike curvature)
-CONTROL_PREDICT_S = 0.08             # ball-state forward extrapolation
+CONTROL_PREDICT_S = float(_OV.get("CONTROL_PREDICT_S", 0.08))  # ball-state forward extrapolation
 
 # =============================================================================
 # Near-target rest mode (control/rest_gate.py)
