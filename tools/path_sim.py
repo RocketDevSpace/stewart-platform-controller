@@ -62,6 +62,32 @@ class SimResult:
     err_trace: list[float]
 
 
+def _apply_rolling_resistance(
+    ax: float,
+    ay: float,
+    vx: float,
+    vy: float,
+    roll_resist_deg: float,
+) -> tuple[float, float, float, float]:
+    """Coulomb-style rolling resistance, roll_resist_deg equivalent tilt.
+
+    Slow ball + net tilt inside the resistance cone -> sticks (velocity
+    zeroed, no acceleration). Moving ball -> constant deceleration
+    G_EFF * roll_resist_deg opposing the velocity. Returns possibly
+    modified (ax, ay, vx, vy).
+    """
+    if roll_resist_deg <= 0.0:
+        return ax, ay, vx, vy
+    a_res = G_EFF * roll_resist_deg
+    speed = math.hypot(vx, vy)
+    if speed < 0.5 and math.hypot(ax, ay) <= a_res:
+        return 0.0, 0.0, 0.0, 0.0
+    if speed > 1e-9:
+        ax -= a_res * vx / speed
+        ay -= a_res * vy / speed
+    return ax, ay, vx, vy
+
+
 def _path_total_len(path: Path) -> float:
     """Total polyline arc length (wrap segment included when closed) —
     the same total PathFollower normalizes path_s_mm against."""
@@ -87,6 +113,7 @@ def simulate_path_following(
     warp_bias_roll_deg: float = 0.0,
     warp_bias_pitch_deg: float = 0.0,
     integral_enabled: bool = True,
+    roll_resist_deg: float = 0.06,
 ) -> SimResult:
     """Run the closed loop for duration_s at hz steps/s; return metrics.
 
@@ -169,6 +196,14 @@ def simulate_path_following(
         d_roll = -warp_c_deg_per_mm * y + warp_bias_roll_deg
         ax = G_EFF * (pitch_cmd - d_pitch)
         ay = -G_EFF * (roll_cmd - d_roll)
+        # Rolling resistance (Coulomb-style, roll_resist_deg equivalent
+        # tilt): a slow ball under a net tilt inside the resistance cone
+        # STICKS — without this, no ball can ever rest and every rest
+        # conclusion the sim draws is wrong (a 0.02 deg residual would
+        # accelerate a frictionless ball off the plate).
+        ax, ay, vx, vy = _apply_rolling_resistance(
+            ax, ay, vx, vy, roll_resist_deg
+        )
         vx += ax * dt
         vy += ay * dt
         x += vx * dt

@@ -417,38 +417,41 @@ class TestRestModeIntegration:
         assert terms["roll_cmd"] == pytest.approx(0.5)
         assert terms["pitch_cmd"] == pytest.approx(-0.5)
 
-    def test_integral_keeps_integrating_during_rest_and_moves_output(self) -> None:
-        # I-term rework composition: rest-radius errors (<= 8 mm) sit
-        # inside the integral's full-integration band, so a resting ball
-        # still feeds the integral, and because the resting command is
-        # level + trim + I, every integral step keeps walking the
-        # platform (the rest mode is now an accurate trim-server).
+    def test_rest_waits_for_integral_settle_then_serves_trim(self) -> None:
+        # I-term rework composition: resting parks the output at
+        # trim + I with P and D dropped, so rest must WAIT until the
+        # integral is flat (|dI/dt| under REST_I_RATE_MAX_DEG_S) — a
+        # still-converging I is not an equilibrium and limit-cycles
+        # (sim-caught). Once flat, rest engages and its command is
+        # trim + I exactly.
         clock = _FakeClock(50.0)
         ctrl = self._rest_controller(clock, kd=0.0, auto_trim_enabled=True)
         ctrl.set_target(0.0, 0.0)
-        state = _state(x=5.0)  # settled 5 mm off target, zero velocity
 
-        # 3 s dwell: rest enters after its 0.5 s hold; the integral has
-        # been walking from the second frame (no gates).
+        # Ball parked 5 mm off: the integral walks at ~0.14 deg/s —
+        # far above the settle threshold. Rest must NOT engage no
+        # matter how long the ball sits quiet.
+        state = _state(x=5.0)
+        terms: dict = {}
+        for _ in range(30):
+            clock.advance(0.1)
+            _, _, terms = ctrl.compute_with_terms(state)
+        assert terms["i_term"][0] < 0.0
+        assert terms["i_rate_deg_s"] > 0.02
+        assert terms["rest_mode_active"] is False
+
+        # Ball now essentially AT target (0.4 mm — the leak-equilibrium
+        # zone): the integral rate falls under the threshold, rest
+        # engages after its own hold, and the resting output is
+        # trim + integral (pitch contribution = i_x).
+        state = _state(x=0.4)
         for _ in range(30):
             clock.advance(0.1)
             _, pitch, terms = ctrl.compute_with_terms(state)
+        assert terms["i_rate_deg_s"] <= 0.02
         assert terms["rest_mode_active"] is True
-        assert terms["i_term"][0] < 0.0
-        # Trim store untouched; the walking is all integral.
+        # Trim store untouched; the leveling is all integral.
         assert terms["pitch_offset"] == 0.0
-        # Resting output follows trim + integral (pitch contrib = i_x).
-        assert pitch == pytest.approx(
-            terms["pitch_offset"] + terms["i_term"][0], abs=0.02
-        )
-        pitch_before = float(pitch)
-
-        # Keep resting: the integral keeps walking, the output walks too.
-        for _ in range(20):
-            clock.advance(0.1)
-            _, pitch, terms = ctrl.compute_with_terms(state)
-        assert terms["rest_mode_active"] is True
-        assert pitch < pitch_before
         assert pitch == pytest.approx(
             terms["pitch_offset"] + terms["i_term"][0], abs=0.02
         )
@@ -532,12 +535,16 @@ class TestRestHomeCalExclusion:
             )
         assert terms["rest_state"] == "active"
         assert terms["rest_mode_active"] is False
-        # After calibration ends, rest can engage again.
+        # After calibration ends, rest can engage again. Ball essentially
+        # AT target (0.3 mm): the integral rate is flat (a synthetic ball
+        # parked at 1 mm never converges — it can't move — which would
+        # hold the I-settle entry gate open forever; a real ball closes
+        # the loop).
         ctrl.cancel_home_calibration()
         for _ in range(60):
             clock.advance(1.0 / 30.0)
             _, _, terms = ctrl.compute_with_terms(
-                BallState(x_mm=1.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+                BallState(x_mm=0.3, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
             )
         assert terms["rest_mode_active"] is True
 

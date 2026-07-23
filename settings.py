@@ -175,6 +175,14 @@ PD_I_LIMIT_HOME_CAL_DEG = 6.0        # home-cal absorbs a whole bad trim
 PD_I_LEAK_TAU_S = 25.0               # steady-state cost ~0.5 mm
 PD_I_ERR_FULL_MM = 25.0              # full integration at/below
 PD_I_ERR_ZERO_MM = 60.0              # zero integration at/above (linear)
+# Rest may only engage once the integral is flat (|dI/dt| EMA under
+# this). Resting parks the output at trim + I with P and D dropped —
+# resting on a still-converging integral is not an equilibrium and
+# limit-cycles at ~0.2 Hz (sim-caught during the rework; the same
+# structural cycle the old gated trim produced as the stale-trim
+# "rocking"). At convergence the net rate is ~0 (integration balances
+# leak), far under this threshold.
+REST_I_RATE_MAX_DEG_S = 0.02
 
 # =============================================================================
 # Near-target rest mode (control/rest_gate.py)

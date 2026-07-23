@@ -42,6 +42,7 @@ from settings import (
     PD_I_LIMIT_DEG,
     PD_I_LIMIT_HOME_CAL_DEG,
     PD_MAX_TILT_RATE_DEG_S,
+    REST_I_RATE_MAX_DEG_S,
     REST_MODE_ENABLED,
 )
 
@@ -415,7 +416,26 @@ class BallController:
         path_following = (
             self._path_follower.active and not self._path_follower.done
         )
-        if self.home_calibration_active or path_following:
+        # Rest ENTRY additionally requires the INTEGRAL settled: resting
+        # parks the output at trim + I with P and D dropped, so entering
+        # rest on a still-converging I is not an equilibrium — the ball
+        # drifts out, rest exits, full PID snaps it back, forever
+        # (~0.2 Hz limit cycle, sim-caught). Once |dI/dt| is flat,
+        # trim + I IS the equilibrium and rest is stable. ENTRY-only:
+        # while already resting, small integral walks are the benign
+        # trim-server behavior (the resting output tracks trim + I) and
+        # forcing exit on them just flaps the gate — exit stays
+        # radius/speed-based inside RestGate.
+        integral_blocks_entry = (
+            not integral_frozen
+            and self._rest_gate.state != STATE_RESTING
+            and self._pd.i_rate_deg_s > REST_I_RATE_MAX_DEG_S
+        )
+        if (
+            self.home_calibration_active
+            or path_following
+            or integral_blocks_entry
+        ):
             # Home calibration needs ACTIVE PID driving the ball to center
             # while the integral absorbs the bias — resting with the ball
             # parked off-center would slow convergence (observed on the
@@ -446,10 +466,16 @@ class BallController:
             else None
         )
 
+        # While RESTING the integral is frozen too: rest entry already
+        # required it flat, and an integrator acting on an undamped
+        # parked ball (P and D dropped) is structurally unstable — the
+        # sim shows a slow oscillation building until the exit gates
+        # trip. Freezing also pauses the leak, so a long rest cannot
+        # drain a learned correction and force a wake to re-learn it.
         res = self._pd.compute(
             pos_vec_x, pos_vec_y, vx, vy, self.roll_offset, self.pitch_offset,
             slew_target_override=rest_override,
-            freeze_integrator=integral_frozen,
+            freeze_integrator=integral_frozen or resting,
             i_limit_override=(
                 PD_I_LIMIT_HOME_CAL_DEG
                 if self.home_calibration_active
@@ -476,6 +502,7 @@ class BallController:
             "i_sat_y": 1.0 if res.i_sat[1] else 0.0,
             "i_atten": res.i_atten,
             "i_frozen": res.i_frozen,
+            "i_rate_deg_s": self._pd.i_rate_deg_s,
             **self._trim.telemetry(self.auto_trim_enabled),
             "rest_state": rest_state,
             "rest_mode_active": resting,

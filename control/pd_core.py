@@ -87,6 +87,13 @@ class PDCore:
         self._i_x = 0.0
         self._i_y = 0.0
         self._i_prev_time: float | None = None
+        # EMA (~0.3 s) of the NET integral rate |dI/dt| (integration +
+        # leak combined — zero at the leak equilibrium even though both
+        # terms are nonzero). RestGate uses it: rest may only engage
+        # once the integral is flat, because resting parks the output at
+        # trim + I with P and D dropped — resting on a still-moving I is
+        # not an equilibrium and limit-cycles (sim-caught).
+        self._i_rate_ema = 0.0
 
     def reset_motion_state(self) -> None:
         """Clear slew state (tracking loss/reacquire). The integral is
@@ -100,6 +107,12 @@ class PDCore:
         self._i_x = 0.0
         self._i_y = 0.0
         self._i_prev_time = None
+        self._i_rate_ema = 0.0
+
+    @property
+    def i_rate_deg_s(self) -> float:
+        """Smoothed |dI/dt| (net of leak). ~0 when converged or frozen."""
+        return self._i_rate_ema
 
     @property
     def i_pitch_contrib(self) -> float:
@@ -234,6 +247,9 @@ class PDCore:
         span = max(1e-6, self.i_err_zero_mm - self.i_err_full_mm)
         weight = _clamp((self.i_err_zero_mm - err_mag) / span, 0.0, 1.0)
         if self.ki <= 0.0 or freeze:
+            # No motion this step: the rate estimate decays toward zero
+            # (fixed ~0.3 s factor at the nominal 30 Hz cadence).
+            self._i_rate_ema *= 0.9
             return weight
 
         now = self._clock()
@@ -245,6 +261,8 @@ class PDCore:
             return weight
         dt = _clamp(now - self._i_prev_time, 1e-4, 0.1)
         self._i_prev_time = now
+        i_x_before = self._i_x
+        i_y_before = self._i_y
 
         # Provisional raw commands with the CURRENT integral decide the
         # anti-windup directions for this step.
@@ -283,6 +301,14 @@ class PDCore:
         )
         self._i_x = _clamp(self._i_x, -i_limit, i_limit)
         self._i_y = _clamp(self._i_y, -i_limit, i_limit)
+
+        # Net rate EMA (post-leak, post-clamp): ~0 at the leak
+        # equilibrium and while parked at the limit.
+        di_x = self._i_x - i_x_before
+        di_y = self._i_y - i_y_before
+        rate = ((di_x * di_x + di_y * di_y) ** 0.5) / dt
+        alpha = _clamp(dt / 0.3, 0.0, 1.0)
+        self._i_rate_ema += alpha * (rate - self._i_rate_ema)
         return weight
 
     def _apply_slew_limit(self, roll: float, pitch: float) -> tuple[float, float]:

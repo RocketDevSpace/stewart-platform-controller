@@ -80,6 +80,7 @@ TERMS_KEYS = frozenset({
     "i_sat_y",
     "i_atten",
     "i_frozen",
+    "i_rate_deg_s",
     # Near-target rest mode (perf pass, 2026-07-22): keys ADDED to the
     # frozen contract — additions are allowed (the GUI ignores unknown
     # keys); removals/renames of anything above remain forbidden.
