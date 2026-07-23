@@ -23,7 +23,7 @@ pip install -r requirements.txt
 `settings.py` holds the committed, neutral defaults — **don't edit it for your
 machine.** Per-machine values live in `user_settings.json` in the repo root: a
 plain JSON file, untracked by git, holding overrides for a whitelisted set of
-12 keys (serial port, camera index, roll/pitch trims, PD gains, and the six
+13 keys (serial port, camera index, roll/pitch trims, PID gains, and the six
 HSV thresholds — see `OVERRIDABLE_KEYS` in `settings_store.py`). Nothing is
 created automatically on first run; without the file the defaults apply.
 

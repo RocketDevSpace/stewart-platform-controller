@@ -17,7 +17,7 @@ PyQt5 desktop app controlling a 6-DOF Stewart platform via Arduino serial. Inclu
 main.py                # entry point — repo-root-relative imports; excepthook → emergency shutdown. ✅
 config.py              # physical geometry constants only. NOT runtime config.
 settings.py            # runtime config: port, baud, intervals, safety limits. Neutral committed defaults; applies the user_settings.json overlay at import. ✅
-settings_store.py      # per-machine settings overlay: 12-key whitelist, atomic JSON writes. ✅
+settings_store.py      # per-machine settings overlay: 13-key whitelist, atomic JSON writes. ✅
 user_settings.json     # untracked per-machine overrides (port, camera, trims, gains, HSV). Written by the GUI save-trim button or by hand.
 conftest.py            # pytest path shim.
 setup.cfg              # flake8 + mypy config. Exclude lists now EMPTY — every module checked.
@@ -33,11 +33,11 @@ hardware/
 
 control/
   routine_runner.py    # routine playback state machine. No Qt deps. ✅
-  ball_controller.py   # PD controller facade over the four modules below. ✅
+  ball_controller.py   # PID controller facade over the modules below. ✅
   setpoint.py          # SetpointArbiter — single owner of the ball target setpoint. ✅
-  auto_trim.py         # AutoTrim — single writer of roll/pitch trim offsets + integral correction. ✅
+  trim_store.py        # TrimStore — persistent trim offsets: manual writes, reset, integral fold. Pure store, no integrator (I-term rework). ✅
   autotune.py          # PDAutotuner — autotune state machine + per-leg step evaluator. ✅
-  pd_core.py           # PDCore — pure PD math: d-term cap, tilt clamp, slew limiter. ✅
+  pid_core.py          # PIDCore — pure PID math: d-term cap, true integral (taper/leak/anti-windup — the loop's ONLY integral action), tilt clamp, slew limiter. ✅
   pose_commander.py    # PoseCommander — GUI-facing Pose→IK→servo facade (zero IK in gui/). ✅
   rest_gate.py         # RestGate — near-target rest mode: hold level+trim when ball is centered and slow; hysteretic same-cycle exit. ✅
   patterns.py          # Path dataclass + pattern generators (circle/square/heart/star/from_points); PATTERNS registry. Pure math. ✅
@@ -47,7 +47,7 @@ cv/
   camera_source.py     # camera lifecycle: backend probe, capture thread, exposure policy, software gain, frame callback. ✅
   ball_tracker.py      # pure detection: ArUco homography + HSV blob → BallState. No camera, no threads. ✅
   measurement_filter.py  # pure position/velocity filtering (modes: adaptive alpha_beta / legacy / raw); bench-importable. ✅
-  vision_control_worker.py  # owns CameraSource + BallTracker + BallController; vision/PD/IK loop in a QThread. ✅
+  vision_control_worker.py  # owns CameraSource + BallTracker + BallController; vision/PID/IK loop in a QThread. ✅
 
 routines/              # pure pose-list generators.
 visualization/
@@ -61,7 +61,7 @@ gui/
 firmware/              # Arduino side: v2 sketch + v2 flash dump (current ground truth), v1 dump (rollback) + reconstructed v1 sketch, wiring_check.py bench utility, README (pin map + protocols).
   stewart_platform_uno_v2/  # firmware v2 source: T tenth-degree protocol + bit-compatible legacy S, 250000 baud, "[READY v2]" banner.
 tools/
-  jitter_bench.py      # headless A/B bench: synthetic/CSV ball motion through the real filter→PD→IK→servo chain; flip/send/d-term metrics.
+  jitter_bench.py      # headless A/B bench: synthetic/CSV ball motion through the real filter→PID→IK→servo chain; flip/send/d-term metrics.
   latency_bench.py     # on-rig serial command→ack RTT percentiles through the real ServoDriver path.
   camera_probe.py      # on-rig fps × exposure sweep; measures real frame period/brightness, recommends a config.
   path_sim.py          # closed-loop path-following feasibility sim: point-mass plant driven by the REAL filter→controller chain; CLI speed sweep.
@@ -93,7 +93,9 @@ tests/                 # test_safety, test_serial_manager, test_servo_driver, te
 
 **2026-07-22 performance pass** (branch `perf/latency-jitter`, stacked on the overhaul): six measured steps against control-chain latency and servo jitter, every change gated by `tools/jitter_bench.py` A/B numbers. Shipped: Schmitt-trigger quantizer + command dedup in `servo_driver`; adaptive alpha-beta measurement filter (`cv/measurement_filter.py`) + every-frame sub-pixel ArUco homography; near-target rest mode (`control/rest_gate.py`); firmware v2 (tenth-degree `T` protocol at 250000 baud, terse ack, hybrid T/S host dispatch); event-driven frame processing (capture callback instead of the poll grid). Headline numbers: rest-state servo commands 6125 integer flips/min → 0 (one send per 30 s at rest); serial RTT 57 → 4.4 ms p50; camera stays at 30 fps (hardware-capped ~31 fps — the 60 fps experiment is closed). See `firmware/README.md` for the v2 protocol and the `[Perf]` commits for step-by-step evidence.
 
-**2026-07-22 path following** (branch `feat/path-following`, stacked on the perf pass): the ball traces virtual patterns (circle/square/heart/star/arbitrary via `from_points`) drawn as overlays in the vision monitor — no physical lines, no camera line detection. `control/path_follower.py` drives the SetpointArbiter **override channel** (autotune's channel — mutually exclusive by contract) from inside `compute_with_terms`; streaming `set_target` was rejected because its per-call side effects would permanently reset the rest gate and freeze auto-trim. Adaptive pacing: the target advances at the set speed (default 30 mm/s) tapered to zero as ball-to-target error grows from 10 to 20 mm — infeasible speeds degrade to slower laps, never to losing the ball (property pinned by `tests/test_path_feasibility.py` against the `tools/path_sim.py` closed-loop sim). Auto-trim is frozen while the target advances (pursuit lag is not a level error) but thaws during a full stall so the trim integrator — the system's only integral action — can pull the ball back inside the capture radius (rig-observed failure otherwise: standing trim offset ≥ capture radius pins the follower at the seed point forever); rest mode is force-suppressed while following.
+**2026-07-22 path following** (branch `feat/path-following`, stacked on the perf pass): the ball traces virtual patterns (circle/square/heart/star/arbitrary via `from_points`) drawn as overlays in the vision monitor — no physical lines, no camera line detection. `control/path_follower.py` drives the SetpointArbiter **override channel** (autotune's channel — mutually exclusive by contract) from inside `compute_with_terms`; streaming `set_target` was rejected because its per-call side effects would permanently reset the rest gate and freeze auto-trim. Adaptive pacing: the target advances at the set speed (default 30 mm/s) tapered to zero as ball-to-target error grows from 10 to 20 mm — infeasible speeds degrade to slower laps, never to losing the ball (property pinned by `tests/test_path_feasibility.py` against the `tools/path_sim.py` closed-loop sim). Standing offsets along the path are cancelled by the PDCore integral (see the I-term rework below); rest mode is force-suppressed while following.
+
+**2026-07-23 I-term rework** (branch `rework/integral-trim`, stacked on path following): the gated AutoTrim position-error integrator was deleted after a rig session traced four field failures to it (home-cal stalls, rest rocking, the path deadlock, and a measured 1.2 Hz burst limit cycle — 200 movement bursts in 206 s — from its settle gates sitting mid-oscillation). The controller is now a true PID: `pd_core.py` owns a continuous integral (error-taper 25→60 mm replaces the settle gates, per-axis directional anti-windup at the tilt clamp, 25 s leak, ±1.5° clamp — 6° during home-cal) that tracks the plate's position-dependent tilt field (rig-measured: ~0.36° more compensation needed at r=65 than center). `trim_store.py` is a pure store: manual offsets + `fold()` (integral → persistent trim). Home calibration auto-completes: the controller watches for a flat integral with the ball slow and near center (the radius gate refuses to fold saturated windup), folds, and the GUI auto-saves via the transient `home_cal_event` terms entry — the Save Trim button routes through the same fold path. Rest interlocks (both sim-caught): rest ENTRY requires the integral flat (`i_rate_deg_s` under `REST_I_RATE_MAX_DEG_S`), and the integral FREEZES while resting — an integrator on an undamped parked ball is structurally unstable. The sim plant gained the measured warp field and Coulomb rolling resistance (a frictionless ball can never rest, so rest conclusions from the old plant were untrustworthy); `tests/test_path_feasibility.py` pins the deadlock reproduction (integral off: 0 laps) and the recovery (integral on, same field: laps at ~99% of commanded speed). Autotune freezes the integral for the session (derived from `autotuner.enabled` — no flag stash). The terms contract was amended (dated): 23 `auto_trim_*` keys removed, `i_*`/`home_cal_*` keys added, `auto_trim_enabled` now means "integral enabled" (default ON via `PD_I_ENABLED`).
 
 **Still open after the overhaul:**
 - Hardware smoke tests gate the PR — the overhaul is not merged until manual tests with the Arduino pass.

@@ -43,7 +43,7 @@ from gui.vision_monitor import VisionMonitorWindow
 from hardware.serial_manager import SerialManager
 from hardware.servo_driver import ServoDriver
 from settings import (
-    AUTO_TRIM_ENABLED,
+    PD_I_ENABLED,
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
     CAMERA_INDEX,
@@ -55,6 +55,7 @@ from settings import (
     MAX_TILT_DEG,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
+    PD_DEFAULT_KI,
     PD_DEFAULT_KP,
     SERIAL_BAUD,
     SERIAL_PORT,
@@ -73,12 +74,14 @@ class MainWindow(QWidget):
 
     # Routed to VisionControlWorker (connected when worker starts)
     vision_gains_updated = QtCore.pyqtSignal(float, float)
+    vision_ki_updated = QtCore.pyqtSignal(float)
     vision_hsv_updated = QtCore.pyqtSignal(int, int, int, int, int, int)
     vision_target_updated = QtCore.pyqtSignal(float, float)
     vision_trim_updated = QtCore.pyqtSignal(float, float)
     vision_z_updated = QtCore.pyqtSignal(float)
     vision_auto_trim_enabled = QtCore.pyqtSignal(bool)
     vision_trim_reset_requested = QtCore.pyqtSignal()
+    vision_trim_fold_requested = QtCore.pyqtSignal()
     vision_calibrate_home_set = QtCore.pyqtSignal(bool)
     vision_pd_autotune_enabled = QtCore.pyqtSignal(bool)
     vision_pd_autotune_auto_apply = QtCore.pyqtSignal(bool)
@@ -143,11 +146,12 @@ class MainWindow(QWidget):
         # Mirror of control_panel settings (for routing to worker)
         self._kp = PD_DEFAULT_KP
         self._kd = PD_DEFAULT_KD
+        self._ki = PD_DEFAULT_KI
         self._target_x_mm = float(BALL_TARGET_DEFAULT_X_MM)
         self._target_y_mm = float(BALL_TARGET_DEFAULT_Y_MM)
         self._trim_roll_deg = float(MANUAL_ROLL_TRIM_DEG)
         self._trim_pitch_deg = float(MANUAL_PITCH_TRIM_DEG)
-        self._auto_trim_enabled = bool(AUTO_TRIM_ENABLED)
+        self._auto_trim_enabled = bool(PD_I_ENABLED)
         self._home_calibration_active = False
         self._last_home_calib_diag_ts = 0.0
         self._pd_autotune_enabled = False
@@ -179,6 +183,7 @@ class MainWindow(QWidget):
         self.control_panel.vision_toggled.connect(self._on_vision_toggled)
         self.control_panel.kp_changed.connect(self._on_kp_changed)
         self.control_panel.kd_changed.connect(self._on_kd_changed)
+        self.control_panel.ki_changed.connect(self._on_ki_changed)
         self.control_panel.raw_command_sent.connect(self._on_raw_command_sent)
 
         # ControlPanel — new vision-control signals
@@ -429,10 +434,16 @@ class MainWindow(QWidget):
     def _on_kp_changed(self, kp: float) -> None:
         self._kp = kp
         self.vision_gains_updated.emit(self._kp, self._kd)
+        self.vision_ki_updated.emit(self._ki)
+
+    def _on_ki_changed(self, ki: float) -> None:
+        self._ki = float(ki)
+        self.vision_ki_updated.emit(self._ki)
 
     def _on_kd_changed(self, kd: float) -> None:
         self._kd = kd
         self.vision_gains_updated.emit(self._kp, self._kd)
+        self.vision_ki_updated.emit(self._ki)
 
     def _on_target_changed(self, x_mm: float, y_mm: float) -> None:
         self._target_x_mm = x_mm
@@ -519,18 +530,59 @@ class MainWindow(QWidget):
         )
 
     def _on_save_trim_as_default(self) -> None:
-        roll = self._trim_roll_deg
-        pitch = self._trim_pitch_deg
+        # With the vision loop running, route through the worker: the
+        # controller folds the live integral into the trim store and
+        # reports the folded values via a home_cal_event, which
+        # _handle_home_cal_event persists (one save code path with
+        # home-cal auto-complete). Without a worker there is no
+        # integral — save the GUI mirrors directly.
+        if self._vision_enabled and self._vision_worker is not None:
+            self.vision_trim_fold_requested.emit()
+            self.control_panel.append_preview(
+                "[TRIM] folding integral into trim…"
+            )
+            return
+        self._save_trim_values(self._trim_roll_deg, self._trim_pitch_deg,
+                               source="manual")
+
+    def _save_trim_values(
+        self, roll: float, pitch: float, source: str
+    ) -> None:
         try:
             settings_store.save_user_overrides({
                 "MANUAL_ROLL_TRIM_DEG": float(roll),
                 "MANUAL_PITCH_TRIM_DEG": float(pitch),
             })
             self.control_panel.append_preview(
-                f"[TRIM] saved roll={roll:.2f}° pitch={pitch:.2f}° to user_settings.json"
+                f"[TRIM] saved roll={roll:.2f}° pitch={pitch:.2f}° "
+                f"to user_settings.json ({source})"
             )
         except OSError as exc:
             self.control_panel.append_preview(f"[TRIM] save failed: {exc}")
+
+    def _handle_home_cal_event(self, event: dict) -> None:
+        """Transient controller event: home-cal completed/timeout, or a
+        Save-Trim fold. Completed/saved carry the freshly folded trim —
+        persist THOSE values (the GUI mirror can be a frame stale)."""
+        kind = str(event.get("type", ""))
+        if kind in ("completed", "saved"):
+            roll = float(event.get("roll", 0.0))
+            pitch = float(event.get("pitch", 0.0))
+            self._trim_roll_deg = roll
+            self._trim_pitch_deg = pitch
+            self.control_panel.sync_trim(roll, pitch)
+            if kind == "completed":
+                self.control_panel.append_preview(
+                    "[AUTO HOME] converged — integral folded into trim"
+                )
+            self._save_trim_values(
+                roll, pitch,
+                source="home-cal" if kind == "completed" else "fold",
+            )
+        elif kind == "timeout":
+            self.control_panel.append_preview(
+                "[AUTO HOME] timed out without converging — nothing saved"
+            )
 
     def _on_autotune_enable_clicked(self, enabled: bool) -> None:
         self._pd_autotune_enabled = enabled
@@ -538,7 +590,7 @@ class MainWindow(QWidget):
             self._pd_autotune_auto_apply = False
             self._pd_autotune_has_suggestion = False
             self.control_panel.sync_autotune_buttons(False, False)
-            self.control_panel.append_preview("[PD TUNE] disabled")
+            self.control_panel.append_preview("[PID TUNE] disabled")
         else:
             # Path following released — autotune owns the target while it
             # steps (the controller enforces this anyway — belt and braces).
@@ -546,14 +598,14 @@ class MainWindow(QWidget):
             self.control_panel.sync_path_button(False)
             self.vision_path_following_set.emit(False)
             self._vision_monitor.set_path_overlay(None)
-            self.control_panel.append_preview("[PD TUNE] enabled")
+            self.control_panel.append_preview("[PID TUNE] enabled")
         self.vision_pd_autotune_enabled.emit(enabled)
         self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
 
     def _on_autotune_apply_clicked(self) -> None:
         if not self._pd_autotune_has_suggestion:
             self.control_panel.append_preview(
-                "[PD TUNE] no recommendation available yet"
+                "[PID TUNE] no recommendation available yet"
             )
             return
         self.vision_pd_autotune_apply.emit()
@@ -569,12 +621,12 @@ class MainWindow(QWidget):
             self._pd_autotune_enabled = True
             self._pd_autotune_has_suggestion = False
             self.control_panel.sync_autotune_buttons(True, True)
-            self.control_panel.append_preview("[PD TUNE] auto-apply started")
+            self.control_panel.append_preview("[PID TUNE] auto-apply started")
         else:
             self._pd_autotune_enabled = False
             self._pd_autotune_has_suggestion = False
             self.control_panel.sync_autotune_buttons(False, False)
-            self.control_panel.append_preview("[PD TUNE] auto-apply stopped")
+            self.control_panel.append_preview("[PID TUNE] auto-apply stopped")
         self.vision_pd_autotune_enabled.emit(self._pd_autotune_enabled)
         self.vision_pd_autotune_auto_apply.emit(enabled)
 
@@ -731,6 +783,7 @@ class MainWindow(QWidget):
 
         # Route GUI signals to worker slots
         self.vision_gains_updated.connect(self._vision_worker.set_gains)
+        self.vision_ki_updated.connect(self._vision_worker.set_ki)
         self.vision_hsv_updated.connect(self._vision_worker.set_hsv)
         self.vision_target_updated.connect(self._vision_worker.set_target)
         self.vision_trim_updated.connect(self._vision_worker.set_trim)
@@ -739,6 +792,7 @@ class MainWindow(QWidget):
             self._vision_worker.set_auto_trim_enabled
         )
         self.vision_trim_reset_requested.connect(self._vision_worker.reset_trim)
+        self.vision_trim_fold_requested.connect(self._vision_worker.fold_trim)
         self.vision_calibrate_home_set.connect(
             self._vision_worker.set_home_calibration
         )
@@ -768,6 +822,7 @@ class MainWindow(QWidget):
 
         # Push current GUI state to worker
         self.vision_gains_updated.emit(self._kp, self._kd)
+        self.vision_ki_updated.emit(self._ki)
         self.vision_target_updated.emit(self._target_x_mm, self._target_y_mm)
         self.vision_trim_updated.emit(self._trim_roll_deg, self._trim_pitch_deg)
         self.vision_z_updated.emit(self._vision_z_setpoint)
@@ -789,6 +844,7 @@ class MainWindow(QWidget):
         # Disconnect routed signals to avoid stale calls after stop
         for sig, slot in [
             (self.vision_gains_updated, self._vision_worker.set_gains),
+            (self.vision_ki_updated, self._vision_worker.set_ki),
             (self.vision_hsv_updated, self._vision_worker.set_hsv),
             (self.vision_target_updated, self._vision_worker.set_target),
             (self.vision_trim_updated, self._vision_worker.set_trim),
@@ -796,6 +852,7 @@ class MainWindow(QWidget):
             (self.vision_auto_trim_enabled,
              self._vision_worker.set_auto_trim_enabled),
             (self.vision_trim_reset_requested, self._vision_worker.reset_trim),
+            (self.vision_trim_fold_requested, self._vision_worker.fold_trim),
             (self.vision_calibrate_home_set,
              self._vision_worker.set_home_calibration),
             (self.vision_pd_autotune_enabled,
@@ -978,21 +1035,27 @@ class MainWindow(QWidget):
             tune_evt = terms.get("pd_autotune_event")
             if tune_evt:
                 self.control_panel.append_preview(
-                    f"[PD TUNE] {tune_evt.get('message', '')}"
+                    f"[PID TUNE] {tune_evt.get('message', '')}"
                 )
 
-            # Home calibration diagnostics every 0.5 s
+            # Home-cal completion / Save-Trim fold events (transient)
+            home_evt = terms.get("home_cal_event")
+            if home_evt:
+                self._handle_home_cal_event(home_evt)
+
+            # Home calibration diagnostics every 0.5 s (I-term rework:
+            # progress = the integral converging, then a flat window)
             if self._home_calibration_active:
                 now_diag = time.perf_counter()
                 if (now_diag - self._last_home_calib_diag_ts) >= 0.5:
                     self._last_home_calib_diag_ts = now_diag
+                    i_term = terms.get("i_term", (0.0, 0.0))
                     self.control_panel.append_preview(
                         "[AUTO HOME] "
-                        f"state={terms.get('auto_trim_state', 'n/a')} "
-                        f"gate={terms.get('auto_trim_gate_reason', 'n/a')} "
                         f"elapsed={terms.get('home_calibration_elapsed_s', 0.0):.1f}s "
-                        f"settled={terms.get('trim_settled_s', 0.0):.2f}/"
-                        f"{terms.get('auto_trim_hold_s', 0.0):.2f}s "
+                        f"i=({i_term[0]:+.3f},{i_term[1]:+.3f})° "
+                        f"rate={terms.get('i_rate_deg_s', 0.0):.3f}°/s "
+                        f"flat={terms.get('home_cal_converge_s', 0.0):.1f}/2.0s "
                         f"trim=(r{terms.get('roll_offset', 0.0):+.3f},"
                         f"p{terms.get('pitch_offset', 0.0):+.3f})"
                     )

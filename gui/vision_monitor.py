@@ -214,7 +214,7 @@ def _draw_warped_overlays(
         legend = [
             ("disp", _DISP_COLOR),
             ("vel", _VEL_COLOR),
-            ("PD", _PD_COLOR),
+            ("PID", _PD_COLOR),
         ]
         for i, (lbl, col) in enumerate(legend):
             lx = w - 70
@@ -230,7 +230,7 @@ def _draw_warped_overlays(
         if control_terms is not None:
             pd = control_terms.get("pd_vec")
             if pd is not None:
-                pd_txt = f"PD ({pd[0]:+.2f}, {pd[1]:+.2f}) deg"
+                pd_txt = f"PID ({pd[0]:+.2f}, {pd[1]:+.2f}) deg"
         lines = [
             f"pos ({ball_state.x_mm:+.1f}, {ball_state.y_mm:+.1f}) mm",
             f"vel ({ball_state.vx_mm_s:+.0f}, {ball_state.vy_mm_s:+.0f}) mm/s",

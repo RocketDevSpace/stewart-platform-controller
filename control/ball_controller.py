@@ -4,41 +4,64 @@ control/ball_controller.py
 BallController — facade over the decomposed ball-balancing controller
 (M10). Constructs and coordinates the four components:
 
-  SetpointArbiter (control/setpoint.py)   target ownership + change time
-  PDCore          (control/pd_core.py)    PD math, d-cap, tilt clamp, slew
-  AutoTrim        (control/auto_trim.py)  trim offsets + slow integrator
-  PDAutotuner     (control/autotune.py)   step-test gain tuning sessions
+  SetpointArbiter (control/setpoint.py)    target ownership + change time
+  PIDCore          (control/pid_core.py)     PID math, d-cap, integral,
+                                           tilt clamp, slew
+  TrimStore       (control/trim_store.py)  persistent trim offsets
+  PDAutotuner     (control/autotune.py)    step-test gain tuning sessions
 
-The public method surface and the compute_with_terms terms-dict contract
-are unchanged from the pre-decomposition monolith (the GUI reads those
-keys — they are frozen, see tests/test_ball_controller_characterization).
+Integral action lives INSIDE PIDCore (2026-07-23 I-term rework — the old
+gated AutoTrim integrator is gone). The `auto_trim_enabled` name is kept
+on the facade as the integral-enable flag so the worker/GUI surface is
+unchanged; the terms-dict contract was amended in the same rework (see
+tests/test_ball_controller_characterization for the dated removal list).
 """
 import math
 import time
+from collections import deque
 from collections.abc import Callable
 
-from control.auto_trim import AutoTrim
 from control.autotune import PDAutotuner
 from control.path_follower import PathFollower
 from control.patterns import Path
-from control.pd_core import PDCore
+from control.pid_core import PIDCore
 from control.rest_gate import STATE_RESTING, RestGate
 from control.setpoint import SetpointArbiter
+from control.trim_store import TrimStore
 from core.platform_state import BallState
 from settings import (
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
+    CONTROL_PREDICT_S,
+    HOME_CAL_CONVERGE_EPS_DEG,
+    HOME_CAL_CONVERGE_MAX_RADIUS_MM,
+    HOME_CAL_CONVERGE_MAX_SPEED_MM_S,
+    HOME_CAL_CONVERGE_WINDOW_S,
+    HOME_CAL_TIMEOUT_S,
     PD_DEFAULT_KD,
+    PD_DEFAULT_KI,
     PD_DEFAULT_KP,
+    PATH_FF_ENABLED,
+    PATH_FF_LOOKAHEAD_S,
+    PATH_FF_TILT_MAX_DEG,
+    PD_AUTOTUNE_G_EFF,
     PD_D_TERM_LIMIT_DEG,
+    PD_I_ENABLED,
+    PD_I_ERR_DEADBAND_MM,
+    PD_I_ERR_FULL_MM,
+    PD_I_ERR_ZERO_MM,
+    PD_I_LEAK_TAU_S,
+    PD_I_LIMIT_DEG,
+    PD_I_LIMIT_HOME_CAL_DEG,
     PD_MAX_TILT_RATE_DEG_S,
+    REST_I_RATE_MAX_DEG_S,
     REST_MODE_ENABLED,
 )
 
 
 class BallController:
     """
-    PD controller for ball balancing on Stewart platform.
+    PID controller for ball balancing on Stewart platform.
 
     Inputs:
         Ball position + velocity (mm, mm/s)
@@ -58,20 +81,27 @@ class BallController:
         d_term_limit_deg: float | None = PD_D_TERM_LIMIT_DEG,
         roll_offset: float = 0.0,
         pitch_offset: float = 0.0,
-        auto_trim_enabled: bool = False,
+        auto_trim_enabled: bool | None = None,
         rest_mode_enabled: bool | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        ki: float = PD_DEFAULT_KI,
     ) -> None:
         self.enabled = True
 
-        # PD math + d-cap + tilt clamp + slew limiter (FG-11)
-        self._pd = PDCore(
+        # PID math + d-cap + integral + tilt clamp + slew limiter
+        self._pd = PIDCore(
             kp=kp,
             kd=kd,
             max_tilt_deg=max_tilt_deg,
             max_tilt_rate_deg_s=max_tilt_rate_deg_s,
             d_term_limit_deg=d_term_limit_deg,
             clock=clock,
+            ki=ki,
+            i_limit_deg=PD_I_LIMIT_DEG,
+            i_leak_tau_s=PD_I_LEAK_TAU_S,
+            i_err_full_mm=PD_I_ERR_FULL_MM,
+            i_err_zero_mm=PD_I_ERR_ZERO_MM,
+            i_err_deadband_mm=PD_I_ERR_DEADBAND_MM,
         )
 
         # Target — owned by the arbiter (manual vs autotune override) (FG-9)
@@ -79,12 +109,19 @@ class BallController:
             float(BALL_TARGET_DEFAULT_X_MM), float(BALL_TARGET_DEFAULT_Y_MM), clock
         )
 
-        # Trim offsets + integrator + home-cal state (FG-9)
-        self._auto_trim = AutoTrim(roll_offset, pitch_offset, clock)
-        self.auto_trim_enabled = bool(auto_trim_enabled)
+        # Persistent trim offsets (I-term rework: a pure store — live
+        # leveling is the PIDCore integral). auto_trim_enabled is the
+        # integral-enable flag; the historical name is kept because the
+        # worker slots and GUI signals carry it.
+        self._trim = TrimStore(roll_offset, pitch_offset, clock)
+        self.auto_trim_enabled = (
+            bool(PD_I_ENABLED)
+            if auto_trim_enabled is None
+            else bool(auto_trim_enabled)
+        )
 
         # Near-target rest mode (perf pass) — parks the platform at
-        # level + trim once the ball has sat quietly at the target.
+        # level + trim + integral once the ball has sat quietly.
         self._rest_gate = RestGate(
             clock=clock,
             enabled=(
@@ -97,13 +134,18 @@ class BallController:
         # PD autotune state machine (FG-10)
         self._autotuner = PDAutotuner(self._arbiter, clock)
         self._autotuner.clear_suggestion(kp, kd)
-        # Auto-trim flag stashed while an autotune session runs; the
-        # stash/restore coordination stays here (single owner of the flag).
-        self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
 
         # Path following (feat/path): drives the arbiter override channel
         # (mutually exclusive with autotune, which owns the same channel).
         self._path_follower = PathFollower(clock)
+
+        # Home-cal convergence watching + fold events (I-term rework).
+        # The controller runs the detector because only it sees both the
+        # integral and the ball; the GUI persists the fold via the
+        # transient home_cal_event terms entry.
+        self._clock = clock
+        self._home_cal_i_history: deque[tuple[float, float, float]] = deque()
+        self._pending_trim_event: dict | None = None
 
     # ---------------------------
     # Delegated read-only state (telemetry code reads these)
@@ -119,15 +161,15 @@ class BallController:
 
     @property
     def roll_offset(self) -> float:
-        return self._auto_trim.roll_offset
+        return self._trim.roll_offset
 
     @property
     def pitch_offset(self) -> float:
-        return self._auto_trim.pitch_offset
+        return self._trim.pitch_offset
 
     @property
     def home_calibration_active(self) -> bool:
-        return self._auto_trim.home_calibration_active
+        return self._trim.home_calibration_active
 
     @property
     def pd_autotune_enabled(self) -> bool:
@@ -160,6 +202,14 @@ class BallController:
     @kd.setter
     def kd(self, value: float) -> None:
         self._pd.kd = float(value)
+
+    @property
+    def ki(self) -> float:
+        return self._pd.ki
+
+    @ki.setter
+    def ki(self, value: float) -> None:
+        self._pd.ki = float(value)
 
     @property
     def max_tilt_deg(self) -> float:
@@ -196,15 +246,25 @@ class BallController:
     # ---------------------------
 
     def set_trim(self, roll_offset_deg: float, pitch_offset_deg: float) -> None:
-        self._auto_trim.set_offsets(roll_offset_deg, pitch_offset_deg)
+        self._trim.set_offsets(roll_offset_deg, pitch_offset_deg)
 
     def reset_trim(self) -> None:
-        self._auto_trim.reset()
+        """Restore settings-default trim AND clear the learned integral —
+        the user asked for a known state."""
+        self._trim.reset()
+        self._pd.reset_integrator()
 
     def set_auto_trim_enabled(self, enabled: bool) -> None:
+        """Enable/disable integral action (the historical flag name).
+
+        Disabling FREEZES the integral in place (PIDCore holds the value,
+        leak paused) — toggling the feature off and on is
+        non-destructive. Home calibration cannot run without the
+        integral, so it cancels.
+        """
         self.auto_trim_enabled = bool(enabled)
         if not self.auto_trim_enabled:
-            self._auto_trim.cancel_home_calibration()
+            self._trim.cancel_home_calibration()
 
     def start_home_calibration(self) -> None:
         # Exclusion: calibration needs a stationary center target.
@@ -216,14 +276,91 @@ class BallController:
         self._arbiter.set_manual(
             float(BALL_TARGET_DEFAULT_X_MM), float(BALL_TARGET_DEFAULT_Y_MM)
         )
-        self._auto_trim.start_home_calibration()
+        self._home_cal_i_history.clear()
+        self._trim.start_home_calibration()
 
     def cancel_home_calibration(self) -> None:
-        self._auto_trim.cancel_home_calibration()
+        self._home_cal_i_history.clear()
+        self._trim.cancel_home_calibration()
+
+    def fold_integrator_into_trim(self) -> tuple[float, float]:
+        """Drain the integral into the persistent trim (zero net output
+        change: trim rises by exactly what the integral gave up). Returns
+        the new (roll, pitch) offsets for the caller to persist."""
+        return self._trim.fold(*self._pd.take_integrator())
+
+    def request_trim_fold(self) -> tuple[float, float]:
+        """Save-Trim path: fold now and flag a {"type": "saved"} event on
+        the next compute so the GUI (which owns the settings file)
+        persists the folded values, not a stale mirror."""
+        roll, pitch = self.fold_integrator_into_trim()
+        self._pending_trim_event = {
+            "type": "saved", "roll": float(roll), "pitch": float(pitch),
+        }
+        return roll, pitch
+
+    def _update_home_calibration(
+        self, radius_mm: float, speed_mm_s: float
+    ) -> None:
+        """Convergence watcher — runs each compute while calibrating.
+
+        Converged: the integral moved < HOME_CAL_CONVERGE_EPS_DEG per
+        axis over the trailing HOME_CAL_CONVERGE_WINDOW_S with the ball
+        slow AND near center -> fold + auto-complete
+        ({"type": "completed"}). The radius gate matters: a ball stuck
+        far away saturates the integral at the wide home-cal limit,
+        where it goes flat — fake flatness that would fold pure windup.
+        Timeout: cancel WITHOUT folding and DISCARD the integral
+        ({"type": "timeout"}) — whatever it accumulated in a failed
+        calibration is windup, not level knowledge.
+        """
+        now = self._clock()
+        if self._trim.home_calibration_elapsed_s > HOME_CAL_TIMEOUT_S:
+            self.cancel_home_calibration()
+            self._pd.reset_integrator()
+            self._pending_trim_event = {"type": "timeout"}
+            return
+
+        hist = self._home_cal_i_history
+        hist.append(
+            (now, self._pd.i_roll_contrib, self._pd.i_pitch_contrib)
+        )
+        while hist and (now - hist[0][0]) > HOME_CAL_CONVERGE_WINDOW_S:
+            hist.popleft()
+        span = now - hist[0][0] if hist else 0.0
+        if span < HOME_CAL_CONVERGE_WINDOW_S * 0.95:
+            return
+        d_roll = max(h[1] for h in hist) - min(h[1] for h in hist)
+        d_pitch = max(h[2] for h in hist) - min(h[2] for h in hist)
+        if (
+            d_roll < HOME_CAL_CONVERGE_EPS_DEG
+            and d_pitch < HOME_CAL_CONVERGE_EPS_DEG
+            and speed_mm_s < HOME_CAL_CONVERGE_MAX_SPEED_MM_S
+            and radius_mm < HOME_CAL_CONVERGE_MAX_RADIUS_MM
+        ):
+            roll, pitch = self.fold_integrator_into_trim()
+            self.cancel_home_calibration()
+            self._pending_trim_event = {
+                "type": "completed",
+                "roll": float(roll),
+                "pitch": float(pitch),
+            }
+
+    @property
+    def _home_cal_flat_s(self) -> float:
+        """Current flat-window span (0 when the integral is still
+        moving) — home-cal progress telemetry."""
+        hist = self._home_cal_i_history
+        if len(hist) < 2:
+            return 0.0
+        d_roll = max(h[1] for h in hist) - min(h[1] for h in hist)
+        d_pitch = max(h[2] for h in hist) - min(h[2] for h in hist)
+        if d_roll < HOME_CAL_CONVERGE_EPS_DEG and d_pitch < HOME_CAL_CONVERGE_EPS_DEG:
+            return hist[-1][0] - hist[0][0]
+        return 0.0
 
     def set_target(self, x_mm: float, y_mm: float) -> None:
         self._arbiter.set_manual(float(x_mm), float(y_mm))
-        self._auto_trim.notify_target_changed()
         # Target moved: any "parked at the target" evidence is stale.
         self._rest_gate.reset()
         if self._autotuner.enabled:
@@ -254,7 +391,7 @@ class BallController:
         target at the nearest path point (the platform does not move on
         start until the ball is seen).
         """
-        self._auto_trim.cancel_home_calibration()
+        self._trim.cancel_home_calibration()
         self.set_pd_autotune(False)
         self._rest_gate.reset()
         return self._path_follower.start()
@@ -271,7 +408,6 @@ class BallController:
             fx, fy = self._arbiter.active
             self._arbiter.set_manual(fx, fy)
             self._arbiter.clear_override()
-        self._auto_trim.notify_target_changed()
         self._rest_gate.reset()
 
     # ---------------------------
@@ -280,21 +416,18 @@ class BallController:
 
     def set_pd_autotune(self, enabled: bool, auto_apply: bool | None = None) -> None:
         if bool(enabled):
-            self._auto_trim.cancel_home_calibration()
+            self._trim.cancel_home_calibration()
             # Exclusion: autotune owns the override channel next.
             self.stop_path()
         changed = self._autotuner.set_enabled(enabled, auto_apply, self.kp, self.kd)
         if changed:
             # Mode change: rest evidence gathered in the old mode is stale.
             self._rest_gate.reset()
-            # Autotune sessions stash the auto-trim flag on enable and
-            # restore it on disable (the arbiter override restore of the
-            # manual target lives inside PDAutotuner.set_enabled).
-            if self._autotuner.enabled:
-                self._pd_autotune_prev_auto_trim_enabled = self.auto_trim_enabled
-                self.auto_trim_enabled = False
-            else:
-                self.auto_trim_enabled = self._pd_autotune_prev_auto_trim_enabled
+            # No flag stash/restore (I-term rework): the integral freeze
+            # during a session is DERIVED from autotuner.enabled inside
+            # compute_with_terms — the leg evaluator's second-order-step
+            # inversion assumes a pure PD response, so the integral holds
+            # its value (like a constant trim) and thaws on disable.
 
     def apply_pd_autotune_recommendation(self) -> tuple[bool, float, float]:
         applied, kp, kd = self._autotuner.take_recommendation(self.kp, self.kd)
@@ -339,21 +472,23 @@ class BallController:
             x, y, vx, vy, self.kp, self.kd
         )
 
+        # Latency compensation: the command computed now takes effect
+        # ~2-3 frames from now (camera exposure + processing + serial +
+        # servo). Control errors are computed against the ball
+        # extrapolated forward by CONTROL_PREDICT_S — ~20 deg of phase
+        # recovered at the 0.78 Hz problem mode. The alpha-beta velocity
+        # is clean enough that the extrapolation adds negligible noise.
+        px = x + vx * CONTROL_PREDICT_S
+        py = y + vy * CONTROL_PREDICT_S
+
         # Path follower (feat/path): advances the override target along the
         # loaded path at the adaptive rate, seeded at the nearest path
-        # point on the first ball sighting. The override is stamped only
-        # when the target actually MOVES: while advancing, the per-cycle
-        # stamp holds auto-trim in target_hold (pursuit lag is NOT a level
-        # error and must not be integrated into trim); when the follower
-        # stalls (factor 0 — target frozen), stamping stops so auto-trim
-        # can integrate away the standing offset that caused the stall.
-        # The PD is pure P+D — auto-trim is the ONLY integral action, and
-        # a trim error of just 1 deg parks the ball ~1/kp = 22 mm from the
-        # target, beyond the capture radius: without this thaw a stalled
-        # path can never recover (observed on the rig: follower pinned at
-        # the seed point, ball fighting 2 cm short of it indefinitely).
+        # point on the first ball sighting (predicted position: the taper
+        # should gate on where the ball WILL be when the command lands).
+        # The override is stamped only when the target actually moves
+        # (hygiene: last_change_time means what it says downstream).
         if self._path_follower.active:
-            ptx, pty = self._path_follower.update(x, y)
+            ptx, pty = self._path_follower.update(px, py)
             if not (
                 self._arbiter.override_active
                 and self._arbiter.active == (ptx, pty)
@@ -361,38 +496,84 @@ class BallController:
                 self._arbiter.set_override(ptx, pty)
 
         target_x, target_y = self._arbiter.active
-        pos_vec_x = target_x - x
-        pos_vec_y = target_y - y
+        pos_vec_x = target_x - px
+        pos_vec_y = target_y - py
 
-        # Auto-trim update (FG-9) — this frame's trim step feeds this
-        # frame's output, matching the pre-decomposition ordering.
-        self._auto_trim.update(
-            pos_vec_x, pos_vec_y, vx, vy,
-            enabled=self.auto_trim_enabled and self.enabled,
-            target_change_time=self._arbiter.last_change_time,
+        # Trajectory feedforward: the path's desired velocity feeds the
+        # D-term (damping velocity ERROR instead of braking the desired
+        # motion — this WAS the entire kd/kp pursuit lag) and its
+        # centripetal acceleration becomes a direct tilt term, evaluated
+        # ahead by the pipeline latency. The wobble no longer outweighs
+        # the drive: path motion is commanded, error only corrects.
+        v_des = (0.0, 0.0)
+        ff = (0.0, 0.0)
+        if PATH_FF_ENABLED and self._path_follower.active:
+            vdx, vdy, adx, ady = self._path_follower.feedforward(
+                PATH_FF_LOOKAHEAD_S
+            )
+            v_des = (vdx, vdy)
+            ff_x = adx / float(PD_AUTOTUNE_G_EFF)
+            ff_y = ady / float(PD_AUTOTUNE_G_EFF)
+            ff_mag = math.hypot(ff_x, ff_y)
+            if ff_mag > PATH_FF_TILT_MAX_DEG:
+                scale = PATH_FF_TILT_MAX_DEG / ff_mag
+                ff_x *= scale
+                ff_y *= scale
+            ff = (ff_x, ff_y)
+
+        # Integral action happens INSIDE _pd.compute below (I-term
+        # rework) — the step is taken in the same call that uses it, so
+        # this frame's integral feeds this frame's output, preserving
+        # the pre-rework same-frame trim ordering. It runs everywhere —
+        # holds, paths, rest — frozen only while autotune owns the loop
+        # (the leg evaluator assumes a pure PD step response) or the
+        # feature is toggled off.
+        integral_frozen = (
+            not (self.auto_trim_enabled and self.enabled)
+            or self._autotuner.enabled
         )
 
         # Near-target rest gate (perf pass). Evaluated from the same error
-        # vector / velocity the PD sees. While resting, the final command is
-        # level + trim (the trim offsets ARE the current best estimate of
-        # level, and auto-trim keeps integrating — its 35 mm / 25 mm/s gates
-        # are wider than rest's — so trim updates still move the platform).
-        # The PD pipeline ALWAYS runs (telemetry + slew-state continuity);
-        # resting only redirects the slew limiter's target, so both the
-        # entry hop and the exit back to full PD are rate-limited and
-        # continuous. Exit is same-cycle: an "active" verdict here computes
-        # a full PD command on this very call.
+        # vector / velocity the PD sees. While resting, the final command
+        # is level + trim + integral (together they ARE the current best
+        # estimate of level; the integral keeps integrating during rest —
+        # rest-radius errors sit inside its full-integration band — so
+        # the resting platform still walks the ball the last millimetres).
+        # The PID pipeline ALWAYS runs (telemetry + slew-state
+        # continuity); resting only redirects the slew limiter's target,
+        # so both the entry hop and the exit back to full PID are
+        # rate-limited and continuous. Exit is same-cycle: an "active"
+        # verdict here computes a full command on this very call.
         rest_radius_mm = math.hypot(pos_vec_x, pos_vec_y)
         rest_speed_mm_s = math.hypot(vx, vy)
         path_following = (
             self._path_follower.active and not self._path_follower.done
         )
-        if self.home_calibration_active or path_following:
-            # Home calibration needs ACTIVE PD driving the ball to center
-            # while auto-trim absorbs the bias — resting at level+trim with
-            # the ball parked off-center would leave centering to the slow
-            # trim walk alone (observed on the rig: calibration far less
-            # reliable with rest engaged).
+        # Rest ENTRY additionally requires the INTEGRAL settled: resting
+        # parks the output at trim + I with P and D dropped, so entering
+        # rest on a still-converging I is not an equilibrium — the ball
+        # drifts out, rest exits, full PID snaps it back, forever
+        # (~0.2 Hz limit cycle, sim-caught). Once |dI/dt| is flat,
+        # trim + I IS the equilibrium and rest is stable. ENTRY-only:
+        # while already resting, small integral walks are the benign
+        # trim-server behavior (the resting output tracks trim + I) and
+        # forcing exit on them just flaps the gate — exit stays
+        # radius/speed-based inside RestGate.
+        integral_blocks_entry = (
+            not integral_frozen
+            and self._rest_gate.state != STATE_RESTING
+            and self._pd.i_rate_deg_s > REST_I_RATE_MAX_DEG_S
+        )
+        if (
+            self.home_calibration_active
+            or path_following
+            or integral_blocks_entry
+        ):
+            # Home calibration needs ACTIVE PID driving the ball to center
+            # while the integral absorbs the bias — resting with the ball
+            # parked off-center would slow convergence (observed on the
+            # rig pre-rework: calibration far less reliable with rest
+            # engaged).
             # Path following likewise: a slow segment (taper, low speed)
             # can satisfy the rest entry gates while the target crawls,
             # producing a rest/wake limbo — suppress. When an OPEN path is
@@ -405,12 +586,43 @@ class BallController:
             rest_state = self._rest_gate.update(rest_radius_mm, rest_speed_mm_s)
             resting = rest_state == STATE_RESTING
 
+        # Rest parks at level + trim + integral. The integral enters BOTH
+        # the raw command and this override — a step in only one of them
+        # would hop the platform on rest entry/exit. (Contribution read
+        # before compute: one frame stale at 30 Hz; the slew smooths it.)
+        rest_override = (
+            (
+                self.roll_offset + self._pd.i_roll_contrib,
+                self.pitch_offset + self._pd.i_pitch_contrib,
+            )
+            if resting
+            else None
+        )
+
+        # While RESTING the integral is frozen too: rest entry already
+        # required it flat, and an integrator acting on an undamped
+        # parked ball (P and D dropped) is structurally unstable — the
+        # sim shows a slow oscillation building until the exit gates
+        # trip. Freezing also pauses the leak, so a long rest cannot
+        # drain a learned correction and force a wake to re-learn it.
         res = self._pd.compute(
             pos_vec_x, pos_vec_y, vx, vy, self.roll_offset, self.pitch_offset,
-            slew_target_override=(
-                (self.roll_offset, self.pitch_offset) if resting else None
+            slew_target_override=rest_override,
+            freeze_integrator=integral_frozen or resting,
+            i_limit_override=(
+                PD_I_LIMIT_HOME_CAL_DEG
+                if self.home_calibration_active
+                else None
             ),
+            v_des=v_des,
+            ff=ff,
         )
+
+        # Home-cal convergence watcher (after the compute so this
+        # frame's integral is in the history) — may fold + complete or
+        # time out, flagging a transient home_cal_event below.
+        if self.home_calibration_active:
+            self._update_home_calibration(rest_radius_mm, rest_speed_mm_s)
 
         terms: dict = {
             "position_vec_mm": (pos_vec_x, pos_vec_y),
@@ -426,7 +638,16 @@ class BallController:
             "pitch_cmd": res.pitch_cmd,
             "roll_offset": self.roll_offset,
             "pitch_offset": self.pitch_offset,
-            **self._auto_trim.telemetry(self.auto_trim_enabled),
+            "i_term": res.i_term,
+            "i_sat_x": 1.0 if res.i_sat[0] else 0.0,
+            "i_sat_y": 1.0 if res.i_sat[1] else 0.0,
+            "i_atten": res.i_atten,
+            "i_frozen": res.i_frozen,
+            "i_rate_deg_s": self._pd.i_rate_deg_s,
+            "ff_vec": res.ff_vec,
+            "v_des_mm_s": v_des,
+            "home_cal_converge_s": self._home_cal_flat_s,
+            **self._trim.telemetry(self.auto_trim_enabled),
             "rest_state": rest_state,
             "rest_mode_active": resting,
             "rest_radius_mm": rest_radius_mm,
@@ -441,4 +662,9 @@ class BallController:
         }
         if tune_info:
             terms["pd_autotune_event"] = tune_info
+        # Transient (present only on fold/complete/timeout — the GUI
+        # persists the folded trim on it, mirroring pd_autotune_event).
+        if self._pending_trim_event is not None:
+            terms["home_cal_event"] = self._pending_trim_event
+            self._pending_trim_event = None
         return res.roll_cmd, res.pitch_cmd, terms

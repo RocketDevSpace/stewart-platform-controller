@@ -123,6 +123,7 @@ class ViewFakeTracker(FakeTracker):
 class FakeController:
     def __init__(self) -> None:
         self.resets = 0
+        self.ki = 0.0
         self.paths: list[Any] = []
         self.path_speeds: list[float] = []
         self.start_path_calls = 0
@@ -148,6 +149,10 @@ class FakeController:
 
     def stop_path(self) -> None:
         self.stop_path_calls += 1
+
+    def request_trim_fold(self) -> tuple[float, float]:
+        self.trim_fold_calls = getattr(self, "trim_fold_calls", 0) + 1
+        return 0.0, 0.0
 
 
 def _get_app() -> object:
@@ -453,6 +458,31 @@ class TestPathSlots:
         worker.set_path_pattern("")
         assert controller.paths == []
         assert worker._path_pattern_init == ""
+
+
+class TestTrimFoldSlot:
+    def test_guards_none_controller(self) -> None:
+        worker, _, _ = _make_worker([])
+        worker.ball_controller = None
+        worker.fold_trim()          # must not raise
+
+    def test_forwards_to_controller(self) -> None:
+        worker, _, controller = _make_worker([])
+        worker.fold_trim()
+        assert getattr(controller, "trim_fold_calls", 0) == 1
+
+
+class TestKiSlot:
+    def test_guards_none_controller_and_caches(self) -> None:
+        worker, _, _ = _make_worker([])
+        worker.ball_controller = None
+        worker.set_ki(0.05)         # must not raise
+        assert worker._ki_init == 0.05
+
+    def test_forwards_live(self) -> None:
+        worker, _, controller = _make_worker([])
+        worker.set_ki(0.041)
+        assert controller.ki == 0.041
 
 
 class TestErrorRateLimit:

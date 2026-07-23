@@ -244,6 +244,53 @@ class PathFollower:
         return self._point_at(self._s_target)
 
     # ---------------------------
+    # Feedforward (trajectory tracking)
+    # ---------------------------
+
+    def feedforward(
+        self, lookahead_s: float = 0.0
+    ) -> tuple[float, float, float, float]:
+        """Desired velocity and acceleration of the moving target.
+
+        Returns (vx_des, vy_des, ax_des, ay_des) in mm/s and mm/s²,
+        evaluated ``lookahead_s`` ahead along the arc (latency
+        compensation: the command sent now takes effect a few frames
+        from now — feed forward where the target will be then).
+
+        v_des = actual advance rate (speed * taper factor) along the
+        tangent; a_des = the centripetal term v²·κ·N̂ from the
+        arc-length second difference. Zero in every state except
+        following/stalled (and zero while stalled since factor is 0).
+        """
+        if self._state not in (STATE_FOLLOWING, STATE_STALLED):
+            return 0.0, 0.0, 0.0, 0.0
+        v_mag = self._speed_mm_s * self._last_factor
+        if v_mag <= 0.0 or self._total_len <= 0.0:
+            return 0.0, 0.0, 0.0, 0.0
+
+        s_eval = self._s_target + v_mag * max(0.0, lookahead_s)
+        h = 3.0  # mm; spans the 2 mm resampling for stable differences
+        x0, y0 = self._point_at(s_eval - h)
+        xc, yc = self._point_at(s_eval)
+        x1, y1 = self._point_at(s_eval + h)
+
+        tx = x1 - x0
+        ty = y1 - y0
+        t_len = math.hypot(tx, ty)
+        if t_len < 1e-9:
+            return 0.0, 0.0, 0.0, 0.0
+        vx_des = v_mag * tx / t_len
+        vy_des = v_mag * ty / t_len
+
+        # Arc-length second difference = curvature vector κ·N̂; the
+        # centripetal acceleration of a point moving at v_mag is v²·κ·N̂.
+        kx = (x0 - 2.0 * xc + x1) / (h * h)
+        ky = (y0 - 2.0 * yc + y1) / (h * h)
+        ax_des = v_mag * v_mag * kx
+        ay_des = v_mag * v_mag * ky
+        return vx_des, vy_des, ax_des, ay_des
+
+    # ---------------------------
     # Geometry
     # ---------------------------
 

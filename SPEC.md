@@ -339,17 +339,11 @@ platform, no camera line detection.
   mirrors the same exclusions (belt and braces).
 - `stop_path()` is motion-free: the active target freezes in place
   bit-identically.
-- Auto-trim is frozen while the target ADVANCES (pursuit lag is a
-  tracking error, not a level error — integrating it would corrupt
-  trim) but thaws during a full stall: the override is stamped only
-  when the target actually moves, so a frozen target lets the 0.6 s
-  target-hold expire and the trim integrator pull the ball back inside
-  the capture radius. The PD is pure P+D — auto-trim is the only
-  integral action, and 1° of standing trim error parks the ball
-  ~1/kp = 22 mm from the target; without the thaw a stalled path can
-  never recover (observed on the rig 2026-07-23: follower pinned at the
-  seed point indefinitely). Rest mode is force-suppressed while
-  following and re-engages when an open path completes.
+- Standing offsets along the path (the plate's position-dependent tilt
+  field) are cancelled by the PDCore integral — see the 2026-07-23
+  I-term rework section below for the contract. Rest mode is
+  force-suppressed while following and re-engages when an open path
+  completes.
 - Telemetry: 8 additive `path_*` keys in the control terms
   (active/state/name/progress/lap/s_mm/error_mm/speed_mm_s).
 
@@ -368,6 +362,87 @@ Star (5pt, r=70 — inner corners are the stress test), plus
   loss, overlay tracks; square corners; star inner corners visibly
   slow-and-recover; Stop on an open path = no jump; target drag
   cancels; autotune/path mutual exclusion via GUI — pending
+
+---
+
+### 2026-07-23 I-Term Rework — True PID, Trim Demoted to a Store
+**Status:** Implemented (branch `rework/integral-trim`, stacked on path
+following); merge gated on the rig session
+
+**Why:** the first path-following rig session traced four field
+failures (home-cal stalls, rest rocking, the path deadlock, a measured
+1.2 Hz burst limit cycle) to the gated AutoTrim integrator — the wrong
+signal (gated position error) in the wrong structure (bang-bang bursts)
+in the wrong data structure (one global scalar for a position-dependent
+field: rig-measured ~0.36° more compensation needed at r=65 than
+center).
+
+**Integral contract (`control/pid_core.py`):**
+- Continuous, no gates; integrates position error in x/y error space,
+  mapped to pitch/roll beside P and D. ki = 0.030 deg/(mm·s)
+  (τ_I = kp/ki = 1.5 s; a 0.4° bias is inside 2 mm and staying there
+  in ≤ 5 s — friction bounds standing accuracy to ~1.3 mm at kp 0.045).
+- Protections: error-taper (full ≤ 25 mm, zero ≥ 60 mm — flicks never
+  integrate), per-axis directional anti-windup at the tilt clamp
+  (un-integrating out of saturation always allowed), 25 s leak
+  (steady-state cost ~0.5 mm; mis-learned corrections self-heal),
+  clamp ±1.5° (±6° during home-cal), freeze-in-place (no zeroing) for
+  autotune sessions / feature-off / rest.
+- `reset_motion_state()` (tracking loss) KEEPS the integral — learned
+  plate knowledge; staleness is the leak's job. `reset_trim` clears it.
+- Known behaviors: unreachable-target windup parks at the clamp and
+  self-heals on the leak; a standing trim+I near the 10° tilt clamp
+  asymmetrically reduces flick headroom in that direction (physics).
+
+**Rest interlocks (both sim-caught):**
+- Rest ENTRY requires the integral flat (`i_rate_deg_s` EMA under
+  `REST_I_RATE_MAX_DEG_S` = 0.02): entering on a converging integral
+  is not an equilibrium (P and D are dropped while resting) and
+  limit-cycles at ~0.2 Hz. Entry-only — exit stays radius/speed-based.
+- The integral FREEZES while resting: an integrator acting on an
+  undamped parked ball is structurally unstable; freezing also pauses
+  the leak so a long rest cannot drain the learned correction.
+- Endgame: converge → rest → integral frozen at the learned bias →
+  total servo silence.
+
+**Trim contract (`control/trim_store.py`):** a pure store — manual
+slider writes, reset to settings defaults, and `fold()` (absorb the
+integral into persistent trim, clamped ±8°, zero net output change).
+Single-writer preserved: TrimStore owns the offsets, PDCore owns the
+integral, `BallController.fold_integrator_into_trim()` is the only
+bridge.
+
+**Home calibration:** auto-completes. Converged = integral moved
+< 0.05°/axis over a trailing 2 s window AND ball < 20 mm/s AND ball
+< 15 mm from center (the radius gate refuses to fold an integral that
+saturated flat against an unreachable ball) → fold → auto-save (GUI
+persists the folded values carried in the transient `home_cal_event`)
+→ auto-complete. Timeout 30 s → cancel, discard the windup, save
+nothing. Save Trim routes through the same fold path — one save code
+path.
+
+**Autotune:** the integral freeze is derived from `autotuner.enabled`
+(no flag stash/restore); a frozen integral is a constant bias, which
+the leg evaluator's second-order-step inversion tolerates exactly like
+trim.
+
+**Acceptance criteria:**
+- Suite green (383 passed) incl.: deadlock reproduction over the
+  measured warp field with the integral off (0 laps), recovery with it
+  on (laps at ~99% of commanded speed, max_err 13 mm), ki sweep, rest
+  stability, home-cal convergence/fake-flatness/timeout ✅
+- jitter_bench A/B: quiescent unchanged (2 sends, 4 flips/min), +5 mm
+  standing bias converges in a ~13-send burst then silence, impulse
+  response untouched (taper) ✅
+- Rig session (gates the PR): center hold with injected 0.4° trim
+  error recenters in 2–4 s with no 0.77 Hz growth; the 206 s
+  stationary run repeats with ~0 movement bursts (was 200); rest goes
+  send-silent after convergence; 300 mm/s flick recovery at baseline
+  with |i_term| excursion < 0.2°; r=65 target equilibrium within
+  ~2 mm (was 8 short); circle laps + star corners over the real plate;
+  home-cal from a deliberately wrong ±2° trim converges, auto-saves,
+  survives restart; autotune session sane; 2 s camera blackout
+  mid-path reacquires with no trim transient — pending
 
 ---
 

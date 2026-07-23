@@ -2,7 +2,7 @@
 cv/vision_control_worker.py
 
 VisionControlWorker: QObject that owns BallTracker + BallController and runs
-the full vision/PD/IK loop in a dedicated QThread. Communicates with the GUI
+the full vision/PID/IK loop in a dedicated QThread. Communicates with the GUI
 exclusively via Qt signals (snapshot_ready, camera_ready, error, stopped).
 
 ControlSnapshot is a dataclass carrying the full per-frame telemetry package.
@@ -27,7 +27,7 @@ from core.platform_state import BallState, IKResult, Pose
 from cv.ball_tracker import BallTracker
 from cv.camera_source import CameraSource
 from settings import (
-    AUTO_TRIM_ENABLED,
+    PD_I_ENABLED,
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
     DEBUG_PRINTS,
@@ -37,6 +37,7 @@ from settings import (
     MAX_TILT_DEG,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
+    PD_DEFAULT_KI,
     PD_DEFAULT_KP,
     TRACKER_HSV_H_MAX,
     TRACKER_HSV_H_MIN,
@@ -85,7 +86,7 @@ class ControlSnapshot:
 
 class VisionControlWorker(QtCore.QObject):
     """
-    Owns BallTracker + BallController. Runs the vision/PD/IK loop in a
+    Owns BallTracker + BallController. Runs the vision/PID/IK loop in a
     QThread at VISION_LOOP_HZ via an internal QTimer.
 
     Signal contract:
@@ -118,7 +119,7 @@ class VisionControlWorker(QtCore.QObject):
         command_sender: Callable[..., object] | None = None,
         roll_offset: float = MANUAL_ROLL_TRIM_DEG,
         pitch_offset: float = MANUAL_PITCH_TRIM_DEG,
-        auto_trim_enabled: bool = AUTO_TRIM_ENABLED,
+        auto_trim_enabled: bool = PD_I_ENABLED,
         rtt_provider: Callable[[], tuple[float, float, int]] | None = None,
         position_log_path: str | None = None,
     ) -> None:
@@ -144,6 +145,7 @@ class VisionControlWorker(QtCore.QObject):
         # Cached init params — applied to controller on start()
         self._kp_init = float(kp)
         self._kd_init = float(kd)
+        self._ki_init = float(PD_DEFAULT_KI)
         self._max_tilt_deg = float(max_tilt_deg)
         self._roll_offset_init = float(roll_offset)
         self._pitch_offset_init = float(pitch_offset)
@@ -216,6 +218,7 @@ class VisionControlWorker(QtCore.QObject):
                 self.ball_controller = BallController(
                     kp=self._kp_init,
                     kd=self._kd_init,
+                    ki=self._ki_init,
                     max_tilt_deg=self._max_tilt_deg,
                     roll_offset=self._roll_offset_init,
                     pitch_offset=self._pitch_offset_init,
@@ -340,6 +343,13 @@ class VisionControlWorker(QtCore.QObject):
         if self.ball_controller is not None:
             self.ball_controller.set_gains(float(kp), float(kd))
 
+    @QtCore.pyqtSlot(float)
+    def set_ki(self, ki: float) -> None:
+        """Live integral-gain change (Ki slider); cached for restart."""
+        self._ki_init = float(ki)
+        if self.ball_controller is not None:
+            self.ball_controller.ki = float(ki)
+
     @QtCore.pyqtSlot(int, int, int, int, int, int)
     def set_hsv(
         self,
@@ -378,6 +388,14 @@ class VisionControlWorker(QtCore.QObject):
     def reset_trim(self) -> None:
         if self.ball_controller is not None:
             self.ball_controller.reset_trim()
+
+    @QtCore.pyqtSlot()
+    def fold_trim(self) -> None:
+        """Save-Trim path (I-term rework): fold the integral into the
+        stored trim; the controller flags a home_cal_event so the GUI
+        persists the folded values."""
+        if self.ball_controller is not None:
+            self.ball_controller.request_trim_fold()
 
     @QtCore.pyqtSlot(bool)
     def set_home_calibration(self, enabled: bool) -> None:
