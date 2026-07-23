@@ -18,6 +18,7 @@ tests/test_ball_controller_characterization for the dated removal list).
 """
 import math
 import time
+from collections import deque
 from collections.abc import Callable
 
 from control.autotune import PDAutotuner
@@ -31,6 +32,11 @@ from core.platform_state import BallState
 from settings import (
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
+    HOME_CAL_CONVERGE_EPS_DEG,
+    HOME_CAL_CONVERGE_MAX_RADIUS_MM,
+    HOME_CAL_CONVERGE_MAX_SPEED_MM_S,
+    HOME_CAL_CONVERGE_WINDOW_S,
+    HOME_CAL_TIMEOUT_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KI,
     PD_DEFAULT_KP,
@@ -125,6 +131,14 @@ class BallController:
         # Path following (feat/path): drives the arbiter override channel
         # (mutually exclusive with autotune, which owns the same channel).
         self._path_follower = PathFollower(clock)
+
+        # Home-cal convergence watching + fold events (I-term rework).
+        # The controller runs the detector because only it sees both the
+        # integral and the ball; the GUI persists the fold via the
+        # transient home_cal_event terms entry.
+        self._clock = clock
+        self._home_cal_i_history: deque[tuple[float, float, float]] = deque()
+        self._pending_trim_event: dict | None = None
 
     # ---------------------------
     # Delegated read-only state (telemetry code reads these)
@@ -247,9 +261,11 @@ class BallController:
         self._arbiter.set_manual(
             float(BALL_TARGET_DEFAULT_X_MM), float(BALL_TARGET_DEFAULT_Y_MM)
         )
+        self._home_cal_i_history.clear()
         self._trim.start_home_calibration()
 
     def cancel_home_calibration(self) -> None:
+        self._home_cal_i_history.clear()
         self._trim.cancel_home_calibration()
 
     def fold_integrator_into_trim(self) -> tuple[float, float]:
@@ -257,6 +273,76 @@ class BallController:
         change: trim rises by exactly what the integral gave up). Returns
         the new (roll, pitch) offsets for the caller to persist."""
         return self._trim.fold(*self._pd.take_integrator())
+
+    def request_trim_fold(self) -> tuple[float, float]:
+        """Save-Trim path: fold now and flag a {"type": "saved"} event on
+        the next compute so the GUI (which owns the settings file)
+        persists the folded values, not a stale mirror."""
+        roll, pitch = self.fold_integrator_into_trim()
+        self._pending_trim_event = {
+            "type": "saved", "roll": float(roll), "pitch": float(pitch),
+        }
+        return roll, pitch
+
+    def _update_home_calibration(
+        self, radius_mm: float, speed_mm_s: float
+    ) -> None:
+        """Convergence watcher — runs each compute while calibrating.
+
+        Converged: the integral moved < HOME_CAL_CONVERGE_EPS_DEG per
+        axis over the trailing HOME_CAL_CONVERGE_WINDOW_S with the ball
+        slow AND near center -> fold + auto-complete
+        ({"type": "completed"}). The radius gate matters: a ball stuck
+        far away saturates the integral at the wide home-cal limit,
+        where it goes flat — fake flatness that would fold pure windup.
+        Timeout: cancel WITHOUT folding and DISCARD the integral
+        ({"type": "timeout"}) — whatever it accumulated in a failed
+        calibration is windup, not level knowledge.
+        """
+        now = self._clock()
+        if self._trim.home_calibration_elapsed_s > HOME_CAL_TIMEOUT_S:
+            self.cancel_home_calibration()
+            self._pd.reset_integrator()
+            self._pending_trim_event = {"type": "timeout"}
+            return
+
+        hist = self._home_cal_i_history
+        hist.append(
+            (now, self._pd.i_roll_contrib, self._pd.i_pitch_contrib)
+        )
+        while hist and (now - hist[0][0]) > HOME_CAL_CONVERGE_WINDOW_S:
+            hist.popleft()
+        span = now - hist[0][0] if hist else 0.0
+        if span < HOME_CAL_CONVERGE_WINDOW_S * 0.95:
+            return
+        d_roll = max(h[1] for h in hist) - min(h[1] for h in hist)
+        d_pitch = max(h[2] for h in hist) - min(h[2] for h in hist)
+        if (
+            d_roll < HOME_CAL_CONVERGE_EPS_DEG
+            and d_pitch < HOME_CAL_CONVERGE_EPS_DEG
+            and speed_mm_s < HOME_CAL_CONVERGE_MAX_SPEED_MM_S
+            and radius_mm < HOME_CAL_CONVERGE_MAX_RADIUS_MM
+        ):
+            roll, pitch = self.fold_integrator_into_trim()
+            self.cancel_home_calibration()
+            self._pending_trim_event = {
+                "type": "completed",
+                "roll": float(roll),
+                "pitch": float(pitch),
+            }
+
+    @property
+    def _home_cal_flat_s(self) -> float:
+        """Current flat-window span (0 when the integral is still
+        moving) — home-cal progress telemetry."""
+        hist = self._home_cal_i_history
+        if len(hist) < 2:
+            return 0.0
+        d_roll = max(h[1] for h in hist) - min(h[1] for h in hist)
+        d_pitch = max(h[2] for h in hist) - min(h[2] for h in hist)
+        if d_roll < HOME_CAL_CONVERGE_EPS_DEG and d_pitch < HOME_CAL_CONVERGE_EPS_DEG:
+            return hist[-1][0] - hist[0][0]
+        return 0.0
 
     def set_target(self, x_mm: float, y_mm: float) -> None:
         self._arbiter.set_manual(float(x_mm), float(y_mm))
@@ -483,6 +569,12 @@ class BallController:
             ),
         )
 
+        # Home-cal convergence watcher (after the compute so this
+        # frame's integral is in the history) — may fold + complete or
+        # time out, flagging a transient home_cal_event below.
+        if self.home_calibration_active:
+            self._update_home_calibration(rest_radius_mm, rest_speed_mm_s)
+
         terms: dict = {
             "position_vec_mm": (pos_vec_x, pos_vec_y),
             "velocity_vec_mm_s": (vx, vy),
@@ -503,6 +595,7 @@ class BallController:
             "i_atten": res.i_atten,
             "i_frozen": res.i_frozen,
             "i_rate_deg_s": self._pd.i_rate_deg_s,
+            "home_cal_converge_s": self._home_cal_flat_s,
             **self._trim.telemetry(self.auto_trim_enabled),
             "rest_state": rest_state,
             "rest_mode_active": resting,
@@ -518,4 +611,9 @@ class BallController:
         }
         if tune_info:
             terms["pd_autotune_event"] = tune_info
+        # Transient (present only on fold/complete/timeout — the GUI
+        # persists the folded trim on it, mirroring pd_autotune_event).
+        if self._pending_trim_event is not None:
+            terms["home_cal_event"] = self._pending_trim_event
+            self._pending_trim_event = None
         return res.roll_cmd, res.pitch_cmd, terms

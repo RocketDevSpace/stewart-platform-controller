@@ -519,6 +519,94 @@ class TestRestModeIntegration:
         assert terms["rest_mode_active"] is False
 
 
+class TestHomeCalConvergence:
+    """I-term rework: home calibration auto-completes — the controller
+    watches the integral, and once it is flat with the ball slow and
+    near center, folds it into trim, cancels, and flags a transient
+    home_cal_event the GUI persists."""
+
+    def test_converges_folds_and_completes(self) -> None:
+        clock = _FakeClock(100.0)   # nonzero: elapsed-timer guard
+        ctrl = BallController(kp=0.045, kd=0.022, clock=clock)
+        ctrl.start_home_calibration()
+        # Ball essentially at center and still: the integral is flat
+        # from the start; the 2 s window fills and convergence fires.
+        event: dict = {}
+        for _ in range(120):
+            clock.advance(1.0 / 30.0)
+            _, _, terms = ctrl.compute_with_terms(
+                BallState(x_mm=0.2, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+            )
+            if "home_cal_event" in terms:
+                event = terms["home_cal_event"]
+                break
+        assert event.get("type") == "completed"
+        assert ctrl.home_calibration_active is False
+        # The event carries the freshly folded offsets (what the GUI
+        # must persist) and they match the store.
+        assert event["roll"] == ctrl.roll_offset
+        assert event["pitch"] == ctrl.pitch_offset
+        # Fold drained the integral (next frame re-integrates a tick).
+        clock.advance(1.0 / 30.0)
+        _, _, terms = ctrl.compute_with_terms(
+            BallState(x_mm=0.2, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+        )
+        assert abs(terms["i_term"][0]) < 0.01
+        assert abs(terms["i_term"][1]) < 0.01
+
+    def test_far_ball_saturated_integral_does_not_fake_converge(self) -> None:
+        # A ball stuck 30 mm out drives the integral to the wide
+        # home-cal limit, where it goes FLAT — the radius gate must
+        # refuse to fold that windup; the run ends in timeout with the
+        # integral discarded and trim untouched.
+        clock = _FakeClock(100.0)   # nonzero: elapsed-timer guard
+        ctrl = BallController(kp=0.045, kd=0.022, clock=clock)
+        ctrl.start_home_calibration()
+        event: dict = {}
+        for _ in range(int(31.0 * 30)):
+            clock.advance(1.0 / 30.0)
+            _, _, terms = ctrl.compute_with_terms(
+                BallState(x_mm=30.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+            )
+            if "home_cal_event" in terms:
+                event = terms["home_cal_event"]
+                break
+        assert event.get("type") == "timeout"
+        assert ctrl.home_calibration_active is False
+        assert (ctrl.roll_offset, ctrl.pitch_offset) == (0.0, 0.0)
+        clock.advance(1.0 / 30.0)
+        _, _, terms = ctrl.compute_with_terms(
+            BallState(x_mm=30.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+        )
+        # Windup discarded (next frame re-integrates a tick at most).
+        assert abs(terms["i_term"][0]) < 0.05
+        assert abs(terms["i_term"][1]) < 0.05
+
+    def test_request_trim_fold_flags_saved_event(self) -> None:
+        clock = _FakeClock()
+        ctrl = BallController(kp=0.045, kd=0.022, clock=clock,
+                              auto_trim_enabled=True)
+        ctrl.compute_with_terms(
+            BallState(x_mm=15.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+        )
+        for _ in range(60):
+            clock.advance(1.0 / 30.0)
+            ctrl.compute_with_terms(
+                BallState(x_mm=15.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+            )
+        roll, pitch = ctrl.request_trim_fold()
+        assert pitch < 0.0                     # absorbed the -x integral
+        assert (ctrl.roll_offset, ctrl.pitch_offset) == (roll, pitch)
+        clock.advance(1.0 / 30.0)
+        _, _, terms = ctrl.compute_with_terms(
+            BallState(x_mm=15.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+        )
+        event = terms.get("home_cal_event", {})
+        assert event.get("type") == "saved"
+        assert event["roll"] == roll
+        assert event["pitch"] == pitch
+
+
 class TestRestHomeCalExclusion:
     def test_never_rests_during_home_calibration(self) -> None:
         """Home calibration needs ACTIVE PD centering the ball; rest mode
@@ -527,11 +615,13 @@ class TestRestHomeCalExclusion:
         clock = _FakeClock()
         ctrl = BallController(kp=0.045, kd=0.022, clock=clock)
         ctrl.start_home_calibration()
-        # Ball parked dead-center and still — prime rest-entry conditions.
+        # Ball near center and still — prime rest-entry conditions.
+        # (2 mm keeps the integral visibly moving so the convergence
+        # watcher cannot auto-complete the calibration mid-test.)
         for _ in range(60):
             clock.advance(1.0 / 30.0)
             _, _, terms = ctrl.compute_with_terms(
-                BallState(x_mm=1.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+                BallState(x_mm=2.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
             )
         assert terms["rest_state"] == "active"
         assert terms["rest_mode_active"] is False

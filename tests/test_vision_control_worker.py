@@ -149,6 +149,10 @@ class FakeController:
     def stop_path(self) -> None:
         self.stop_path_calls += 1
 
+    def request_trim_fold(self) -> tuple[float, float]:
+        self.trim_fold_calls = getattr(self, "trim_fold_calls", 0) + 1
+        return 0.0, 0.0
+
 
 def _get_app() -> object:
     from PyQt5.QtWidgets import QApplication
@@ -453,6 +457,18 @@ class TestPathSlots:
         worker.set_path_pattern("")
         assert controller.paths == []
         assert worker._path_pattern_init == ""
+
+
+class TestTrimFoldSlot:
+    def test_guards_none_controller(self) -> None:
+        worker, _, _ = _make_worker([])
+        worker.ball_controller = None
+        worker.fold_trim()          # must not raise
+
+    def test_forwards_to_controller(self) -> None:
+        worker, _, controller = _make_worker([])
+        worker.fold_trim()
+        assert getattr(controller, "trim_fold_calls", 0) == 1
 
 
 class TestErrorRateLimit:

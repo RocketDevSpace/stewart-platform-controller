@@ -379,6 +379,14 @@ class VisionControlWorker(QtCore.QObject):
         if self.ball_controller is not None:
             self.ball_controller.reset_trim()
 
+    @QtCore.pyqtSlot()
+    def fold_trim(self) -> None:
+        """Save-Trim path (I-term rework): fold the integral into the
+        stored trim; the controller flags a home_cal_event so the GUI
+        persists the folded values."""
+        if self.ball_controller is not None:
+            self.ball_controller.request_trim_fold()
+
     @QtCore.pyqtSlot(bool)
     def set_home_calibration(self, enabled: bool) -> None:
         if self.ball_controller is None:

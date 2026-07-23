@@ -213,6 +213,21 @@ MANUAL_ROLL_TRIM_DEG = float(_OV.get("MANUAL_ROLL_TRIM_DEG", 0.0))
 MANUAL_PITCH_TRIM_DEG = float(_OV.get("MANUAL_PITCH_TRIM_DEG", 0.0))
 TRIM_LIMIT_DEG = 8.0                 # offset/fold clamp per axis
 
+# Home calibration (I-term rework): hold the ball at center, watch the
+# integral converge, then auto-fold it into trim, auto-save, and
+# auto-complete. Converged = the integral moved less than EPS per axis
+# over the trailing WINDOW while the ball is slow. Timeout cancels
+# WITHOUT folding (an unconverged integral is a transient, not a trim).
+HOME_CAL_CONVERGE_WINDOW_S = 2.0
+HOME_CAL_CONVERGE_EPS_DEG = 0.05
+HOME_CAL_CONVERGE_MAX_SPEED_MM_S = 20.0
+# Converged also requires the ball NEAR CENTER: a ball stuck far away
+# saturates the integral at the wide home-cal limit, where it goes flat
+# — without the radius gate that fake flatness would fold pure windup
+# into the persistent trim.
+HOME_CAL_CONVERGE_MAX_RADIUS_MM = 15.0
+HOME_CAL_TIMEOUT_S = 30.0
+
 # =============================================================================
 # PD autotune
 # =============================================================================
