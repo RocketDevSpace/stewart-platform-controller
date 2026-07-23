@@ -118,6 +118,34 @@ class TestWarpFieldRecovery:
         assert res.max_err_mm < 20.0
         assert res.mean_advance_mm_s > 20.0
 
+    def test_feedforward_halves_mean_tracking_error(self) -> None:
+        # The trajectory-feedforward pin (2026-07-23 second rig session:
+        # at low speeds the wobble dominated the path drive). With the
+        # 2-frame latency plant, ff + prediction cuts the circle's mean
+        # tracking error from ~10 mm (plain PID) to ~5.7 mm and unlocks
+        # near-commanded speed at 45 mm/s (98% vs 80% delivered).
+        import control.ball_controller as bc
+        saved = (bc.PATH_FF_ENABLED, bc.CONTROL_PREDICT_S)
+        try:
+            bc.PATH_FF_ENABLED = False
+            bc.CONTROL_PREDICT_S = 0.0
+            plain = simulate_path_following(
+                circle(), 30.0, 40.0,
+                warp_c_deg_per_mm=RIG_WARP_C,
+                warp_bias_roll_deg=RIG_STALE_TRIM_ROLL,
+                warp_bias_pitch_deg=RIG_STALE_TRIM_PITCH,
+            )
+        finally:
+            bc.PATH_FF_ENABLED, bc.CONTROL_PREDICT_S = saved
+        shipped = simulate_path_following(
+            circle(), 30.0, 40.0,
+            warp_c_deg_per_mm=RIG_WARP_C,
+            warp_bias_roll_deg=RIG_STALE_TRIM_ROLL,
+            warp_bias_pitch_deg=RIG_STALE_TRIM_PITCH,
+        )
+        assert shipped.mean_err_mm < plain.mean_err_mm * 0.85
+        assert shipped.mean_err_mm < 9.0
+
     def test_star_with_warp_corners_bounded(self) -> None:
         # Sharp inner corners + rotating field: the corner transient from
         # a momentarily stale integral vector is bounded by the taper

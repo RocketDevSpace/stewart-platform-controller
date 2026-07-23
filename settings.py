@@ -193,6 +193,24 @@ PD_I_ERR_DEADBAND_MM = 2.0
 # leak), far under this threshold.
 REST_I_RATE_MAX_DEG_S = 0.02
 
+# --- Trajectory feedforward + latency compensation (2026-07-23, second
+# rig session) ---
+# Measured: at low path speeds the ball's wobble (mean ~28 mm/s total
+# motion) dominated the ~11 mm/s path drive — following was invisible.
+# Two causes fixed here:
+# 1. The D-term damped ALL velocity, including the DESIRED path motion
+#    (kd*30 mm/s = 0.66 deg of braking against the carrot — the whole
+#    pursuit lag). D now damps velocity ERROR vs the path's desired
+#    velocity, and the follower feeds centripetal tilt forward, so path
+#    motion is commanded, not dragged out of lag error.
+# 2. Pipeline latency (~2-3 frames camera->servo) costs ~20 deg of
+#    phase at the 0.78 Hz problem mode. Control errors are computed
+#    against the ball position extrapolated by CONTROL_PREDICT_S.
+PATH_FF_ENABLED = True
+PATH_FF_LOOKAHEAD_S = 0.12           # evaluate ff ahead by the pipeline lag
+PATH_FF_TILT_MAX_DEG = 1.5           # cap (polyline corners spike curvature)
+CONTROL_PREDICT_S = 0.08             # ball-state forward extrapolation
+
 # =============================================================================
 # Near-target rest mode (control/rest_gate.py)
 # =============================================================================

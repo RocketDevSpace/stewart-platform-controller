@@ -114,6 +114,7 @@ def simulate_path_following(
     warp_bias_pitch_deg: float = 0.0,
     integral_enabled: bool = True,
     roll_resist_deg: float = 0.06,
+    latency_frames: int = 2,
 ) -> SimResult:
     """Run the closed loop for duration_s at hz steps/s; return metrics.
 
@@ -169,6 +170,15 @@ def simulate_path_following(
     final_progress = 0.0
     err_trace: list[float] = []
 
+    # Pipeline latency model (camera exposure + processing + serial +
+    # servo motion ≈ 2-3 frames on the rig): the plant acts on the
+    # command from latency_frames ago. This is what CONTROL_PREDICT_S /
+    # PATH_FF_LOOKAHEAD_S exist to compensate.
+    from collections import deque as _deque
+    cmd_queue: _deque[tuple[float, float]] = _deque(
+        [(0.0, 0.0)] * max(0, int(latency_frames))
+    )
+
     for _ in range(steps):
         clock.t += dt
 
@@ -191,11 +201,15 @@ def simulate_path_following(
         )
         err_trace.append(err)
 
+        # Delayed command reaches the plant this frame.
+        cmd_queue.append((roll_cmd, pitch_cmd))
+        roll_act, pitch_act = cmd_queue.popleft()
+
         # Plant step (semi-implicit Euler) against the warp field.
         d_pitch = warp_c_deg_per_mm * x + warp_bias_pitch_deg
         d_roll = -warp_c_deg_per_mm * y + warp_bias_roll_deg
-        ax = G_EFF * (pitch_cmd - d_pitch)
-        ay = -G_EFF * (roll_cmd - d_roll)
+        ax = G_EFF * (pitch_act - d_pitch)
+        ay = -G_EFF * (roll_act - d_roll)
         # Rolling resistance (Coulomb-style, roll_resist_deg equivalent
         # tilt): a slow ball under a net tilt inside the resistance cone
         # STICKS — without this, no ball can ever rest and every rest

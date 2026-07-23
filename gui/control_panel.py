@@ -264,14 +264,15 @@ class ControlPanel(QWidget):
             tune, "Kp: {:.3f}", 0, 300,
             float(PD_DEFAULT_KP), 1000.0, self._on_kp_changed,
         )
-        self._kd_label, self._kd_slider = self._make_scaled_slider(
-            tune, "Kd: {:.3f}", 0, 100,
-            float(PD_DEFAULT_KD), 1000.0, self._on_kd_changed,
-        )
+        # Slider order matches the name: P, I, D.
         # Ki (I-term rework): 0-0.080 deg/(mm*s); 0 disables integration
         self._ki_label, self._ki_slider = self._make_scaled_slider(
             tune, "Ki: {:.3f}", 0, 80,
             float(PD_DEFAULT_KI), 1000.0, self._on_ki_changed,
+        )
+        self._kd_label, self._kd_slider = self._make_scaled_slider(
+            tune, "Kd: {:.3f}", 0, 100,
+            float(PD_DEFAULT_KD), 1000.0, self._on_kd_changed,
         )
 
         self._autotune_enable_btn = self._make_toggle_button(

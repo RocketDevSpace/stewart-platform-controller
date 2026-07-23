@@ -316,8 +316,22 @@ tilt at r=65 mm than center — ball equilibrium 8 mm inside the circle).
   new `set_ki` worker slot, cached across vision restarts.
 - PD → PID rename: `control/pd_core.py` → `control/pid_core.py`
   (`PDCore` → `PIDCore`, `PDResult` → `PIDResult`), GUI "PID Control"
-  group, "[PID TUNE]" messages, docs. Settings keys (`PD_*`) and
-  terms keys keep their names — wire/overlay compatibility.
+  group (sliders now ordered Kp/Ki/Kd), "[PID TUNE]" messages,
+  vision-monitor overlay legend/status, docs. Settings keys (`PD_*`)
+  and terms keys keep their names — wire/overlay compatibility.
+- Trajectory feedforward + latency compensation (third session: the
+  ball's wobble — ~28 mm/s of motion — dominated an ~11 mm/s path
+  drive; 19 laps completed but invisible as path-following). The
+  D-term damped ALL velocity including the DESIRED path motion (the
+  entire kd/kp pursuit lag); it now damps velocity ERROR against the
+  follower's desired velocity, plus centripetal tilt feedforward
+  evaluated `PATH_FF_LOOKAHEAD_S` ahead (`PathFollower.feedforward`),
+  and control errors are computed against the ball extrapolated by
+  `CONTROL_PREDICT_S` (~20° of phase recovered at the 0.78 Hz mode).
+  The sim plant gained a 2-frame command-latency model. A/B over
+  warp + latency: circle mean tracking error 9.97 → 5.73 mm; 45 mm/s
+  now delivers 44 mm/s (98%, was 80%) — path motion is commanded,
+  not dragged out of lag error.
 
 #### Removed
 - `control/auto_trim.py` (~200-line gated integrator state machine)

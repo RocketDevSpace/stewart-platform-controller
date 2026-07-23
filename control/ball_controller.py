@@ -32,6 +32,7 @@ from core.platform_state import BallState
 from settings import (
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
+    CONTROL_PREDICT_S,
     HOME_CAL_CONVERGE_EPS_DEG,
     HOME_CAL_CONVERGE_MAX_RADIUS_MM,
     HOME_CAL_CONVERGE_MAX_SPEED_MM_S,
@@ -40,6 +41,10 @@ from settings import (
     PD_DEFAULT_KD,
     PD_DEFAULT_KI,
     PD_DEFAULT_KP,
+    PATH_FF_ENABLED,
+    PATH_FF_LOOKAHEAD_S,
+    PATH_FF_TILT_MAX_DEG,
+    PD_AUTOTUNE_G_EFF,
     PD_D_TERM_LIMIT_DEG,
     PD_I_ENABLED,
     PD_I_ERR_DEADBAND_MM,
@@ -467,13 +472,23 @@ class BallController:
             x, y, vx, vy, self.kp, self.kd
         )
 
+        # Latency compensation: the command computed now takes effect
+        # ~2-3 frames from now (camera exposure + processing + serial +
+        # servo). Control errors are computed against the ball
+        # extrapolated forward by CONTROL_PREDICT_S — ~20 deg of phase
+        # recovered at the 0.78 Hz problem mode. The alpha-beta velocity
+        # is clean enough that the extrapolation adds negligible noise.
+        px = x + vx * CONTROL_PREDICT_S
+        py = y + vy * CONTROL_PREDICT_S
+
         # Path follower (feat/path): advances the override target along the
         # loaded path at the adaptive rate, seeded at the nearest path
-        # point on the first ball sighting. The override is stamped only
-        # when the target actually moves (hygiene: last_change_time means
-        # what it says for any downstream reader).
+        # point on the first ball sighting (predicted position: the taper
+        # should gate on where the ball WILL be when the command lands).
+        # The override is stamped only when the target actually moves
+        # (hygiene: last_change_time means what it says downstream).
         if self._path_follower.active:
-            ptx, pty = self._path_follower.update(x, y)
+            ptx, pty = self._path_follower.update(px, py)
             if not (
                 self._arbiter.override_active
                 and self._arbiter.active == (ptx, pty)
@@ -481,8 +496,30 @@ class BallController:
                 self._arbiter.set_override(ptx, pty)
 
         target_x, target_y = self._arbiter.active
-        pos_vec_x = target_x - x
-        pos_vec_y = target_y - y
+        pos_vec_x = target_x - px
+        pos_vec_y = target_y - py
+
+        # Trajectory feedforward: the path's desired velocity feeds the
+        # D-term (damping velocity ERROR instead of braking the desired
+        # motion — this WAS the entire kd/kp pursuit lag) and its
+        # centripetal acceleration becomes a direct tilt term, evaluated
+        # ahead by the pipeline latency. The wobble no longer outweighs
+        # the drive: path motion is commanded, error only corrects.
+        v_des = (0.0, 0.0)
+        ff = (0.0, 0.0)
+        if PATH_FF_ENABLED and self._path_follower.active:
+            vdx, vdy, adx, ady = self._path_follower.feedforward(
+                PATH_FF_LOOKAHEAD_S
+            )
+            v_des = (vdx, vdy)
+            ff_x = adx / float(PD_AUTOTUNE_G_EFF)
+            ff_y = ady / float(PD_AUTOTUNE_G_EFF)
+            ff_mag = math.hypot(ff_x, ff_y)
+            if ff_mag > PATH_FF_TILT_MAX_DEG:
+                scale = PATH_FF_TILT_MAX_DEG / ff_mag
+                ff_x *= scale
+                ff_y *= scale
+            ff = (ff_x, ff_y)
 
         # Integral action happens INSIDE _pd.compute below (I-term
         # rework) — the step is taken in the same call that uses it, so
@@ -577,6 +614,8 @@ class BallController:
                 if self.home_calibration_active
                 else None
             ),
+            v_des=v_des,
+            ff=ff,
         )
 
         # Home-cal convergence watcher (after the compute so this
@@ -605,6 +644,8 @@ class BallController:
             "i_atten": res.i_atten,
             "i_frozen": res.i_frozen,
             "i_rate_deg_s": self._pd.i_rate_deg_s,
+            "ff_vec": res.ff_vec,
+            "v_des_mm_s": v_des,
             "home_cal_converge_s": self._home_cal_flat_s,
             **self._trim.telemetry(self.auto_trim_enabled),
             "rest_state": rest_state,

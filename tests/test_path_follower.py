@@ -317,3 +317,56 @@ class TestIdleNoOp:
         assert tel["path_state"] == "idle"
         assert tel["path_active"] is False
         assert tel["path_s_mm"] == 0.0
+
+
+class TestFeedforward:
+    def test_circle_tangent_and_centripetal(self) -> None:
+        clock = _FakeClock()
+        follower = PathFollower(clock=clock, speed_mm_s=30.0)
+        follower.set_path(circle())
+        follower.start()
+        # Seed near (65, 0); one on-target update -> factor 1.
+        follower.update(65.0, 0.0)
+        clock.advance(1 / 30)
+        follower.update(65.0, 0.0)
+        vdx, vdy, adx, ady = follower.feedforward(0.0)
+        # Desired speed = commanded speed at factor 1.
+        assert math.hypot(vdx, vdy) == pytest.approx(30.0, rel=0.02)
+        # Tangent is perpendicular to the radius at (65, 0) -> mostly y.
+        assert abs(vdx) < 3.0
+        # Centripetal points INWARD (-x here) with magnitude v^2/r.
+        assert adx == pytest.approx(-(30.0 ** 2) / 65.0, rel=0.15)
+        assert abs(ady) < 3.0
+
+    def test_zero_when_not_following(self) -> None:
+        clock = _FakeClock()
+        follower = PathFollower(clock=clock)
+        follower.set_path(circle())
+        assert follower.feedforward(0.1) == (0.0, 0.0, 0.0, 0.0)
+        follower.start()                       # armed, not yet seeded
+        assert follower.feedforward(0.1) == (0.0, 0.0, 0.0, 0.0)
+
+    def test_zero_when_stalled(self) -> None:
+        clock = _FakeClock()
+        follower = PathFollower(clock=clock, speed_mm_s=30.0)
+        follower.set_path(circle())
+        follower.start()
+        follower.update(65.0, 0.0)             # seed
+        clock.advance(1 / 30)
+        follower.update(20.0, 0.0)             # 45 mm short -> stalled
+        assert follower.telemetry()["path_state"] == "stalled"
+        assert follower.feedforward(0.1) == (0.0, 0.0, 0.0, 0.0)
+
+    def test_lookahead_rotates_the_tangent(self) -> None:
+        clock = _FakeClock()
+        follower = PathFollower(clock=clock, speed_mm_s=30.0)
+        follower.set_path(circle())
+        follower.start()
+        follower.update(65.0, 0.0)
+        clock.advance(1 / 30)
+        follower.update(65.0, 0.0)
+        v_now = follower.feedforward(0.0)[:2]
+        v_ahead = follower.feedforward(1.0)[:2]   # 30 mm ahead on the arc
+        # Direction changed by roughly 30/65 rad ~ 26 deg.
+        dot = (v_now[0] * v_ahead[0] + v_now[1] * v_ahead[1]) / (30.0 * 30.0)
+        assert 0.75 < dot < 0.98

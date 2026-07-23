@@ -203,6 +203,28 @@ class TestLimitAndFlags:
         assert pd.i_roll_contrib == 0.0
 
 
+class TestFeedforward:
+    def test_d_term_damps_velocity_error_not_motion(self) -> None:
+        clock = FakeClock()
+        pd = _make(clock)
+        # Ball moving exactly at the desired velocity: zero D braking —
+        # commanded trajectory motion is never fought.
+        res = pd.compute(0.0, 0.0, 30.0, -10.0, 0.0, 0.0,
+                         v_des=(30.0, -10.0))
+        assert res.d_term == pytest.approx((0.0, 0.0))
+        # Zero v_des reproduces classic velocity damping exactly.
+        res = pd.compute(0.0, 0.0, 30.0, 0.0, 0.0, 0.0)
+        assert res.d_term[0] == pytest.approx(0.022 * -30.0)
+
+    def test_ff_maps_into_raws_like_pd(self) -> None:
+        clock = FakeClock()
+        pd = _make(clock)
+        res = pd.compute(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, ff=(0.5, 0.3))
+        assert res.pitch_raw == pytest.approx(0.5)    # +ff_x
+        assert res.roll_raw == pytest.approx(-0.3)    # -(ff_y)
+        assert res.ff_vec == (0.5, 0.3)
+
+
 class TestFoldAndResets:
     def test_take_integrator_maps_and_zeros(self) -> None:
         clock = FakeClock()

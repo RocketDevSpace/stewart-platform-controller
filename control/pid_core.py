@@ -44,6 +44,7 @@ class PIDResult:
     i_sat: tuple[bool, bool] = (False, False)
     i_atten: float = 1.0
     i_frozen: bool = False
+    ff_vec: tuple[float, float] = (0.0, 0.0)
 
 
 class PIDCore:
@@ -149,6 +150,8 @@ class PIDCore:
         slew_target_override: tuple[float, float] | None = None,
         freeze_integrator: bool = False,
         i_limit_override: float | None = None,
+        v_des: tuple[float, float] = (0.0, 0.0),
+        ff: tuple[float, float] = (0.0, 0.0),
     ) -> PIDResult:
         """One PID step from error vector (ex, ey) and ball velocity.
 
@@ -164,11 +167,19 @@ class PIDCore:
         freeze_integrator holds the integral exactly (no step, no leak).
         i_limit_override widens/narrows the integral clamp for this call
         (home calibration uses the wide limit).
+
+        v_des (mm/s, error space): the DESIRED ball velocity — the
+        derivative term damps velocity ERROR (v_des - v), not raw
+        velocity, so commanded trajectory motion is never braked (a
+        zero v_des reproduces classic velocity damping exactly).
+        ff (deg, error space): feedforward tilt added beside P/I/D
+        (path centripetal pre-tilt), mapped to pitch/roll like the
+        other x/y terms.
         """
         p_x = self.kp * ex
         p_y = self.kp * ey
-        d_x = self.kd * (-vx)
-        d_y = self.kd * (-vy)
+        d_x = self.kd * (v_des[0] - vx)
+        d_y = self.kd * (v_des[1] - vy)
 
         # Derivative term cap (FG-11)
         if self.d_term_limit_deg is not None:
@@ -179,12 +190,12 @@ class PIDCore:
         pd_y = p_y + d_y
 
         i_atten = self._step_integrator(
-            ex, ey, pd_x, pd_y, roll_offset, pitch_offset,
+            ex, ey, pd_x + ff[0], pd_y + ff[1], roll_offset, pitch_offset,
             freeze_integrator, i_limit_override,
         )
 
-        pitch_raw = pd_x + self._i_x + pitch_offset
-        roll_raw = -(pd_y + self._i_y) + roll_offset
+        pitch_raw = pd_x + self._i_x + ff[0] + pitch_offset
+        roll_raw = -(pd_y + self._i_y + ff[1]) + roll_offset
         roll_clamped = _clamp(roll_raw, -self.max_tilt_deg, self.max_tilt_deg)
         pitch_clamped = _clamp(pitch_raw, -self.max_tilt_deg, self.max_tilt_deg)
 
@@ -222,6 +233,7 @@ class PIDCore:
             ),
             i_atten=i_atten,
             i_frozen=freeze_integrator,
+            ff_vec=ff,
         )
 
     def _step_integrator(
