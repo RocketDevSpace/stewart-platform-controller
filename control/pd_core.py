@@ -1,10 +1,23 @@
 """
 control/pd_core.py
 
-PDCore — pure PD math for the ball balancer: proportional + derivative
-terms, the derivative-term cap (FG-11), the max-tilt clamp, and the
-commanded-tilt slew ("tilt rate") limiter (FG-11). No target, trim, or
-autotune knowledge; the caller supplies error vectors and offsets.
+PDCore — pure PID math for the ball balancer: proportional + derivative
+terms, the derivative-term cap (FG-11), a true integral term (the loop's
+ONLY integral action — it cancels standing tilt bias the pure P+D cannot),
+the max-tilt clamp, and the commanded-tilt slew ("tilt rate") limiter
+(FG-11). No target, trim, or autotune knowledge; the caller supplies
+error vectors and offsets.
+
+Integral protections (all continuous — no gates, no state machine):
+- error-weighted taper: full integration at |e| <= i_err_full_mm, zero at
+  >= i_err_zero_mm (flick protection; replaces the old settle gates)
+- per-axis conditional anti-windup: no integration in the direction that
+  would deepen an active tilt-clamp saturation
+- exponential leak (i_leak_tau_s): a mis-learned correction bleeds out on
+  its own; steady-state accuracy cost is ~kp/(kp + ki*tau) — sub-mm here
+- clamp to ±i_limit_deg (caller may widen per-call, e.g. home cal)
+- freeze_integrator holds the value exactly (leak paused too) — used
+  while autotune owns the loop or the I feature is toggled off
 """
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,7 +29,7 @@ def _clamp(value: float, min_val: float, max_val: float) -> float:
 
 @dataclass
 class PDResult:
-    """Intermediate and final values of one PD step (terms-dict inputs)."""
+    """Intermediate and final values of one PID step (terms-dict inputs)."""
 
     p_term: tuple[float, float]
     d_term: tuple[float, float]
@@ -27,6 +40,10 @@ class PDResult:
     pitch_clamped: float
     roll_cmd: float
     pitch_cmd: float
+    i_term: tuple[float, float] = (0.0, 0.0)
+    i_sat: tuple[bool, bool] = (False, False)
+    i_atten: float = 1.0
+    i_frozen: bool = False
 
 
 class PDCore:
@@ -38,6 +55,11 @@ class PDCore:
         max_tilt_rate_deg_s: float,
         d_term_limit_deg: float | None,
         clock: Callable[[], float],
+        ki: float = 0.0,
+        i_limit_deg: float = 1.5,
+        i_leak_tau_s: float = 25.0,
+        i_err_full_mm: float = 25.0,
+        i_err_zero_mm: float = 60.0,
     ) -> None:
         self._clock = clock
         self.kp = float(kp)
@@ -47,16 +69,59 @@ class PDCore:
         self.d_term_limit_deg = (
             None if d_term_limit_deg is None else float(d_term_limit_deg)
         )
+        self.ki = float(ki)
+        self.i_limit_deg = float(i_limit_deg)
+        self.i_leak_tau_s = float(i_leak_tau_s)
+        self.i_err_full_mm = float(i_err_full_mm)
+        self.i_err_zero_mm = float(i_err_zero_mm)
 
         # Slew limit state (FG-11)
         self._prev_roll_cmd = 0.0
         self._prev_pitch_cmd = 0.0
         self._prev_cmd_time: float | None = None
 
+        # Integral state — ERROR space (x, y), like p/d, mapped to
+        # pitch/roll at the raw-command step. Own timebase, separate
+        # from the slew clock: reset_motion_state() must not disturb
+        # the learned correction or its dt.
+        self._i_x = 0.0
+        self._i_y = 0.0
+        self._i_prev_time: float | None = None
+
     def reset_motion_state(self) -> None:
+        """Clear slew state (tracking loss/reacquire). The integral is
+        deliberately KEPT — it is learned plate knowledge, not motion
+        state; staleness is the leak's job."""
         self._prev_roll_cmd = 0.0
         self._prev_pitch_cmd = 0.0
         self._prev_cmd_time = None
+
+    def reset_integrator(self) -> None:
+        self._i_x = 0.0
+        self._i_y = 0.0
+        self._i_prev_time = None
+
+    @property
+    def i_pitch_contrib(self) -> float:
+        """The integral's contribution to pitch_raw (axis-mapped)."""
+        return self._i_x
+
+    @property
+    def i_roll_contrib(self) -> float:
+        """The integral's contribution to roll_raw (axis-mapped)."""
+        return -self._i_y
+
+    def take_integrator(self) -> tuple[float, float]:
+        """Atomically drain the integral as (roll, pitch) contributions.
+
+        The fold primitive: TrimStore.fold(*pd.take_integrator()) moves
+        the learned correction into persistent trim with zero net change
+        to the commanded output (trim rises by exactly what I gave up).
+        """
+        out = (self.i_roll_contrib, self.i_pitch_contrib)
+        self._i_x = 0.0
+        self._i_y = 0.0
+        return out
 
     def compute(
         self,
@@ -67,17 +132,23 @@ class PDCore:
         roll_offset: float,
         pitch_offset: float,
         slew_target_override: tuple[float, float] | None = None,
+        freeze_integrator: bool = False,
+        i_limit_override: float | None = None,
     ) -> PDResult:
-        """One PD step from error vector (ex, ey) and ball velocity.
+        """One PID step from error vector (ex, ey) and ball velocity.
 
-        slew_target_override, when given, replaces the clamped PD command
+        slew_target_override, when given, replaces the clamped PID command
         as the SLEW LIMITER's target (roll, pitch) for this step (rest
-        mode parks the platform at level + trim through this path). The
-        full PD pipeline still runs — every intermediate term is computed
-        and reported — and the shared prev-command slew state advances
-        toward the override instead, so the transition is rate-limited
-        and a later normal step resumes continuously from the true last
-        command.
+        mode parks the platform at level + trim + I through this path).
+        The full PID pipeline still runs — every intermediate term is
+        computed and reported — and the shared prev-command slew state
+        advances toward the override instead, so the transition is
+        rate-limited and a later normal step resumes continuously from
+        the true last command.
+
+        freeze_integrator holds the integral exactly (no step, no leak).
+        i_limit_override widens/narrows the integral clamp for this call
+        (home calibration uses the wide limit).
         """
         p_x = self.kp * ex
         p_y = self.kp * ey
@@ -92,8 +163,13 @@ class PDCore:
         pd_x = p_x + d_x
         pd_y = p_y + d_y
 
-        pitch_raw = pd_x + pitch_offset
-        roll_raw = -pd_y + roll_offset
+        i_atten = self._step_integrator(
+            ex, ey, pd_x, pd_y, roll_offset, pitch_offset,
+            freeze_integrator, i_limit_override,
+        )
+
+        pitch_raw = pd_x + self._i_x + pitch_offset
+        roll_raw = -(pd_y + self._i_y) + roll_offset
         roll_clamped = _clamp(roll_raw, -self.max_tilt_deg, self.max_tilt_deg)
         pitch_clamped = _clamp(pitch_raw, -self.max_tilt_deg, self.max_tilt_deg)
 
@@ -110,6 +186,10 @@ class PDCore:
             )
         roll_cmd, pitch_cmd = self._apply_slew_limit(slew_roll, slew_pitch)
 
+        i_limit = (
+            self.i_limit_deg if i_limit_override is None
+            else float(i_limit_override)
+        )
         return PDResult(
             p_term=(p_x, p_y),
             d_term=(d_x, d_y),
@@ -120,7 +200,90 @@ class PDCore:
             pitch_clamped=pitch_clamped,
             roll_cmd=roll_cmd,
             pitch_cmd=pitch_cmd,
+            i_term=(self._i_x, self._i_y),
+            i_sat=(
+                abs(self._i_x) >= i_limit - 1e-9,
+                abs(self._i_y) >= i_limit - 1e-9,
+            ),
+            i_atten=i_atten,
+            i_frozen=freeze_integrator,
         )
+
+    def _step_integrator(
+        self,
+        ex: float,
+        ey: float,
+        pd_x: float,
+        pd_y: float,
+        roll_offset: float,
+        pitch_offset: float,
+        freeze: bool,
+        i_limit_override: float | None,
+    ) -> float:
+        """Advance the integral one step; returns the taper weight used.
+
+        The step happens BEFORE the raw command is formed, so this
+        frame's integral feeds this frame's output (same-frame ordering,
+        matching the pre-rework trim behavior). Anti-windup is per-axis
+        and directional: with the provisional raw command (current I)
+        tilt-clamped, integration is blocked only in the direction that
+        would deepen the saturation — un-integrating out of it stays
+        allowed.
+        """
+        err_mag = (ex * ex + ey * ey) ** 0.5
+        span = max(1e-6, self.i_err_zero_mm - self.i_err_full_mm)
+        weight = _clamp((self.i_err_zero_mm - err_mag) / span, 0.0, 1.0)
+        if self.ki <= 0.0 or freeze:
+            return weight
+
+        now = self._clock()
+        if self._i_prev_time is None:
+            # First call seeds the timebase only — the first frame
+            # contributes no integral (exact-PD single-call behavior
+            # is preserved for callers/tests that expect it).
+            self._i_prev_time = now
+            return weight
+        dt = _clamp(now - self._i_prev_time, 1e-4, 0.1)
+        self._i_prev_time = now
+
+        # Provisional raw commands with the CURRENT integral decide the
+        # anti-windup directions for this step.
+        pitch_prov = pd_x + self._i_x + pitch_offset
+        roll_prov = -(pd_y + self._i_y) + roll_offset
+
+        # x axis drives pitch directly: growth blocked in the sign that
+        # deepens a pitch saturation.
+        allow_x = not (
+            (pitch_prov >= self.max_tilt_deg and ex > 0.0)
+            or (pitch_prov <= -self.max_tilt_deg and ex < 0.0)
+        )
+        # y axis drives roll NEGATED (roll_raw = -(pd_y + i_y) + offset):
+        # i_y growth (ey > 0) pushes roll_raw DOWN, so a low-saturated
+        # roll blocks positive ey integration and a high-saturated roll
+        # blocks negative ey integration.
+        allow_y = not (
+            (roll_prov <= -self.max_tilt_deg and ey > 0.0)
+            or (roll_prov >= self.max_tilt_deg and ey < 0.0)
+        )
+
+        step = self.ki * weight * dt
+        if allow_x:
+            self._i_x += step * ex
+        if allow_y:
+            self._i_y += step * ey
+
+        if self.i_leak_tau_s > 0.0:
+            decay = 1.0 - dt / self.i_leak_tau_s
+            self._i_x *= decay
+            self._i_y *= decay
+
+        i_limit = (
+            self.i_limit_deg if i_limit_override is None
+            else float(i_limit_override)
+        )
+        self._i_x = _clamp(self._i_x, -i_limit, i_limit)
+        self._i_y = _clamp(self._i_y, -i_limit, i_limit)
+        return weight
 
     def _apply_slew_limit(self, roll: float, pitch: float) -> tuple[float, float]:
         now = self._clock()
