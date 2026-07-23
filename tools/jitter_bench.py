@@ -187,13 +187,21 @@ def run_bench(
     samples: list[tuple[float, float, float]],
     label: str,
     filter_mode: str | None = None,
+    pos_bias_mm: float = 0.0,
 ) -> dict[str, object]:
     """Push the samples through the production chain; return the metrics.
 
     filter_mode overrides settings.TRACKER_FILTER_MODE for A/B runs
-    (None = whatever the settings default is)."""
+    (None = whatever the settings default is).
+
+    pos_bias_mm shifts every sample's x by a constant — the ball sits
+    that far from the target throughout, modeling a standing tilt/trim
+    error. Used to bench integral-action convergence (send burst then
+    silence) and its absence (permanent offset)."""
     if not samples:
         raise ValueError("no samples to bench")
+    if pos_bias_mm:
+        samples = [(t, x + pos_bias_mm, y) for t, x, y in samples]
 
     clock = FakeClock()
     meas = MeasurementFilter() if filter_mode is None else MeasurementFilter(filter_mode)
@@ -331,6 +339,11 @@ def main(argv: list[str] | None = None) -> int:
         help="override settings.TRACKER_FILTER_MODE for A/B comparison",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--pos-bias-mm", type=float, default=0.0,
+        help="constant x offset on every sample (standing trim-error "
+             "model for integral-action A/B)",
+    )
     args = parser.parse_args(argv)
 
     if args.csv:
@@ -340,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
         samples = build_profile(args.profile, args.frames, args.fps, args.seed)
         label = args.profile
 
-    report = run_bench(samples, label, args.filter_mode)
+    report = run_bench(samples, label, args.filter_mode, args.pos_bias_mm)
     if args.json:
         print(json.dumps(report, indent=2))
     else:

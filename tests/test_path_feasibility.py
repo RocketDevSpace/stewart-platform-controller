@@ -42,3 +42,34 @@ class TestStarFeasibility:
         # the taper slows the target, the ball recovers — no divergence.
         res = simulate_path_following(star(), 25.0, 40.0)
         assert res.max_err_mm < 25.0
+
+
+# Rig-measured warp field, 2026-07-23: bowl coefficient 0.0055 deg/mm
+# (0.36 deg extra tilt needed at r=65, ball equilibrium 8 mm inside the
+# circle) plus a stale-trim constant bias. See the [I-term] commits.
+RIG_WARP_C = 0.0055
+RIG_STALE_TRIM_ROLL = 0.6
+RIG_STALE_TRIM_PITCH = 0.6
+
+
+class TestWarpFieldFailurePin:
+    """The 2026-07-23 rig deadlock, reproduced in sim.
+
+    With the warp field + stale trim and NO integral action anywhere
+    (BallController defaults: auto-trim disabled, ki unwired), the
+    standing offset meets/exceeds the 20 mm capture radius, the advance
+    factor pins at 0, and the follower never leaves the seed point. The
+    original feasibility suite missed this because its plant was
+    perfectly trimmed — a zero-constant-disturbance plant cannot expose
+    a missing integrator.
+    """
+
+    def test_circle_with_warp_and_no_integral_never_advances(self) -> None:
+        res = simulate_path_following(
+            circle(), 30.0, 40.0,
+            warp_c_deg_per_mm=RIG_WARP_C,
+            warp_bias_roll_deg=RIG_STALE_TRIM_ROLL,
+            warp_bias_pitch_deg=RIG_STALE_TRIM_PITCH,
+        )
+        assert res.laps == 0
+        assert res.mean_advance_mm_s < 2.0
