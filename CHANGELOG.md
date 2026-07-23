@@ -13,9 +13,10 @@ PR: the 2026-07-20 firmware capture and the 2026-07-22 six-step overhaul
 (absorbs milestones M9–M12; driven by the five-agent full-repo review — see
 `docs/code-review-2026-07-22.md` for the finding-by-finding record).
 The 2026-07-22 performance pass (branch `perf/latency-jitter`, stacked on
-the overhaul) and the path-following feature (branch `feat/path-following`,
-stacked on the perf pass) are recorded in their own subsections at the end
-of [Unreleased].
+the overhaul), the path-following feature (branch `feat/path-following`,
+stacked on the perf pass), and the 2026-07-23 I-term rework (branch
+`rework/integral-trim`, stacked on path following) are recorded in their
+own subsections at the end of [Unreleased].
 
 ### Added
 - `firmware/` — captured Uno firmware (2026-07-20): byte-for-byte flash dump
@@ -243,6 +244,71 @@ to slower laps, never to losing the ball.
   `target_x_mm`/`target_y_mm` from control terms over the stale GUI
   mirror args — moving path and autotune-leg targets render where the
   controller actually aimed that frame (step 7).
+
+### I-term rework (branch `rework/integral-trim`, 2026-07-23)
+
+The first path-following rig session traced a family of field failures
+(home-cal stalls, rest rocking, the path deadlock, a measured 1.2 Hz
+burst limit cycle — 200 movement bursts in 206 s) to one architecture:
+the gated AutoTrim position-error integrator. It integrated the wrong
+signal through five gates into a single global scalar, while the plate's
+real correction need is position-dependent (rig-measured: ~0.36° more
+tilt at r=65 mm than center — ball equilibrium 8 mm inside the circle).
+
+#### Added
+- True integral term in `control/pd_core.py` — the loop's ONLY integral
+  action, continuous (no gates): error-magnitude taper (full ≤ 25 mm,
+  zero ≥ 60 mm — flick protection), per-axis directional anti-windup at
+  the tilt clamp, 25 s exponential leak, ±1.5° clamp (6° during
+  home-cal), freeze-in-place semantics (autotune sessions / feature
+  toggle / rest), `take_integrator()` fold primitive, `i_rate_deg_s`
+  settle telemetry. ki = 0.030 deg/(mm·s): τ_I = 1.5 s, I-corner above
+  the 30 mm/s carrot rotation, ~8° phase cost at the 0.77 Hz mode.
+- `control/trim_store.py` — trim demoted to a pure store: manual
+  offsets, reset, `fold()` (integral → persistent trim, clamped ±8°).
+- Home calibration auto-completes: the controller watches for a flat
+  integral (< 0.05°/axis over 2 s) with the ball slow and NEAR CENTER
+  (the radius gate refuses to fold an integral saturated flat by an
+  unreachable ball), folds, cancels, and the GUI auto-saves via the
+  transient `home_cal_event` terms entry. Timeout (30 s) cancels
+  without folding and discards the windup. Save Trim routes through
+  the same fold path (`vision_trim_fold_requested` → worker
+  `fold_trim` → `{"type": "saved"}` event → one GUI save handler).
+- Sim honesty: `tools/path_sim.py` plant gained the measured warp
+  field (`--warp-c`, `--warp-bias-*`) and Coulomb rolling resistance
+  (0.06° cone — a frictionless ball can never rest, so every rest
+  conclusion from the old plant was untrustworthy); `jitter_bench.py`
+  gained `--pos-bias-mm`. Feasibility suite pins the deadlock
+  reproduction (integral off: 0 laps) and the recovery (integral on,
+  same field: 2 laps @ 29.8 mm/s ≈ 99% of commanded, max_err 13 mm)
+  plus a ki bias-cancel sweep.
+
+#### Changed
+- Rest-mode interlocks (both sim-caught before hardware): rest ENTRY
+  now requires the integral flat (`REST_I_RATE_MAX_DEG_S`) — entering
+  on a converging integral limit-cycled at ~0.2 Hz (the same
+  structural cycle as the old stale-trim "rocking"); and the integral
+  FREEZES while resting (an integrator on an undamped parked ball is
+  structurally unstable; freezing also pauses the leak so long rests
+  keep their learned correction). Sim endgame: converge → rest →
+  integral frozen at the learned bias → total servo silence, ball
+  ~1.2 mm from target (was a 9.4 mm standing offset).
+- Autotune coordination simplified: the integral freeze is derived
+  from `autotuner.enabled` (the old auto-trim flag stash/restore is
+  gone); `auto_trim_enabled` now means "integral enabled", default ON
+  (`PD_I_ENABLED` — load-bearing for path following).
+- Terms contract amended (dated, deliberate): 23 `auto_trim_*`
+  gate/state keys removed; `i_term`, `i_sat_x/y`, `i_atten`,
+  `i_frozen`, `i_rate_deg_s`, `home_cal_converge_s`, transient
+  `home_cal_event` added. Home-cal GUI diagnostics rewritten around
+  the integral (i vector, rate, flat-window progress).
+- `PD_DEFAULT_KI` joined the settings overlay whitelist (13 keys).
+
+#### Removed
+- `control/auto_trim.py` (~200-line gated integrator state machine)
+  and its 11 `AUTO_TRIM_*` settings keys.
+- The path stall-thaw special case from 983583f (symptom patch,
+  obsoleted by the integral) and `notify_target_changed()`.
 
 ---
 
