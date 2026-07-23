@@ -219,6 +219,28 @@ PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC: float = 0.50   # max fractional change per tria
 AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 
 # =============================================================================
+# Path following (control/patterns.py + control/path_follower.py)
+# =============================================================================
+# The follower advances a target point along a pattern path, tapering the
+# advance rate with the ball's tracking error: full speed while the ball is
+# within PATH_FULL_SPEED_RADIUS_MM of the target, linearly down to frozen at
+# PATH_CAPTURE_RADIUS_MM. If the ball cannot keep up, the target waits.
+# Default target speed: ~2/3 of the analytic 35 mm/s stall ceiling at
+# default PD gains.
+PATH_SPEED_MM_S = 30.0
+PATH_SPEED_MIN_MM_S = 10.0
+# MAX is above the default-gain ceiling on purpose — headroom for retuned
+# gains; the adaptive taper keeps any setting safe.
+PATH_SPEED_MAX_MM_S = 80.0
+PATH_CAPTURE_RADIUS_MM = 20.0     # advance frozen at/above this tracking error
+# Taper start; deadband so the healthy ~12 mm pursuit lag is not misread
+# as a stall.
+PATH_FULL_SPEED_RADIUS_MM = 10.0
+# Radial clamp; just inside the 84.85 mm ArUco marker-corner radius.
+PATH_MAX_RADIUS_MM = 85.0
+PATH_POINT_SPACING_MM = 2.0       # uniform resample spacing
+
+# =============================================================================
 # Loop rates
 # =============================================================================
 CONTROL_LOOP_INTERVAL_MS = 20

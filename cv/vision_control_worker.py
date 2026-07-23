@@ -21,6 +21,7 @@ import numpy as np
 from PyQt5 import QtCore
 
 from control.ball_controller import BallController
+from control.patterns import PATTERNS
 from core.ik_engine import IKEngine
 from core.platform_state import BallState, IKResult, Pose
 from cv.ball_tracker import BallTracker
@@ -34,6 +35,7 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KP,
     TRACKER_HSV_H_MAX,
@@ -146,6 +148,11 @@ class VisionControlWorker(QtCore.QObject):
         self._roll_offset_init = float(roll_offset)
         self._pitch_offset_init = float(pitch_offset)
         self._auto_trim_enabled_init = bool(auto_trim_enabled)
+        # Path following: pattern label + speed are cached and applied at
+        # start(); following itself is NEVER cached — a fresh session
+        # always begins with the follower idle.
+        self._path_pattern_init: str = ""
+        self._path_speed_init = float(PATH_SPEED_MM_S)
 
         self._timer: QtCore.QTimer | None = None
         self._running = False
@@ -241,6 +248,16 @@ class VisionControlWorker(QtCore.QObject):
                 "period_ms": cam_stats.period_ms,
                 "gray": cam_stats.gray_mean,
             })
+
+        # Apply the cached path init (pattern + speed) to the configured
+        # controller. Following is NEVER auto-started here — a fresh
+        # session always begins with the follower idle.
+        if self.ball_controller is not None:
+            if self._path_pattern_init and self._path_pattern_init in PATTERNS:
+                self.ball_controller.set_path(
+                    PATTERNS[self._path_pattern_init]()
+                )
+            self.ball_controller.set_path_speed(self._path_speed_init)
 
         # Event-driven tick: every published frame nudges _tick via the
         # queued _frame_arrived bridge (the QTimer below stays as the
@@ -387,6 +404,30 @@ class VisionControlWorker(QtCore.QObject):
     def apply_pd_autotune_recommendation(self) -> None:
         if self.ball_controller is not None:
             self.ball_controller.apply_pd_autotune_recommendation()
+
+    @QtCore.pyqtSlot(str)
+    def set_path_pattern(self, label: str) -> None:
+        """Cache the pattern label ("" = none) and load it when running."""
+        self._path_pattern_init = str(label)
+        if self.ball_controller is not None and label in PATTERNS:
+            self.ball_controller.set_path(PATTERNS[label]())
+
+    @QtCore.pyqtSlot(bool)
+    def set_path_following(self, enabled: bool) -> None:
+        """Start/stop following. Deliberately NOT cached: following never
+        auto-starts on a fresh session."""
+        if self.ball_controller is None:
+            return
+        if bool(enabled):
+            self.ball_controller.start_path()
+        else:
+            self.ball_controller.stop_path()
+
+    @QtCore.pyqtSlot(float)
+    def set_path_speed(self, mm_s: float) -> None:
+        self._path_speed_init = float(mm_s)
+        if self.ball_controller is not None:
+            self.ball_controller.set_path_speed(float(mm_s))
 
     # ------------------------------------------------------------------
     # Inner loop

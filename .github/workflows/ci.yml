@@ -9,8 +9,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter: stacked PRs (feature -> feature) must get CI
+  # too, not only PRs targeting main.
   pull_request:
-    branches: [main]
 
 jobs:
   test:

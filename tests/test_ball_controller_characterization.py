@@ -89,6 +89,16 @@ TERMS_KEYS = frozenset({
     "rest_radius_mm",
     "rest_speed_lpf_mm_s",
     "rest_hold_elapsed_s",
+    # Path-following keys added 2026-07-22 (feat/path) — additions to this
+    # set are allowed; removals/renames remain forbidden.
+    "path_active",
+    "path_state",
+    "path_name",
+    "path_progress",
+    "path_lap",
+    "path_s_mm",
+    "path_error_mm",
+    "path_speed_mm_s",
     "kp",
     "kd",
     "pd_autotune_enabled",

@@ -123,6 +123,10 @@ class ViewFakeTracker(FakeTracker):
 class FakeController:
     def __init__(self) -> None:
         self.resets = 0
+        self.paths: list[Any] = []
+        self.path_speeds: list[float] = []
+        self.start_path_calls = 0
+        self.stop_path_calls = 0
 
     def compute_with_terms(
         self, ball_state: BallState
@@ -131,6 +135,19 @@ class FakeController:
 
     def reset_motion_state(self) -> None:
         self.resets += 1
+
+    def set_path(self, path: Any) -> None:
+        self.paths.append(path)
+
+    def set_path_speed(self, mm_s: float) -> None:
+        self.path_speeds.append(float(mm_s))
+
+    def start_path(self) -> bool:
+        self.start_path_calls += 1
+        return True
+
+    def stop_path(self) -> None:
+        self.stop_path_calls += 1
 
 
 def _get_app() -> object:
@@ -380,6 +397,62 @@ class TestNeutralFallback:
         camera.advance()
         worker._tick()
         assert len(sent) == neutral_sends
+
+
+class TestPathSlots:
+    def test_slots_guard_none_controller(self) -> None:
+        worker, _, _ = _make_worker([])
+        worker.ball_controller = None
+        # Must not raise with no controller (pre-start / post-stop).
+        worker.set_path_pattern("Circle (r=65)")
+        worker.set_path_following(True)
+        worker.set_path_following(False)
+        worker.set_path_speed(42.0)
+
+    def test_pattern_and_speed_cached_prestart_applied_at_start(self) -> None:
+        worker, camera, controller = _make_worker([])
+        worker._running = False               # allow start() to run
+        saved = worker.ball_controller
+        worker.ball_controller = None         # pre-start: cache only
+        worker.set_path_pattern("Circle (r=65)")
+        worker.set_path_speed(55.0)
+        worker.ball_controller = saved
+        worker.start()
+        assert len(controller.paths) == 1
+        assert controller.paths[0].name.startswith("circle")
+        assert controller.path_speeds[-1] == 55.0
+        # Following must NEVER auto-start on a fresh session.
+        assert controller.start_path_calls == 0
+        worker.stop()
+
+    def test_following_never_autostarts_at_start(self) -> None:
+        worker, camera, controller = _make_worker([])
+        worker._running = False
+        worker.start()
+        assert controller.start_path_calls == 0
+        assert controller.stop_path_calls == 0
+        worker.stop()
+
+    def test_following_toggle_forwards_to_controller(self) -> None:
+        worker, _, controller = _make_worker([])
+        worker.set_path_following(True)
+        worker.set_path_following(False)
+        assert controller.start_path_calls == 1
+        assert controller.stop_path_calls == 1
+
+    def test_live_pattern_and_speed_forward_immediately(self) -> None:
+        worker, _, controller = _make_worker([])
+        worker.set_path_pattern("Circle (r=65)")
+        worker.set_path_speed(20.0)
+        assert len(controller.paths) == 1
+        assert controller.path_speeds == [20.0]
+
+    def test_unknown_or_empty_label_caches_without_set_path(self) -> None:
+        worker, _, controller = _make_worker([])
+        worker.set_path_pattern("Not A Pattern")
+        worker.set_path_pattern("")
+        assert controller.paths == []
+        assert worker._path_pattern_init == ""
 
 
 class TestErrorRateLimit:

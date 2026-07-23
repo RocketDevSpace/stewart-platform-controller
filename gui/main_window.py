@@ -30,6 +30,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 import settings_store
+from control.patterns import PATTERNS
 from control.pose_commander import PoseCommander
 from control.routine_runner import RoutineRunner
 from core.ik_engine import IKEngine
@@ -52,6 +53,7 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KP,
     SERIAL_BAUD,
@@ -81,6 +83,9 @@ class MainWindow(QWidget):
     vision_pd_autotune_enabled = QtCore.pyqtSignal(bool)
     vision_pd_autotune_auto_apply = QtCore.pyqtSignal(bool)
     vision_pd_autotune_apply = QtCore.pyqtSignal()
+    vision_path_pattern_selected = QtCore.pyqtSignal(str)
+    vision_path_following_set = QtCore.pyqtSignal(bool)
+    vision_path_speed_updated = QtCore.pyqtSignal(float)
     vision_snapshot_consumed = QtCore.pyqtSignal()
 
     def __init__(self) -> None:
@@ -151,6 +156,10 @@ class MainWindow(QWidget):
         # Worker-ack guard: after Apply Now, ignore has_suggestion=True from
         # stale snapshots until the worker reports has_suggestion False.
         self._autotune_apply_pending = False
+        # Path following mirrors (worker owns the truth via control_terms)
+        self._path_following_active = False
+        self._path_speed_mm_s = float(PATH_SPEED_MM_S)
+        self._last_path_status = ""
 
         # --- Routine timer ---
         self._routine_timer = QtCore.QTimer()
@@ -193,6 +202,13 @@ class MainWindow(QWidget):
             self._on_autotune_auto_apply_clicked
         )
         self.control_panel.hsv_changed.connect(self._on_hsv_changed)
+        self.control_panel.path_pattern_selected.connect(
+            self._on_path_pattern_selected
+        )
+        self.control_panel.path_toggled.connect(self._on_path_toggled)
+        self.control_panel.path_speed_changed.connect(
+            self._on_path_speed_changed
+        )
         self.control_panel.open_vision_monitor_clicked.connect(
             self._vision_monitor.show
         )
@@ -431,6 +447,8 @@ class MainWindow(QWidget):
             self.control_panel.append_preview(
                 "[AUTO HOME] calibration cancelled (target moved)"
             )
+        if self._path_following_active:
+            self._stop_path_following("[PATH] stopped (target moved)")
         self.vision_target_updated.emit(x_mm, y_mm)
 
     def _on_trim_changed(self, roll_deg: float, pitch_deg: float) -> None:
@@ -467,6 +485,13 @@ class MainWindow(QWidget):
         self.control_panel.sync_autotune_buttons(False, False)
         self.vision_pd_autotune_enabled.emit(False)
         self.vision_pd_autotune_auto_apply.emit(False)
+
+        # Path following released too — home calibration owns the target
+        # (the controller enforces this anyway — belt and braces).
+        self._path_following_active = False
+        self.control_panel.sync_path_button(False)
+        self.vision_path_following_set.emit(False)
+        self._vision_monitor.set_path_overlay(None)
 
         self._auto_trim_enabled = True
         self.control_panel.sync_auto_trim_button(True)
@@ -515,6 +540,12 @@ class MainWindow(QWidget):
             self.control_panel.sync_autotune_buttons(False, False)
             self.control_panel.append_preview("[PD TUNE] disabled")
         else:
+            # Path following released — autotune owns the target while it
+            # steps (the controller enforces this anyway — belt and braces).
+            self._path_following_active = False
+            self.control_panel.sync_path_button(False)
+            self.vision_path_following_set.emit(False)
+            self._vision_monitor.set_path_overlay(None)
             self.control_panel.append_preview("[PD TUNE] enabled")
         self.vision_pd_autotune_enabled.emit(enabled)
         self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
@@ -551,6 +582,70 @@ class MainWindow(QWidget):
         self, hmin: int, hmax: int, smin: int, smax: int, vmin: int, vmax: int
     ) -> None:
         self.vision_hsv_updated.emit(hmin, hmax, smin, smax, vmin, vmax)
+
+    # ------------------------------------------------------------------
+    # Path following handlers
+    # ------------------------------------------------------------------
+
+    def _stop_path_following(self, message: str) -> None:
+        """Shared stop path: worker signal, button sync, overlay clear."""
+        self._path_following_active = False
+        self.control_panel.sync_path_button(False)
+        self.vision_path_following_set.emit(False)
+        self._vision_monitor.set_path_overlay(None)
+        self.control_panel.append_preview(message)
+
+    def _on_path_pattern_selected(self, label: str) -> None:
+        if self._path_following_active:
+            self._stop_path_following("[PATH] stopped (pattern changed)")
+        self.vision_path_pattern_selected.emit(label)
+        # Preview the selected pattern on the vision monitor (pure
+        # geometry for display — playback stays in the worker/controller).
+        if label in PATTERNS:
+            path = PATTERNS[label]()
+            self._vision_monitor.set_path_overlay(path.points, path.closed)
+        else:
+            self._vision_monitor.set_path_overlay(None)
+
+    def _on_path_toggled(self, enabled: bool) -> None:
+        if not enabled:
+            self._stop_path_following("[PATH] stopped")
+            return
+
+        if not self._vision_enabled or self._vision_worker is None:
+            self.control_panel.append_preview("[PATH] start vision mode first")
+            self.control_panel.sync_path_button(False)
+            return
+
+        label = self.control_panel.current_pattern()
+        if not label:
+            self.control_panel.append_preview("[PATH] choose a pattern first")
+            self.control_panel.sync_path_button(False)
+            return
+
+        # Mutual exclusion: autotune and home calibration must release the
+        # target before the follower takes it over (the controller enforces
+        # this too — belt and braces).
+        self._pd_autotune_enabled = False
+        self._pd_autotune_auto_apply = False
+        self._pd_autotune_has_suggestion = False
+        self.control_panel.sync_autotune_buttons(False, False)
+        self.vision_pd_autotune_enabled.emit(False)
+        self.vision_pd_autotune_auto_apply.emit(False)
+        self._home_calibration_active = False
+        self.control_panel.sync_calibrate_button(False)
+        self.vision_calibrate_home_set.emit(False)
+
+        if label in PATTERNS:
+            path = PATTERNS[label]()
+            self._vision_monitor.set_path_overlay(path.points, path.closed)
+        self._path_following_active = True
+        self.vision_path_following_set.emit(True)
+        self.control_panel.append_preview(f"[PATH] following {label}")
+
+    def _on_path_speed_changed(self, mm_s: float) -> None:
+        self._path_speed_mm_s = float(mm_s)
+        self.vision_path_speed_updated.emit(self._path_speed_mm_s)
 
     # ------------------------------------------------------------------
     # Vision mode enable / disable
@@ -656,6 +751,15 @@ class MainWindow(QWidget):
         self.vision_pd_autotune_apply.connect(
             self._vision_worker.apply_pd_autotune_recommendation
         )
+        self.vision_path_pattern_selected.connect(
+            self._vision_worker.set_path_pattern
+        )
+        self.vision_path_following_set.connect(
+            self._vision_worker.set_path_following
+        )
+        self.vision_path_speed_updated.connect(
+            self._vision_worker.set_path_speed
+        )
         self.vision_snapshot_consumed.connect(
             self._vision_worker.mark_snapshot_consumed
         )
@@ -671,6 +775,10 @@ class MainWindow(QWidget):
         self.vision_calibrate_home_set.emit(self._home_calibration_active)
         self.vision_pd_autotune_enabled.emit(self._pd_autotune_enabled)
         self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
+        self.vision_path_pattern_selected.emit(
+            self.control_panel.current_pattern()
+        )
+        self.vision_path_speed_updated.emit(self._path_speed_mm_s)
         self.vision_hsv_updated.emit(*self.control_panel.get_hsv())
 
     def _stop_vision_worker_async(self) -> None:
@@ -696,6 +804,12 @@ class MainWindow(QWidget):
              self._vision_worker.set_pd_autotune_auto_apply),
             (self.vision_pd_autotune_apply,
              self._vision_worker.apply_pd_autotune_recommendation),
+            (self.vision_path_pattern_selected,
+             self._vision_worker.set_path_pattern),
+            (self.vision_path_following_set,
+             self._vision_worker.set_path_following),
+            (self.vision_path_speed_updated,
+             self._vision_worker.set_path_speed),
             (self.vision_snapshot_consumed,
              self._vision_worker.mark_snapshot_consumed),
         ]:
@@ -738,6 +852,11 @@ class MainWindow(QWidget):
         self.control_panel.sync_autotune_buttons(False, False)
         self._home_calibration_active = False
         self.control_panel.sync_calibrate_button(False)
+        self._path_following_active = False
+        self.control_panel.sync_path_button(False)
+        self.control_panel.set_path_status("path: idle")
+        self._last_path_status = ""
+        self._vision_monitor.set_path_overlay(None)
         # Close (hide) the monitor so it doesn't sit around showing the
         # last frozen frames; reopening starts fresh.
         self._vision_monitor.close()
@@ -840,6 +959,7 @@ class MainWindow(QWidget):
             self._sync_trim_from_terms(terms)
             self._sync_auto_trim_from_terms(terms)
             self._sync_home_calibration_from_terms(terms)
+            self._sync_path_from_terms(terms)
 
             # Timing plot — derived metrics measured HERE are injected at
             # the call site; the widget owns history/trim/redraw cadence.
@@ -947,6 +1067,25 @@ class MainWindow(QWidget):
         if active != self._home_calibration_active:
             self._home_calibration_active = active
             self.control_panel.sync_calibrate_button(active)
+
+    def _sync_path_from_terms(self, terms: dict) -> None:
+        if "path_active" not in terms:
+            return
+        active = bool(terms["path_active"])
+        if active != self._path_following_active:
+            self._path_following_active = active
+            self.control_panel.sync_path_button(active)
+        status = (
+            f"{terms.get('path_state', 'idle')} · "
+            f"lap {int(terms.get('path_lap', 0))} · "
+            f"{float(terms.get('path_progress', 0.0)) * 100:.0f}% · "
+            f"err {float(terms.get('path_error_mm', 0.0)):.0f}mm"
+        )
+        # Update only when the formatted text changed — snapshots arrive at
+        # GUI_SNAPSHOT_HZ and repainting an unchanged label is pure churn.
+        if status != self._last_path_status:
+            self._last_path_status = status
+            self.control_panel.set_path_status(status)
 
     def _sync_autotune_from_terms(self, terms: dict) -> None:
         enabled = bool(

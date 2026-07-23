@@ -40,6 +40,8 @@ control/
   pd_core.py           # PDCore — pure PD math: d-term cap, tilt clamp, slew limiter. ✅
   pose_commander.py    # PoseCommander — GUI-facing Pose→IK→servo facade (zero IK in gui/). ✅
   rest_gate.py         # RestGate — near-target rest mode: hold level+trim when ball is centered and slow; hysteretic same-cycle exit. ✅
+  patterns.py          # Path dataclass + pattern generators (circle/square/heart/star/from_points); PATTERNS registry. Pure math. ✅
+  path_follower.py     # PathFollower — adaptive-pacing engine: nearest-point seeding, error-tapered advance, lap/done tracking. Injected clock, no Qt. ✅
 
 cv/
   camera_source.py     # camera lifecycle: backend probe, capture thread, exposure policy, software gain, frame callback. ✅
@@ -62,10 +64,11 @@ tools/
   jitter_bench.py      # headless A/B bench: synthetic/CSV ball motion through the real filter→PD→IK→servo chain; flip/send/d-term metrics.
   latency_bench.py     # on-rig serial command→ack RTT percentiles through the real ServoDriver path.
   camera_probe.py      # on-rig fps × exposure sweep; measures real frame period/brightness, recommends a config.
+  path_sim.py          # closed-loop path-following feasibility sim: point-mass plant driven by the REAL filter→controller chain; CLI speed sweep.
 docs/
   codex_audit.md       # historical M7 audit of the original Codex branch.
   code-review-2026-07-22.md  # five-agent full-repo review record; maps findings → overhaul fixes.
-tests/                 # test_safety, test_serial_manager, test_servo_driver, test_ik_engine, test_ik_solver, test_routine_runner, test_ball_controller (+ characterization), test_ball_tracker, test_camera_source, test_vision_control_worker, test_settings_store, test_settings_overlay, test_measurement_filter, test_rest_gate, test_jitter_bench.
+tests/                 # test_safety, test_serial_manager, test_servo_driver, test_ik_engine, test_ik_solver, test_routine_runner, test_ball_controller (+ characterization, + paths), test_ball_tracker, test_camera_source, test_vision_control_worker, test_settings_store, test_settings_overlay, test_measurement_filter, test_rest_gate, test_jitter_bench, test_patterns, test_path_follower, test_path_feasibility.
 ```
 
 **Module ownership boundaries:**
@@ -89,6 +92,8 @@ tests/                 # test_safety, test_serial_manager, test_servo_driver, te
 **The post-refactor hardening phase (M8–M12, scoped 2026-06-11) is done.** M8 (housekeeping) merged earlier via PR #16. The remaining milestones — M9 (IK correctness), M10 (controller decomposition), M11 (vision split), M12 (settings overlay + GUI slimming) — were all absorbed into the **2026-07-22 overhaul** (branch `overhaul/safety-ik-vision-gui`, one PR), which grew out of a five-agent full-repo review that same day. The overhaul also shipped safety work that was never on the roadmap: serial-link hardening (write lock, crash-surviving read loop, disconnect reporting, latest-wins streaming writer, [READY] handshake), mode mutual exclusion in the GUI, and the `closeEvent` deadlock / `sys.excepthook` emergency-shutdown fixes. See `docs/code-review-2026-07-22.md` for the finding-by-finding record and `CHANGELOG.md` for what shipped.
 
 **2026-07-22 performance pass** (branch `perf/latency-jitter`, stacked on the overhaul): six measured steps against control-chain latency and servo jitter, every change gated by `tools/jitter_bench.py` A/B numbers. Shipped: Schmitt-trigger quantizer + command dedup in `servo_driver`; adaptive alpha-beta measurement filter (`cv/measurement_filter.py`) + every-frame sub-pixel ArUco homography; near-target rest mode (`control/rest_gate.py`); firmware v2 (tenth-degree `T` protocol at 250000 baud, terse ack, hybrid T/S host dispatch); event-driven frame processing (capture callback instead of the poll grid). Headline numbers: rest-state servo commands 6125 integer flips/min → 0 (one send per 30 s at rest); serial RTT 57 → 4.4 ms p50; camera stays at 30 fps (hardware-capped ~31 fps — the 60 fps experiment is closed). See `firmware/README.md` for the v2 protocol and the `[Perf]` commits for step-by-step evidence.
+
+**2026-07-22 path following** (branch `feat/path-following`, stacked on the perf pass): the ball traces virtual patterns (circle/square/heart/star/arbitrary via `from_points`) drawn as overlays in the vision monitor — no physical lines, no camera line detection. `control/path_follower.py` drives the SetpointArbiter **override channel** (autotune's channel — mutually exclusive by contract) from inside `compute_with_terms`; streaming `set_target` was rejected because its per-call side effects would permanently reset the rest gate and freeze auto-trim. Adaptive pacing: the target advances at the set speed (default 30 mm/s) tapered to zero as ball-to-target error grows from 10 to 20 mm — infeasible speeds degrade to slower laps, never to losing the ball (property pinned by `tests/test_path_feasibility.py` against the `tools/path_sim.py` closed-loop sim). Auto-trim is frozen while the target advances (pursuit lag is not a level error) but thaws during a full stall so the trim integrator — the system's only integral action — can pull the ball back inside the capture radius (rig-observed failure otherwise: standing trim offset ≥ capture radius pins the follower at the seed point forever); rest mode is force-suppressed while following.
 
 **Still open after the overhaul:**
 - Hardware smoke tests gate the PR — the overhaul is not merged until manual tests with the Arduino pass.
