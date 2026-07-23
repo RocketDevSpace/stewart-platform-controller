@@ -135,22 +135,34 @@ class TestGains:
         assert pitch_after != pytest.approx(0.0)
 
 
-class TestAutotuneDisablesAutoTrim:
-    def test_autotune_enable_disables_auto_trim(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.chdir(tmp_path)
-        ctrl = BallController(auto_trim_enabled=True)
-        assert ctrl.auto_trim_enabled is True
-        ctrl.set_pd_autotune(True)
-        assert ctrl.auto_trim_enabled is False
+class TestAutotuneFreezesIntegral:
+    """I-term rework: autotune no longer touches the auto_trim_enabled
+    flag (the old stash/restore is gone). The integral freeze during a
+    session is DERIVED from autotuner.enabled inside compute — the leg
+    evaluator assumes a pure PD step response."""
 
-    def test_autotune_disable_restores_auto_trim(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_autotune_does_not_flip_the_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
         ctrl = BallController(auto_trim_enabled=True)
         ctrl.set_pd_autotune(True)
+        assert ctrl.auto_trim_enabled is True
         ctrl.set_pd_autotune(False)
         assert ctrl.auto_trim_enabled is True
 
-    def test_autotune_enable_preserves_false_trim(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_integral_frozen_during_session_thaws_after(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        clock = _FakeClock()
+        ctrl = BallController(auto_trim_enabled=True, clock=clock)
+        ctrl.set_pd_autotune(True)
+        clock.advance(1 / 30)
+        _, _, terms = ctrl.compute_with_terms(_state(x=10.0))
+        assert terms["i_frozen"] is True
+        ctrl.set_pd_autotune(False)
+        clock.advance(1 / 30)
+        _, _, terms = ctrl.compute_with_terms(_state(x=10.0))
+        assert terms["i_frozen"] is False
+
+    def test_flag_off_stays_off_through_a_session(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
         ctrl = BallController(auto_trim_enabled=False)
         ctrl.set_pd_autotune(True)
@@ -405,37 +417,41 @@ class TestRestModeIntegration:
         assert terms["roll_cmd"] == pytest.approx(0.5)
         assert terms["pitch_cmd"] == pytest.approx(-0.5)
 
-    def test_auto_trim_keeps_integrating_during_rest_and_moves_output(self) -> None:
-        # Composition under test (deliberately no auto_trim.py changes):
-        # rest gates (6 mm / 12 mm/s) are strictly inside auto-trim's
-        # settle gates (35 mm / 25 mm/s), so a resting ball still feeds the
-        # trim integrator, and because the resting command IS the live trim
-        # offsets, every trim step keeps moving the platform.
+    def test_integral_keeps_integrating_during_rest_and_moves_output(self) -> None:
+        # I-term rework composition: rest-radius errors (<= 8 mm) sit
+        # inside the integral's full-integration band, so a resting ball
+        # still feeds the integral, and because the resting command is
+        # level + trim + I, every integral step keeps walking the
+        # platform (the rest mode is now an accurate trim-server).
         clock = _FakeClock(50.0)
         ctrl = self._rest_controller(clock, kd=0.0, auto_trim_enabled=True)
         ctrl.set_target(0.0, 0.0)
         state = _state(x=5.0)  # settled 5 mm off target, zero velocity
 
-        # 3 s: target hold (0.6 s) + settle hold (0.6 s) pass; rest enters
-        # after its own 0.5 s hold. Both are active together afterwards.
+        # 3 s dwell: rest enters after its 0.5 s hold; the integral has
+        # been walking from the second frame (no gates).
         for _ in range(30):
             clock.advance(0.1)
             _, pitch, terms = ctrl.compute_with_terms(state)
         assert terms["rest_mode_active"] is True
-        assert terms["auto_trim_state"] == "updating"
-        assert terms["trim_updates"] >= 1
-        assert terms["pitch_offset"] < 0.0
-        # Resting output follows the live trim offsets exactly.
-        assert pitch == pytest.approx(terms["pitch_offset"])
-        pitch_before = float(terms["pitch_offset"])
+        assert terms["i_term"][0] < 0.0
+        # Trim store untouched; the walking is all integral.
+        assert terms["pitch_offset"] == 0.0
+        # Resting output follows trim + integral (pitch contrib = i_x).
+        assert pitch == pytest.approx(
+            terms["pitch_offset"] + terms["i_term"][0], abs=0.02
+        )
+        pitch_before = float(pitch)
 
-        # Keep resting: the trim keeps walking and the output walks with it.
+        # Keep resting: the integral keeps walking, the output walks too.
         for _ in range(20):
             clock.advance(0.1)
             _, pitch, terms = ctrl.compute_with_terms(state)
         assert terms["rest_mode_active"] is True
-        assert terms["pitch_offset"] < pitch_before
-        assert pitch == pytest.approx(terms["pitch_offset"])
+        assert pitch < pitch_before
+        assert pitch == pytest.approx(
+            terms["pitch_offset"] + terms["i_term"][0], abs=0.02
+        )
 
     def test_fast_disturbance_gets_full_pd_response_same_call(self) -> None:
         # END-TO-END: a resting controller hit by a fast disturbance must

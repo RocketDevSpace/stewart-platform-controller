@@ -70,6 +70,7 @@ class TestWarpFieldFailurePin:
             warp_c_deg_per_mm=RIG_WARP_C,
             warp_bias_roll_deg=RIG_STALE_TRIM_ROLL,
             warp_bias_pitch_deg=RIG_STALE_TRIM_PITCH,
+            integral_enabled=False,
         )
         assert res.laps == 0
         assert res.mean_advance_mm_s < 2.0

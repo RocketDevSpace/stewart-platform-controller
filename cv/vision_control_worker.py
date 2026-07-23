@@ -27,7 +27,7 @@ from core.platform_state import BallState, IKResult, Pose
 from cv.ball_tracker import BallTracker
 from cv.camera_source import CameraSource
 from settings import (
-    AUTO_TRIM_ENABLED,
+    PD_I_ENABLED,
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
     DEBUG_PRINTS,
@@ -118,7 +118,7 @@ class VisionControlWorker(QtCore.QObject):
         command_sender: Callable[..., object] | None = None,
         roll_offset: float = MANUAL_ROLL_TRIM_DEG,
         pitch_offset: float = MANUAL_PITCH_TRIM_DEG,
-        auto_trim_enabled: bool = AUTO_TRIM_ENABLED,
+        auto_trim_enabled: bool = PD_I_ENABLED,
         rtt_provider: Callable[[], tuple[float, float, int]] | None = None,
         position_log_path: str | None = None,
     ) -> None:

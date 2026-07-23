@@ -43,7 +43,7 @@ from gui.vision_monitor import VisionMonitorWindow
 from hardware.serial_manager import SerialManager
 from hardware.servo_driver import ServoDriver
 from settings import (
-    AUTO_TRIM_ENABLED,
+    PD_I_ENABLED,
     BALL_TARGET_DEFAULT_X_MM,
     BALL_TARGET_DEFAULT_Y_MM,
     CAMERA_INDEX,
@@ -147,7 +147,7 @@ class MainWindow(QWidget):
         self._target_y_mm = float(BALL_TARGET_DEFAULT_Y_MM)
         self._trim_roll_deg = float(MANUAL_ROLL_TRIM_DEG)
         self._trim_pitch_deg = float(MANUAL_PITCH_TRIM_DEG)
-        self._auto_trim_enabled = bool(AUTO_TRIM_ENABLED)
+        self._auto_trim_enabled = bool(PD_I_ENABLED)
         self._home_calibration_active = False
         self._last_home_calib_diag_ts = 0.0
         self._pd_autotune_enabled = False

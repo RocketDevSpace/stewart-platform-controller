@@ -157,6 +157,25 @@ PD_D_TERM_LIMIT_DEG = 6.0
 BALL_TARGET_DEFAULT_X_MM = 0.0
 BALL_TARGET_DEFAULT_Y_MM = 0.0
 
+# --- Integral term (2026-07-23 I-term rework) ---
+# The loop's ONLY integral action: cancels the plate's position-dependent
+# tilt bias (rig-measured: ~0.36 deg more compensation needed at r=65 mm
+# than at center) that pure P+D holds as a standing offset (~22 mm per
+# degree at kp 0.045). Continuous — no settle gates; protections are the
+# error taper, per-axis anti-windup at the tilt clamp, the leak, and the
+# clamp (see control/pd_core.py).
+# ki: tau_I = kp/ki = 1.5 s (0.4 deg bias ~90% cancelled in ~3-4 s).
+# I-corner ki/kp = 0.67 rad/s must exceed the 0.46 rad/s carrot rotation
+# of a 30 mm/s r=65 circle (tracks the rotating field) while adding only
+# ~8 deg phase at the 0.77 Hz problem mode.
+PD_I_ENABLED = True
+PD_DEFAULT_KI = float(_OV.get("PD_DEFAULT_KI", 0.030))  # deg/(mm*s)
+PD_I_LIMIT_DEG = 1.5                 # ~4x the measured field
+PD_I_LIMIT_HOME_CAL_DEG = 6.0        # home-cal absorbs a whole bad trim
+PD_I_LEAK_TAU_S = 25.0               # steady-state cost ~0.5 mm
+PD_I_ERR_FULL_MM = 25.0              # full integration at/below
+PD_I_ERR_ZERO_MM = 60.0              # zero integration at/above (linear)
+
 # =============================================================================
 # Near-target rest mode (control/rest_gate.py)
 # =============================================================================
@@ -175,23 +194,16 @@ REST_ENTER_HOLD_S = 0.5                 # entry conditions must hold this long
 REST_SPEED_LPF_ALPHA = 0.6              # RestGate's own speed EMA (weight on prev)
 
 # =============================================================================
-# Manual trim / Auto-trim
+# Trim store (control/trim_store.py)
 # =============================================================================
+# Persistent level offsets. The gated auto-trim integrator (and its 11
+# AUTO_TRIM_* gate settings) was deleted in the 2026-07-23 I-term rework
+# - live leveling now happens in the PDCore integral above; trim is a
+# pure store the integral is FOLDED into on Save Trim / home-cal
+# completion.
 MANUAL_ROLL_TRIM_DEG = float(_OV.get("MANUAL_ROLL_TRIM_DEG", 0.0))
 MANUAL_PITCH_TRIM_DEG = float(_OV.get("MANUAL_PITCH_TRIM_DEG", 0.0))
-
-AUTO_TRIM_ENABLED = False
-AUTO_TRIM_KI_DEG_PER_MM_S = 0.008
-AUTO_TRIM_MAX_DEG = 6.0
-AUTO_TRIM_HOME_CAL_MAX_DEG = 8.0
-AUTO_TRIM_SETTLE_SPEED_MM_S = 25.0
-AUTO_TRIM_SETTLE_RADIUS_MM = 35.0
-AUTO_TRIM_SETTLE_HOLD_S = 0.60
-AUTO_TRIM_STEP_LIMIT_DEG = 0.08
-AUTO_TRIM_TARGET_HOLD_S = 0.60
-AUTO_TRIM_ERROR_LPF_ALPHA = 0.85
-AUTO_TRIM_SETTLE_SPEED_LPF_ALPHA = 0.75
-AUTO_TRIM_SETTLE_RADIUS_LPF_ALPHA = 0.75
+TRIM_LIMIT_DEG = 8.0                 # offset/fold clamp per axis
 
 # =============================================================================
 # PD autotune

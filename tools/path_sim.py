@@ -86,6 +86,7 @@ def simulate_path_following(
     warp_c_deg_per_mm: float = 0.0,
     warp_bias_roll_deg: float = 0.0,
     warp_bias_pitch_deg: float = 0.0,
+    integral_enabled: bool = True,
 ) -> SimResult:
     """Run the closed loop for duration_s at hz steps/s; return metrics.
 
@@ -117,7 +118,9 @@ def simulate_path_following(
     rng = random.Random(seed)
 
     clock = FakeClock()
-    ctrl = BallController(kp=kp, kd=kd, clock=clock)
+    ctrl = BallController(
+        kp=kp, kd=kd, clock=clock, auto_trim_enabled=integral_enabled
+    )
     ctrl.set_path(path)
     ctrl.set_path_speed(speed_mm_s)
     ctrl.start_path()
