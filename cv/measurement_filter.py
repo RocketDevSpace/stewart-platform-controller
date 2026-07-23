@@ -43,6 +43,8 @@ from settings import (
     TRACKER_AB_INNOV_OPEN_MM,
     TRACKER_AB_SPEED_FULL_MM_S,
     TRACKER_AB_SPEED_OPEN_MM_S,
+    TRACKER_AB_VETO_MAX_FRAMES,
+    TRACKER_AB_VETO_MM,
     TRACKER_FILTER_MODE,
     TRACKER_MAX_SPEED_MM_S,
     TRACKER_POS_FILTER_ALPHA_FAST,
@@ -85,6 +87,8 @@ class AlphaBetaFilter2D:
         innov_full_mm: float = TRACKER_AB_INNOV_FULL_MM,
         speed_open_mm_s: float = TRACKER_AB_SPEED_OPEN_MM_S,
         speed_full_mm_s: float = TRACKER_AB_SPEED_FULL_MM_S,
+        veto_mm: float = TRACKER_AB_VETO_MM,
+        veto_max_frames: int = TRACKER_AB_VETO_MAX_FRAMES,
     ) -> None:
         self.alpha_min = float(alpha_min)
         self.alpha_max = float(alpha_max)
@@ -94,12 +98,15 @@ class AlphaBetaFilter2D:
         self.innov_full_mm = float(innov_full_mm)
         self.speed_open_mm_s = float(speed_open_mm_s)
         self.speed_full_mm_s = float(speed_full_mm_s)
+        self.veto_mm = float(veto_mm)
+        self.veto_max_frames = int(veto_max_frames)
 
         self._x: float = 0.0
         self._y: float = 0.0
         self._vx: float = 0.0
         self._vy: float = 0.0
         self._prev_t: float | None = None
+        self._veto_streak: int = 0
 
     @property
     def vx(self) -> float:
@@ -132,6 +139,25 @@ class AlphaBetaFilter2D:
         ry = float(z_y) - y_pred
         r_mag = math.hypot(rx, ry)
 
+        # Single-frame glitch veto: an innovation beyond veto_mm on top
+        # of the predicted motion (ArUco occlusion glitches measure
+        # 4-15 mm; real inter-frame motion at path speeds is ~1.5 mm)
+        # coasts on the prediction instead of folding the glitch in.
+        # At most veto_max_frames consecutive coasts — a sustained
+        # offset is real motion and gets accepted (a genuine flick is
+        # delayed by at most one frame).
+        if (
+            self.veto_mm > 0.0
+            and r_mag > self.veto_mm
+            and self._veto_streak < self.veto_max_frames
+        ):
+            self._veto_streak += 1
+            self._x = x_pred
+            self._y = y_pred
+            self._prev_t = float(t)
+            return self._x, self._y, self._vx, self._vy
+        self._veto_streak = 0
+
         g_inn = _unit_ramp(r_mag, self.innov_open_mm, self.innov_full_mm)
         g_spd = _unit_ramp(
             math.hypot(vx_pred, vy_pred),
@@ -157,6 +183,7 @@ class AlphaBetaFilter2D:
         self._vx = 0.0
         self._vy = 0.0
         self._prev_t = None
+        self._veto_streak = 0
 
 
 class MeasurementFilter:

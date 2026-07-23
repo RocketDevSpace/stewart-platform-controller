@@ -142,6 +142,17 @@ TRACKER_AB_INNOV_OPEN_MM = 1.5       # innovation below this: gains stay MIN
 TRACKER_AB_INNOV_FULL_MM = 4.0       # innovation above this: gains at MAX
 TRACKER_AB_SPEED_OPEN_MM_S = 60.0    # predicted speed below this: no opening
 TRACKER_AB_SPEED_FULL_MM_S = 150.0   # predicted speed above this: gains at MAX
+# Single-frame glitch veto (2026-07-23 path sessions): when the ball
+# transits an ArUco marker its edge partially occludes the marker and
+# the homography glitches — >4 mm single-frame position jumps at 3x
+# the base rate near the marker diagonals, which the PID then chases.
+# An innovation beyond VETO_MM coasts on the prediction for at most
+# VETO_MAX_FRAMES (then accepts, so sustained real motion is never
+# suppressed — a genuine 300 mm/s flick is delayed by one frame at
+# most, and the perf-pass impulse profile at 5 mm/frame never trips
+# the 6 mm threshold at all).
+TRACKER_AB_VETO_MM = 6.0
+TRACKER_AB_VETO_MAX_FRAMES = 1
 
 # =============================================================================
 # PD controller

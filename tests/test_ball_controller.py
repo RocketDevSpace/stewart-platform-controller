@@ -468,8 +468,11 @@ class TestRestModeIntegration:
         auto_trim_enabled: bool = False,
         rest_mode_enabled: bool = True,
     ) -> BallController:
+        # ki pinned explicitly: BallController's default reads the USER
+        # OVERLAY (PD_DEFAULT_KI), so rig-saved gains would silently
+        # change this suite's timing assertions (bit us 2026-07-23).
         return BallController(
-            kp=kp, kd=kd,
+            kp=kp, kd=kd, ki=0.03,
             roll_offset=roll_offset, pitch_offset=pitch_offset,
             auto_trim_enabled=auto_trim_enabled,
             rest_mode_enabled=rest_mode_enabled,
