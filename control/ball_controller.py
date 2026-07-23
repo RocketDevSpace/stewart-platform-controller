@@ -341,13 +341,24 @@ class BallController:
 
         # Path follower (feat/path): advances the override target along the
         # loaded path at the adaptive rate, seeded at the nearest path
-        # point on the first ball sighting. set_override stamps
-        # last_change_time every cycle, which deliberately holds auto-trim
-        # in target_hold for the whole run — pursuit lag is NOT a level
-        # error and must not be integrated into trim.
+        # point on the first ball sighting. The override is stamped only
+        # when the target actually MOVES: while advancing, the per-cycle
+        # stamp holds auto-trim in target_hold (pursuit lag is NOT a level
+        # error and must not be integrated into trim); when the follower
+        # stalls (factor 0 — target frozen), stamping stops so auto-trim
+        # can integrate away the standing offset that caused the stall.
+        # The PD is pure P+D — auto-trim is the ONLY integral action, and
+        # a trim error of just 1 deg parks the ball ~1/kp = 22 mm from the
+        # target, beyond the capture radius: without this thaw a stalled
+        # path can never recover (observed on the rig: follower pinned at
+        # the seed point, ball fighting 2 cm short of it indefinitely).
         if self._path_follower.active:
             ptx, pty = self._path_follower.update(x, y)
-            self._arbiter.set_override(ptx, pty)
+            if not (
+                self._arbiter.override_active
+                and self._arbiter.active == (ptx, pty)
+            ):
+                self._arbiter.set_override(ptx, pty)
 
         target_x, target_y = self._arbiter.active
         pos_vec_x = target_x - x

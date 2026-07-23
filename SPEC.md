@@ -339,10 +339,17 @@ platform, no camera line detection.
   mirrors the same exclusions (belt and braces).
 - `stop_path()` is motion-free: the active target freezes in place
   bit-identically.
-- Auto-trim is deliberately frozen while following (pursuit lag is a
+- Auto-trim is frozen while the target ADVANCES (pursuit lag is a
   tracking error, not a level error — integrating it would corrupt
-  trim). Rest mode is force-suppressed while following and re-engages
-  when an open path completes.
+  trim) but thaws during a full stall: the override is stamped only
+  when the target actually moves, so a frozen target lets the 0.6 s
+  target-hold expire and the trim integrator pull the ball back inside
+  the capture radius. The PD is pure P+D — auto-trim is the only
+  integral action, and 1° of standing trim error parks the ball
+  ~1/kp = 22 mm from the target; without the thaw a stalled path can
+  never recover (observed on the rig 2026-07-23: follower pinned at the
+  seed point indefinitely). Rest mode is force-suppressed while
+  following and re-engages when an open path completes.
 - Telemetry: 8 additive `path_*` keys in the control terms
   (active/state/name/progress/lap/s_mm/error_mm/speed_mm_s).
 

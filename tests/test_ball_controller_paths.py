@@ -4,8 +4,11 @@ Integration tests: PathFollower wired into BallController.
 Pins the contracts that make path following safe alongside the other
 target owners: the override channel, the motion-free stop transfer, both
 exclusion directions (autotune / home-cal), rest suppression while
-following (lifted when an open path completes), and auto-trim staying
-frozen for the whole run.
+following (lifted when an open path completes), and the trim contract:
+auto-trim frozen while the target advances, thawed during a full stall
+so the integrator can pull the ball back inside the capture radius
+(without the thaw, a standing trim offset >= the capture radius pins
+the follower at the seed point forever — observed on the rig).
 """
 
 from control.ball_controller import BallController
@@ -180,6 +183,39 @@ class TestTrimFrozen:
             _, _, terms = ctrl.compute_with_terms(_ball(64.0, 1.0))
         assert (ctrl.roll_offset, ctrl.pitch_offset) == before
         assert terms["auto_trim_gate_reason"] == "target_hold"
+
+    def test_stall_thaws_auto_trim_for_recovery(self) -> None:
+        """A fully stalled follower must NOT hold auto-trim in target_hold.
+
+        The PD is pure P+D; auto-trim is the only integral action. If a
+        standing trim offset parks the ball >= the capture radius from
+        the frozen target, the ONLY way the path can ever resume is the
+        trim integrator walking the ball back in — so a stall stops
+        stamping the (unchanged) override and lets the 0.6 s target-hold
+        expire.
+        """
+        clock = FakeClock()
+        ctrl = BallController(
+            kp=0.045, kd=0.022, auto_trim_enabled=True, clock=clock
+        )
+        ctrl.set_path(circle())
+        ctrl.start_path()
+        clock.advance(1 / 30)
+        ctrl.compute_with_terms(_ball(35.0, 0.0))       # seed at (65, 0)
+        before = (ctrl.roll_offset, ctrl.pitch_offset)
+        # Ball parked 30 mm short of the target: stalled (err >= capture
+        # 20 mm) but inside auto-trim's 35 mm settle-radius gate, at zero
+        # speed. Held 5 s — far beyond target_hold 0.6 s + settle 0.6 s.
+        terms: dict = {}
+        for _ in range(150):
+            clock.advance(1 / 30)
+            _, _, terms = ctrl.compute_with_terms(_ball(35.0, 0.0))
+        assert terms["path_state"] == "stalled"
+        # Target still frozen at the seed point (no advance while stalled).
+        assert abs(terms["target_x_mm"] - 65.0) < 3.0
+        # The recovery mechanism ran: trim offsets moved.
+        assert (ctrl.roll_offset, ctrl.pitch_offset) != before
+        assert terms["auto_trim_gate_reason"] != "target_hold"
 
 
 class TestTermsKeys:

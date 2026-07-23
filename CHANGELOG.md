@@ -212,9 +212,15 @@ to slower laps, never to losing the ball.
   `set_target` was rejected because its side effects would permanently
   reset the rest gate and freeze auto-trim. `stop_path()` freezes the
   active target in place bit-identically (no motion on stop). Auto-trim
-  deliberately frozen during a run (pursuit lag is not a level error);
-  rest mode force-suppressed while following, re-engaging when an open
-  path completes. Telemetry gains 8 additive `path_*` keys.
+  frozen while the target advances (pursuit lag is not a level error)
+  but thawed during a full stall — the override is stamped only when
+  the target moves, so the trim integrator (the only integral action
+  over the pure-P+D loop) can absorb the standing offset that caused
+  the stall and the path self-resumes; without this a trim error ≥
+  0.9° (≈ 20 mm offset at kp 0.045) pinned the follower at the seed
+  point forever (rig-observed 2026-07-23). Rest mode force-suppressed
+  while following, re-engaging when an open path completes. Telemetry
+  gains 8 additive `path_*` keys.
 - `tools/path_sim.py` + `tests/test_path_feasibility.py` (step 4):
   closed-loop sim (point-mass plant, real AlphaBetaFilter2D +
   BallController in the loop, pixel noise) pins the safety property —
