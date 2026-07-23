@@ -377,7 +377,7 @@ in the wrong data structure (one global scalar for a position-dependent
 field: rig-measured ~0.36° more compensation needed at r=65 than
 center).
 
-**Integral contract (`control/pd_core.py`):**
+**Integral contract (`control/pid_core.py`):**
 - Continuous, no gates; integrates position error in x/y error space,
   mapped to pitch/roll beside P and D. ki = 0.030 deg/(mm·s)
   (τ_I = kp/ki = 1.5 s; a 0.4° bias is inside 2 mm and staying there

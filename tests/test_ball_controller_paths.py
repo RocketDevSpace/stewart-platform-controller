@@ -6,7 +6,7 @@ target owners: the override channel, the motion-free stop transfer, both
 exclusion directions (autotune / home-cal), rest suppression while
 following (lifted when an open path completes), and the I-term-rework
 trim contract: the persistent trim never moves during a run, while the
-PDCore integral stays active throughout — including during a stall,
+PIDCore integral stays active throughout — including during a stall,
 where its ramp toward the standing error IS the recovery mechanism
 (the old gate-based freeze/thaw choreography is gone).
 """

@@ -163,7 +163,7 @@ BALL_TARGET_DEFAULT_Y_MM = 0.0
 # than at center) that pure P+D holds as a standing offset (~22 mm per
 # degree at kp 0.045). Continuous — no settle gates; protections are the
 # error taper, per-axis anti-windup at the tilt clamp, the leak, and the
-# clamp (see control/pd_core.py).
+# clamp (see control/pid_core.py).
 # ki: tau_I = kp/ki = 1.5 s (0.4 deg bias ~90% cancelled in ~3-4 s).
 # I-corner ki/kp = 0.67 rad/s must exceed the 0.46 rad/s carrot rotation
 # of a 30 mm/s r=65 circle (tracks the rotating field) while adding only
@@ -175,6 +175,15 @@ PD_I_LIMIT_HOME_CAL_DEG = 6.0        # home-cal absorbs a whole bad trim
 PD_I_LEAK_TAU_S = 25.0               # steady-state cost ~0.5 mm
 PD_I_ERR_FULL_MM = 25.0              # full integration at/below
 PD_I_ERR_ZERO_MM = 60.0              # zero integration at/above (linear)
+# Low-side integration deadband (rig-tuned 2026-07-23): the plate's
+# REAL stiction is ~0.3-0.5 deg — a ball parked inside ~2-7 mm cannot
+# be moved by P alone, so an integral that keeps demanding zero error
+# winds up until it snaps the ball loose, overshoots, and hunts
+# forever at 5-15 mm amplitude (measured: the ball never rested in a
+# 3-minute static hold, ~17 mm/s perpetual wander). Below DEADBAND the
+# integral stops (ramping to full by 2x DEADBAND): the ball parks
+# within the stiction scale, the integral goes flat, and rest engages.
+PD_I_ERR_DEADBAND_MM = 2.0
 # Rest may only engage once the integral is flat (|dI/dt| EMA under
 # this). Resting parks the output at trim + I with P and D dropped —
 # resting on a still-converging integral is not an equilibrium and
@@ -206,7 +215,7 @@ REST_SPEED_LPF_ALPHA = 0.6              # RestGate's own speed EMA (weight on pr
 # =============================================================================
 # Persistent level offsets. The gated auto-trim integrator (and its 11
 # AUTO_TRIM_* gate settings) was deleted in the 2026-07-23 I-term rework
-# - live leveling now happens in the PDCore integral above; trim is a
+# - live leveling now happens in the PIDCore integral above; trim is a
 # pure store the integral is FOLDED into on Save Trim / home-cal
 # completion.
 MANUAL_ROLL_TRIM_DEG = float(_OV.get("MANUAL_ROLL_TRIM_DEG", 0.0))
@@ -290,7 +299,7 @@ GUI_SNAPSHOT_HZ = 30
 # When non-empty, the vision worker appends "t,x,y" lines (perf_counter
 # seconds, ball x/y in mm) for every valid frame — input for
 # tools/jitter_bench.py --csv replay. Empty string = disabled.
-VISION_POSITION_LOG_PATH: str = ""
+VISION_POSITION_LOG_PATH: str = "vision_positions.csv"  # TEMP: rig gate, do not commit
 
 # =============================================================================
 # Vision neutral-pose fallback (safety action on sustained ball loss)

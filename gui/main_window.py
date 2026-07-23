@@ -55,6 +55,7 @@ from settings import (
     MAX_TILT_DEG,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
+    PD_DEFAULT_KI,
     PD_DEFAULT_KP,
     SERIAL_BAUD,
     SERIAL_PORT,
@@ -73,6 +74,7 @@ class MainWindow(QWidget):
 
     # Routed to VisionControlWorker (connected when worker starts)
     vision_gains_updated = QtCore.pyqtSignal(float, float)
+    vision_ki_updated = QtCore.pyqtSignal(float)
     vision_hsv_updated = QtCore.pyqtSignal(int, int, int, int, int, int)
     vision_target_updated = QtCore.pyqtSignal(float, float)
     vision_trim_updated = QtCore.pyqtSignal(float, float)
@@ -144,6 +146,7 @@ class MainWindow(QWidget):
         # Mirror of control_panel settings (for routing to worker)
         self._kp = PD_DEFAULT_KP
         self._kd = PD_DEFAULT_KD
+        self._ki = PD_DEFAULT_KI
         self._target_x_mm = float(BALL_TARGET_DEFAULT_X_MM)
         self._target_y_mm = float(BALL_TARGET_DEFAULT_Y_MM)
         self._trim_roll_deg = float(MANUAL_ROLL_TRIM_DEG)
@@ -180,6 +183,7 @@ class MainWindow(QWidget):
         self.control_panel.vision_toggled.connect(self._on_vision_toggled)
         self.control_panel.kp_changed.connect(self._on_kp_changed)
         self.control_panel.kd_changed.connect(self._on_kd_changed)
+        self.control_panel.ki_changed.connect(self._on_ki_changed)
         self.control_panel.raw_command_sent.connect(self._on_raw_command_sent)
 
         # ControlPanel — new vision-control signals
@@ -430,10 +434,16 @@ class MainWindow(QWidget):
     def _on_kp_changed(self, kp: float) -> None:
         self._kp = kp
         self.vision_gains_updated.emit(self._kp, self._kd)
+        self.vision_ki_updated.emit(self._ki)
+
+    def _on_ki_changed(self, ki: float) -> None:
+        self._ki = float(ki)
+        self.vision_ki_updated.emit(self._ki)
 
     def _on_kd_changed(self, kd: float) -> None:
         self._kd = kd
         self.vision_gains_updated.emit(self._kp, self._kd)
+        self.vision_ki_updated.emit(self._ki)
 
     def _on_target_changed(self, x_mm: float, y_mm: float) -> None:
         self._target_x_mm = x_mm
@@ -580,7 +590,7 @@ class MainWindow(QWidget):
             self._pd_autotune_auto_apply = False
             self._pd_autotune_has_suggestion = False
             self.control_panel.sync_autotune_buttons(False, False)
-            self.control_panel.append_preview("[PD TUNE] disabled")
+            self.control_panel.append_preview("[PID TUNE] disabled")
         else:
             # Path following released — autotune owns the target while it
             # steps (the controller enforces this anyway — belt and braces).
@@ -588,14 +598,14 @@ class MainWindow(QWidget):
             self.control_panel.sync_path_button(False)
             self.vision_path_following_set.emit(False)
             self._vision_monitor.set_path_overlay(None)
-            self.control_panel.append_preview("[PD TUNE] enabled")
+            self.control_panel.append_preview("[PID TUNE] enabled")
         self.vision_pd_autotune_enabled.emit(enabled)
         self.vision_pd_autotune_auto_apply.emit(self._pd_autotune_auto_apply)
 
     def _on_autotune_apply_clicked(self) -> None:
         if not self._pd_autotune_has_suggestion:
             self.control_panel.append_preview(
-                "[PD TUNE] no recommendation available yet"
+                "[PID TUNE] no recommendation available yet"
             )
             return
         self.vision_pd_autotune_apply.emit()
@@ -611,12 +621,12 @@ class MainWindow(QWidget):
             self._pd_autotune_enabled = True
             self._pd_autotune_has_suggestion = False
             self.control_panel.sync_autotune_buttons(True, True)
-            self.control_panel.append_preview("[PD TUNE] auto-apply started")
+            self.control_panel.append_preview("[PID TUNE] auto-apply started")
         else:
             self._pd_autotune_enabled = False
             self._pd_autotune_has_suggestion = False
             self.control_panel.sync_autotune_buttons(False, False)
-            self.control_panel.append_preview("[PD TUNE] auto-apply stopped")
+            self.control_panel.append_preview("[PID TUNE] auto-apply stopped")
         self.vision_pd_autotune_enabled.emit(self._pd_autotune_enabled)
         self.vision_pd_autotune_auto_apply.emit(enabled)
 
@@ -773,6 +783,7 @@ class MainWindow(QWidget):
 
         # Route GUI signals to worker slots
         self.vision_gains_updated.connect(self._vision_worker.set_gains)
+        self.vision_ki_updated.connect(self._vision_worker.set_ki)
         self.vision_hsv_updated.connect(self._vision_worker.set_hsv)
         self.vision_target_updated.connect(self._vision_worker.set_target)
         self.vision_trim_updated.connect(self._vision_worker.set_trim)
@@ -811,6 +822,7 @@ class MainWindow(QWidget):
 
         # Push current GUI state to worker
         self.vision_gains_updated.emit(self._kp, self._kd)
+        self.vision_ki_updated.emit(self._ki)
         self.vision_target_updated.emit(self._target_x_mm, self._target_y_mm)
         self.vision_trim_updated.emit(self._trim_roll_deg, self._trim_pitch_deg)
         self.vision_z_updated.emit(self._vision_z_setpoint)
@@ -832,6 +844,7 @@ class MainWindow(QWidget):
         # Disconnect routed signals to avoid stale calls after stop
         for sig, slot in [
             (self.vision_gains_updated, self._vision_worker.set_gains),
+            (self.vision_ki_updated, self._vision_worker.set_ki),
             (self.vision_hsv_updated, self._vision_worker.set_hsv),
             (self.vision_target_updated, self._vision_worker.set_target),
             (self.vision_trim_updated, self._vision_worker.set_trim),
@@ -1022,7 +1035,7 @@ class MainWindow(QWidget):
             tune_evt = terms.get("pd_autotune_event")
             if tune_evt:
                 self.control_panel.append_preview(
-                    f"[PD TUNE] {tune_evt.get('message', '')}"
+                    f"[PID TUNE] {tune_evt.get('message', '')}"
                 )
 
             # Home-cal completion / Save-Trim fold events (transient)

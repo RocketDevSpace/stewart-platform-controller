@@ -5,12 +5,12 @@ BallController — facade over the decomposed ball-balancing controller
 (M10). Constructs and coordinates the four components:
 
   SetpointArbiter (control/setpoint.py)    target ownership + change time
-  PDCore          (control/pd_core.py)     PID math, d-cap, integral,
+  PIDCore          (control/pid_core.py)     PID math, d-cap, integral,
                                            tilt clamp, slew
   TrimStore       (control/trim_store.py)  persistent trim offsets
   PDAutotuner     (control/autotune.py)    step-test gain tuning sessions
 
-Integral action lives INSIDE PDCore (2026-07-23 I-term rework — the old
+Integral action lives INSIDE PIDCore (2026-07-23 I-term rework — the old
 gated AutoTrim integrator is gone). The `auto_trim_enabled` name is kept
 on the facade as the integral-enable flag so the worker/GUI surface is
 unchanged; the terms-dict contract was amended in the same rework (see
@@ -24,7 +24,7 @@ from collections.abc import Callable
 from control.autotune import PDAutotuner
 from control.path_follower import PathFollower
 from control.patterns import Path
-from control.pd_core import PDCore
+from control.pid_core import PIDCore
 from control.rest_gate import STATE_RESTING, RestGate
 from control.setpoint import SetpointArbiter
 from control.trim_store import TrimStore
@@ -42,6 +42,7 @@ from settings import (
     PD_DEFAULT_KP,
     PD_D_TERM_LIMIT_DEG,
     PD_I_ENABLED,
+    PD_I_ERR_DEADBAND_MM,
     PD_I_ERR_FULL_MM,
     PD_I_ERR_ZERO_MM,
     PD_I_LEAK_TAU_S,
@@ -55,7 +56,7 @@ from settings import (
 
 class BallController:
     """
-    PD controller for ball balancing on Stewart platform.
+    PID controller for ball balancing on Stewart platform.
 
     Inputs:
         Ball position + velocity (mm, mm/s)
@@ -83,7 +84,7 @@ class BallController:
         self.enabled = True
 
         # PID math + d-cap + integral + tilt clamp + slew limiter
-        self._pd = PDCore(
+        self._pd = PIDCore(
             kp=kp,
             kd=kd,
             max_tilt_deg=max_tilt_deg,
@@ -95,6 +96,7 @@ class BallController:
             i_leak_tau_s=PD_I_LEAK_TAU_S,
             i_err_full_mm=PD_I_ERR_FULL_MM,
             i_err_zero_mm=PD_I_ERR_ZERO_MM,
+            i_err_deadband_mm=PD_I_ERR_DEADBAND_MM,
         )
 
         # Target — owned by the arbiter (manual vs autotune override) (FG-9)
@@ -103,7 +105,7 @@ class BallController:
         )
 
         # Persistent trim offsets (I-term rework: a pure store — live
-        # leveling is the PDCore integral). auto_trim_enabled is the
+        # leveling is the PIDCore integral). auto_trim_enabled is the
         # integral-enable flag; the historical name is kept because the
         # worker slots and GUI signals carry it.
         self._trim = TrimStore(roll_offset, pitch_offset, clock)
@@ -197,6 +199,14 @@ class BallController:
         self._pd.kd = float(value)
 
     @property
+    def ki(self) -> float:
+        return self._pd.ki
+
+    @ki.setter
+    def ki(self, value: float) -> None:
+        self._pd.ki = float(value)
+
+    @property
     def max_tilt_deg(self) -> float:
         return self._pd.max_tilt_deg
 
@@ -242,7 +252,7 @@ class BallController:
     def set_auto_trim_enabled(self, enabled: bool) -> None:
         """Enable/disable integral action (the historical flag name).
 
-        Disabling FREEZES the integral in place (PDCore holds the value,
+        Disabling FREEZES the integral in place (PIDCore holds the value,
         leak paused) — toggling the feature off and on is
         non-destructive. Home calibration cannot run without the
         integral, so it cancels.

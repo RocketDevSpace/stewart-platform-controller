@@ -7,17 +7,17 @@ This replaced control/auto_trim.py in the 2026-07-23 I-term rework. The
 old module was a gated position-error integrator (settle gates, hold
 timers, target-hold) that corrected in bursts and caused a family of rig
 failures (burst limit cycle, path-following deadlock, home-cal stalls).
-Live leveling now happens continuously in the PDCore integral term; trim
+Live leveling now happens continuously in the PIDCore integral term; trim
 is a pure STORE that the integral gets folded into for persistence:
 
   - manual slider writes land here (set_offsets)
   - Save Trim / home-cal completion fold the current integral in
     (fold — the offsets absorb what the integral learned, the caller
-    zeros the integral via PDCore.take_integrator, net output change 0)
+    zeros the integral via PIDCore.take_integrator, net output change 0)
   - reset restores the settings defaults
 
 Single-writer rule: these offsets are mutated only here (set_offsets,
-fold, reset). The integral state is PDCore's alone. BallController's
+fold, reset). The integral state is PIDCore's alone. BallController's
 fold_integrator_into_trim() is the only bridge.
 
 Home calibration here is only the flag + start timestamp; the

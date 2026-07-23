@@ -1,5 +1,5 @@
 """
-Unit tests for the PDCore integral term (I-term rework).
+Unit tests for the PIDCore integral term (I-term rework).
 
 Pins the integral's contracts in isolation: integration rate, the
 exponential leak, the error-magnitude taper, per-axis directional
@@ -10,7 +10,7 @@ the take_integrator fold primitive, and reset boundaries
 """
 import pytest
 
-from control.pd_core import PDCore
+from control.pid_core import PIDCore
 
 
 class FakeClock:
@@ -30,8 +30,8 @@ def _make(
     i_limit_deg: float = 1.5,
     i_leak_tau_s: float = 25.0,
     max_tilt_deg: float = 10.0,
-) -> PDCore:
-    return PDCore(
+) -> PIDCore:
+    return PIDCore(
         kp=0.045,
         kd=0.022,
         max_tilt_deg=max_tilt_deg,
@@ -47,7 +47,7 @@ def _make(
 
 
 def _run(
-    pd: PDCore,
+    pd: PIDCore,
     clock: FakeClock,
     ex: float,
     ey: float,
@@ -119,6 +119,28 @@ class TestTaper:
         clock.advance(1 / 30)
         res = pd.compute(err, 0.0, 0.0, 0.0, 0.0, 0.0)
         assert res.i_atten == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        "err,expected",
+        [(0.5, 0.0), (2.0, 0.0), (3.0, 0.5), (4.0, 1.0), (10.0, 1.0)],
+    )
+    def test_low_side_deadband(self, err: float, expected: float) -> None:
+        # Stiction hunting guard (rig-observed 2026-07-23): no
+        # integration below the deadband, ramping to full by 2x.
+        clock = FakeClock()
+        pd = _make(clock)
+        pd.i_err_deadband_mm = 2.0
+        clock.advance(1 / 30)
+        res = pd.compute(err, 0.0, 0.0, 0.0, 0.0, 0.0)
+        assert res.i_atten == pytest.approx(expected)
+
+    def test_deadband_error_never_integrates(self) -> None:
+        clock = FakeClock()
+        pd = _make(clock)
+        pd.i_err_deadband_mm = 2.0
+        _run(pd, clock, 1.0, -1.0, 150)         # |e|=1.4 mm, 5 s inside
+        assert pd.i_pitch_contrib == 0.0
+        assert pd.i_roll_contrib == 0.0
 
     def test_flick_error_does_not_integrate(self) -> None:
         clock = FakeClock()

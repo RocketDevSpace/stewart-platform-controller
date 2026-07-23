@@ -149,7 +149,7 @@ def _bias_cancel_time_s(
     filt = AlphaBetaFilter2D()
     rng = random.Random(0)
     x = y = vx = vy = 0.0
-    threshold = 2.0   # mm; see TestBiasCancelSweep docstring
+    threshold = 4.0   # mm; see TestBiasCancelSweep docstring
 
     trace: list[tuple[float, float]] = []
     for step in range(int(duration_s * hz)):
@@ -180,15 +180,16 @@ def _bias_cancel_time_s(
 
 class TestBiasCancelSweep:
     """0.4 deg standing bias = 8.9 mm P-only offset. The convergence
-    threshold is 2 mm — rolling resistance (0.06 deg cone) physically
-    limits standing accuracy to ~1.3 mm at kp 0.045 (the ball sticks
-    wherever |P*e| is inside the cone), so tighter bounds would test
-    the friction model, not the controller. The observed endgame is
-    ideal rig behavior: converge, rest, integral frozen at the learned
-    bias, total servo silence."""
+    threshold is 4 mm — the integration deadband (2 mm, the stiction
+    hunting guard) deliberately stops correcting below the accuracy the
+    plate's static friction can hold, and rolling resistance adds its
+    own stick zone; tighter bounds would test the friction model, not
+    the controller. The observed endgame is ideal rig behavior:
+    converge, rest, integral frozen at the learned bias, total servo
+    silence."""
 
     def test_default_ki_cancels_a_0p4_deg_bias_and_stays(self) -> None:
-        # tau_I = kp/ki = 1.5 s at ki 0.030: inside 2 mm (was 8.9) and
+        # tau_I = kp/ki = 1.5 s at ki 0.030: inside 4 mm (was 8.9) and
         # STAYING there within 5 s including the stick-slip endgame.
         assert _bias_cancel_time_s(0.030) <= 5.0
 

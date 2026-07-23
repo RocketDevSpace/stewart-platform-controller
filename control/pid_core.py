@@ -1,7 +1,7 @@
 """
-control/pd_core.py
+control/pid_core.py
 
-PDCore — pure PID math for the ball balancer: proportional + derivative
+PIDCore — pure PID math for the ball balancer: proportional + derivative
 terms, the derivative-term cap (FG-11), a true integral term (the loop's
 ONLY integral action — it cancels standing tilt bias the pure P+D cannot),
 the max-tilt clamp, and the commanded-tilt slew ("tilt rate") limiter
@@ -28,7 +28,7 @@ def _clamp(value: float, min_val: float, max_val: float) -> float:
 
 
 @dataclass
-class PDResult:
+class PIDResult:
     """Intermediate and final values of one PID step (terms-dict inputs)."""
 
     p_term: tuple[float, float]
@@ -46,7 +46,7 @@ class PDResult:
     i_frozen: bool = False
 
 
-class PDCore:
+class PIDCore:
     def __init__(
         self,
         kp: float,
@@ -60,6 +60,7 @@ class PDCore:
         i_leak_tau_s: float = 25.0,
         i_err_full_mm: float = 25.0,
         i_err_zero_mm: float = 60.0,
+        i_err_deadband_mm: float = 0.0,
     ) -> None:
         self._clock = clock
         self.kp = float(kp)
@@ -74,6 +75,7 @@ class PDCore:
         self.i_leak_tau_s = float(i_leak_tau_s)
         self.i_err_full_mm = float(i_err_full_mm)
         self.i_err_zero_mm = float(i_err_zero_mm)
+        self.i_err_deadband_mm = float(i_err_deadband_mm)
 
         # Slew limit state (FG-11)
         self._prev_roll_cmd = 0.0
@@ -147,7 +149,7 @@ class PDCore:
         slew_target_override: tuple[float, float] | None = None,
         freeze_integrator: bool = False,
         i_limit_override: float | None = None,
-    ) -> PDResult:
+    ) -> PIDResult:
         """One PID step from error vector (ex, ey) and ball velocity.
 
         slew_target_override, when given, replaces the clamped PID command
@@ -203,7 +205,7 @@ class PDCore:
             self.i_limit_deg if i_limit_override is None
             else float(i_limit_override)
         )
-        return PDResult(
+        return PIDResult(
             p_term=(p_x, p_y),
             d_term=(d_x, d_y),
             pd_vec=(pd_x, pd_y),
@@ -246,6 +248,13 @@ class PDCore:
         err_mag = (ex * ex + ey * ey) ** 0.5
         span = max(1e-6, self.i_err_zero_mm - self.i_err_full_mm)
         weight = _clamp((self.i_err_zero_mm - err_mag) / span, 0.0, 1.0)
+        # Low-side deadband (stiction hunting guard): no integration
+        # below i_err_deadband_mm, ramping to full by 2x — the integral
+        # must not demand accuracy the plate's static friction cannot
+        # hold, or it winds up, snaps the ball loose, and hunts forever.
+        dead = self.i_err_deadband_mm
+        if dead > 0.0:
+            weight *= _clamp((err_mag - dead) / max(1e-6, dead), 0.0, 1.0)
         if self.ki <= 0.0 or freeze:
             # No motion this step: the rate estimate decays toward zero
             # (fixed ~0.3 s factor at the nominal 30 Hz cadence).

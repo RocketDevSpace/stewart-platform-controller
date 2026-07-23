@@ -303,6 +303,21 @@ tilt at r=65 mm than center — ball equilibrium 8 mm inside the circle).
   `home_cal_event` added. Home-cal GUI diagnostics rewritten around
   the integral (i vector, rate, flat-window progress).
 - `PD_DEFAULT_KI` joined the settings overlay whitelist (13 keys).
+- Rig-feedback pass (same day, second session): integration DEADBAND
+  (`PD_I_ERR_DEADBAND_MM` = 2.0) — the plate's real stiction
+  (~0.3–0.5°, far above the sim's 0.06° cone) means a ball parked
+  5–7 mm out cannot be moved by P alone; an integral that keeps
+  demanding zero error winds up, snaps the ball loose, and hunts
+  forever (measured: no rest in a 3-minute static hold, ~17 mm/s
+  perpetual wander, while the same session still completed ~5.7 path
+  laps at 72% of commanded speed). Below the deadband the integral
+  stops, the ball parks within the stiction scale, and rest engages.
+- GUI Ki slider (0–0.080) beside Kp/Kd for rig tuning; live via the
+  new `set_ki` worker slot, cached across vision restarts.
+- PD → PID rename: `control/pd_core.py` → `control/pid_core.py`
+  (`PDCore` → `PIDCore`, `PDResult` → `PIDResult`), GUI "PID Control"
+  group, "[PID TUNE]" messages, docs. Settings keys (`PD_*`) and
+  terms keys keep their names — wire/overlay compatibility.
 
 #### Removed
 - `control/auto_trim.py` (~200-line gated integrator state machine)

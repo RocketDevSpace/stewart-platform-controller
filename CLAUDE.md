@@ -37,7 +37,7 @@ control/
   setpoint.py          # SetpointArbiter — single owner of the ball target setpoint. ✅
   trim_store.py        # TrimStore — persistent trim offsets: manual writes, reset, integral fold. Pure store, no integrator (I-term rework). ✅
   autotune.py          # PDAutotuner — autotune state machine + per-leg step evaluator. ✅
-  pd_core.py           # PDCore — pure PID math: d-term cap, true integral (taper/leak/anti-windup — the loop's ONLY integral action), tilt clamp, slew limiter. ✅
+  pid_core.py          # PIDCore — pure PID math: d-term cap, true integral (taper/leak/anti-windup — the loop's ONLY integral action), tilt clamp, slew limiter. ✅
   pose_commander.py    # PoseCommander — GUI-facing Pose→IK→servo facade (zero IK in gui/). ✅
   rest_gate.py         # RestGate — near-target rest mode: hold level+trim when ball is centered and slow; hysteretic same-cycle exit. ✅
   patterns.py          # Path dataclass + pattern generators (circle/square/heart/star/from_points); PATTERNS registry. Pure math. ✅
@@ -47,7 +47,7 @@ cv/
   camera_source.py     # camera lifecycle: backend probe, capture thread, exposure policy, software gain, frame callback. ✅
   ball_tracker.py      # pure detection: ArUco homography + HSV blob → BallState. No camera, no threads. ✅
   measurement_filter.py  # pure position/velocity filtering (modes: adaptive alpha_beta / legacy / raw); bench-importable. ✅
-  vision_control_worker.py  # owns CameraSource + BallTracker + BallController; vision/PD/IK loop in a QThread. ✅
+  vision_control_worker.py  # owns CameraSource + BallTracker + BallController; vision/PID/IK loop in a QThread. ✅
 
 routines/              # pure pose-list generators.
 visualization/
@@ -61,7 +61,7 @@ gui/
 firmware/              # Arduino side: v2 sketch + v2 flash dump (current ground truth), v1 dump (rollback) + reconstructed v1 sketch, wiring_check.py bench utility, README (pin map + protocols).
   stewart_platform_uno_v2/  # firmware v2 source: T tenth-degree protocol + bit-compatible legacy S, 250000 baud, "[READY v2]" banner.
 tools/
-  jitter_bench.py      # headless A/B bench: synthetic/CSV ball motion through the real filter→PD→IK→servo chain; flip/send/d-term metrics.
+  jitter_bench.py      # headless A/B bench: synthetic/CSV ball motion through the real filter→PID→IK→servo chain; flip/send/d-term metrics.
   latency_bench.py     # on-rig serial command→ack RTT percentiles through the real ServoDriver path.
   camera_probe.py      # on-rig fps × exposure sweep; measures real frame period/brightness, recommends a config.
   path_sim.py          # closed-loop path-following feasibility sim: point-mass plant driven by the REAL filter→controller chain; CLI speed sweep.

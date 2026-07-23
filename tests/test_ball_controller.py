@@ -616,12 +616,13 @@ class TestRestHomeCalExclusion:
         ctrl = BallController(kp=0.045, kd=0.022, clock=clock)
         ctrl.start_home_calibration()
         # Ball near center and still — prime rest-entry conditions.
-        # (2 mm keeps the integral visibly moving so the convergence
-        # watcher cannot auto-complete the calibration mid-test.)
+        # (4 mm sits above the integration deadband, keeping the
+        # integral visibly moving so the convergence watcher cannot
+        # auto-complete the calibration mid-test.)
         for _ in range(60):
             clock.advance(1.0 / 30.0)
             _, _, terms = ctrl.compute_with_terms(
-                BallState(x_mm=2.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
+                BallState(x_mm=4.0, y_mm=0.0, vx_mm_s=0.0, vy_mm_s=0.0)
             )
         assert terms["rest_state"] == "active"
         assert terms["rest_mode_active"] is False

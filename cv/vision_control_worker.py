@@ -2,7 +2,7 @@
 cv/vision_control_worker.py
 
 VisionControlWorker: QObject that owns BallTracker + BallController and runs
-the full vision/PD/IK loop in a dedicated QThread. Communicates with the GUI
+the full vision/PID/IK loop in a dedicated QThread. Communicates with the GUI
 exclusively via Qt signals (snapshot_ready, camera_ready, error, stopped).
 
 ControlSnapshot is a dataclass carrying the full per-frame telemetry package.
@@ -37,6 +37,7 @@ from settings import (
     MAX_TILT_DEG,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
+    PD_DEFAULT_KI,
     PD_DEFAULT_KP,
     TRACKER_HSV_H_MAX,
     TRACKER_HSV_H_MIN,
@@ -85,7 +86,7 @@ class ControlSnapshot:
 
 class VisionControlWorker(QtCore.QObject):
     """
-    Owns BallTracker + BallController. Runs the vision/PD/IK loop in a
+    Owns BallTracker + BallController. Runs the vision/PID/IK loop in a
     QThread at VISION_LOOP_HZ via an internal QTimer.
 
     Signal contract:
@@ -144,6 +145,7 @@ class VisionControlWorker(QtCore.QObject):
         # Cached init params — applied to controller on start()
         self._kp_init = float(kp)
         self._kd_init = float(kd)
+        self._ki_init = float(PD_DEFAULT_KI)
         self._max_tilt_deg = float(max_tilt_deg)
         self._roll_offset_init = float(roll_offset)
         self._pitch_offset_init = float(pitch_offset)
@@ -216,6 +218,7 @@ class VisionControlWorker(QtCore.QObject):
                 self.ball_controller = BallController(
                     kp=self._kp_init,
                     kd=self._kd_init,
+                    ki=self._ki_init,
                     max_tilt_deg=self._max_tilt_deg,
                     roll_offset=self._roll_offset_init,
                     pitch_offset=self._pitch_offset_init,
@@ -339,6 +342,13 @@ class VisionControlWorker(QtCore.QObject):
         self._kd_init = float(kd)
         if self.ball_controller is not None:
             self.ball_controller.set_gains(float(kp), float(kd))
+
+    @QtCore.pyqtSlot(float)
+    def set_ki(self, ki: float) -> None:
+        """Live integral-gain change (Ki slider); cached for restart."""
+        self._ki_init = float(ki)
+        if self.ball_controller is not None:
+            self.ball_controller.ki = float(ki)
 
     @QtCore.pyqtSlot(int, int, int, int, int, int)
     def set_hsv(

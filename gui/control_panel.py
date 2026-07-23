@@ -38,6 +38,7 @@ from settings import (
     PATH_SPEED_MIN_MM_S,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
+    PD_DEFAULT_KI,
     PD_DEFAULT_KP,
     TRACKER_HSV_H_MAX,
     TRACKER_HSV_H_MIN,
@@ -84,6 +85,7 @@ class ControlPanel(QWidget):
     vision_toggled = pyqtSignal(bool)
     kp_changed = pyqtSignal(float)
     kd_changed = pyqtSignal(float)
+    ki_changed = pyqtSignal(float)
     raw_command_sent = pyqtSignal(str)
     target_changed = pyqtSignal(float, float)        # x_mm, y_mm
     trim_changed = pyqtSignal(float, float)          # roll_deg, pitch_deg
@@ -114,7 +116,7 @@ class ControlPanel(QWidget):
 
         main_layout = QHBoxLayout()
         main_layout.addLayout(self._build_slider_column())
-        main_layout.addLayout(self._build_ball_pd_column())
+        main_layout.addLayout(self._build_ball_pid_column())
         main_layout.addLayout(self._build_command_column())
         self.setLayout(main_layout)
 
@@ -187,10 +189,10 @@ class ControlPanel(QWidget):
         return hsv_group
 
     # ------------------------------------------------------------------
-    # Column 2: ball target, trim, PD control (Kp/Kd + autotune)
+    # Column 2: ball target, trim, PID control (Kp/Ki/Kd + autotune)
     # ------------------------------------------------------------------
 
-    def _build_ball_pd_column(self) -> QVBoxLayout:
+    def _build_ball_pid_column(self) -> QVBoxLayout:
         layout = QVBoxLayout()
         layout.setSpacing(4)
 
@@ -251,8 +253,8 @@ class ControlPanel(QWidget):
         trim_group.setLayout(tr)
         layout.addWidget(trim_group)
 
-        # --- PD Control (sliders + autotune) ---
-        tune_group = QGroupBox("PD Control")
+        # --- PID Control (sliders + autotune) ---
+        tune_group = QGroupBox("PID Control")
         tune = QVBoxLayout()
         tune.setSpacing(2)
         tune.setContentsMargins(6, 10, 6, 6)
@@ -265,6 +267,11 @@ class ControlPanel(QWidget):
         self._kd_label, self._kd_slider = self._make_scaled_slider(
             tune, "Kd: {:.3f}", 0, 100,
             float(PD_DEFAULT_KD), 1000.0, self._on_kd_changed,
+        )
+        # Ki (I-term rework): 0-0.080 deg/(mm*s); 0 disables integration
+        self._ki_label, self._ki_slider = self._make_scaled_slider(
+            tune, "Ki: {:.3f}", 0, 80,
+            float(PD_DEFAULT_KI), 1000.0, self._on_ki_changed,
         )
 
         self._autotune_enable_btn = self._make_toggle_button(
@@ -490,6 +497,11 @@ class ControlPanel(QWidget):
         kd = raw / 1000.0
         self._kd_label.setText(f"Kd: {kd:.3f}")
         self.kd_changed.emit(kd)
+
+    def _on_ki_changed(self, raw: int) -> None:
+        ki = raw / 1000.0
+        self._ki_label.setText(f"Ki: {ki:.3f}")
+        self.ki_changed.emit(ki)
 
     def _on_raw_send(self) -> None:
         cmd = self._raw_serial_input.text().strip()

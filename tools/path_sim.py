@@ -4,7 +4,7 @@ tools/path_sim.py
 Closed-loop path-following feasibility simulation: a point-mass
 ball-on-plate plant driven by the REAL control chain — AlphaBetaFilter2D
 (the production tracker filter) -> BallController.compute_with_terms
-(PathFollower + SetpointArbiter + PDCore, fake clock) — with the tilt
+(PathFollower + SetpointArbiter + PIDCore, fake clock) — with the tilt
 command mapped back to ball acceleration through the same effective
 gravity constant the autotuner uses (PD_AUTOTUNE_G_EFF).
 

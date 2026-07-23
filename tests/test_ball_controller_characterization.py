@@ -7,7 +7,7 @@ They were written against the pre-decomposition monolith; the terms-dict key
 set and value semantics are frozen because the GUI reads these keys.
 
 CONTRACT AMENDMENT 2026-07-23 (I-term rework): the gated AutoTrim integrator
-was deleted — integral action now lives in PDCore, trim is a pure store
+was deleted — integral action now lives in PIDCore, trim is a pure store
 (control/trim_store.py). 23 auto_trim_* gate/state keys were REMOVED from the
 contract (deliberately — see the list at TERMS_KEYS), 5 i_* keys added, and
 `auto_trim_enabled` was repurposed as the integral-enable flag (default now
@@ -74,7 +74,7 @@ TERMS_KEYS = frozenset({
     #   auto_trim_gate_settled_ok, auto_trim_gate_reason
     # (GUI read none of them outside the home-cal diag line, rewritten in
     # the same rework. auto_trim_enabled now means: integral enabled.)
-    # ADDED 2026-07-23: the PDCore integral's telemetry.
+    # ADDED 2026-07-23: the PIDCore integral's telemetry.
     "i_term",
     "i_sat_x",
     "i_sat_y",
