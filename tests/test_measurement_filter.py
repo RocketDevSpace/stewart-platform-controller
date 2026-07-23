@@ -57,10 +57,14 @@ class TestAlphaBetaQuiescence:
 class TestAlphaBetaRamp:
     def test_converges_to_true_velocity_within_3_frames(self) -> None:
         # 300 mm/s constant-velocity input from rest: filtered v must be
-        # within 10% of truth within 3 frames of the ramp start.
+        # within 10% of truth within 4 frames of the ramp start. (Was 3
+        # pre-veto: the glitch veto coasts the FIRST 10 mm/frame onset
+        # — indistinguishable from an ArUco occlusion glitch for one
+        # frame — costing exactly one frame of convergence; the 15-19%
+        # glitch rate measured during marker transits is the trade.)
         f = AlphaBetaFilter2D()
         vx = 0.0
-        for i in range(4):   # frame 0 seeds; frames 1-3 are the ramp
+        for i in range(5):   # frame 0 seeds; frames 1-4 are the ramp
             _, _, vx, _ = f.update(300.0 * i * DT, 0.0, i * DT)
         assert vx == pytest.approx(300.0, rel=0.10)
 
@@ -105,7 +109,9 @@ class TestAlphaBetaReset:
     def test_reset_reseeds_on_next_update(self) -> None:
         f = AlphaBetaFilter2D()
         f.update(0.0, 0.0, 0.0)
-        f.update(10.0, 0.0, DT)
+        # 5 mm move: builds velocity without tripping the 6 mm glitch
+        # veto (a 10 mm single-frame jump from rest is now vetoed).
+        f.update(5.0, 0.0, DT)
         assert f.vx != 0.0
         f.reset()
         assert f.update(50.0, -20.0, 5.0) == (50.0, -20.0, 0.0, 0.0)
@@ -166,3 +172,57 @@ class TestMeasurementFilterModes:
         assert out is not None
         assert out == pytest.approx((30.0, -10.0, 0.0, 0.0))
         assert m._vx_f == 0.0
+
+
+class TestGlitchVeto:
+    """Single-frame ArUco-occlusion glitch veto (2026-07-23 path data:
+    >4 mm one-frame jumps at 3x the base rate near marker diagonals)."""
+
+    def test_single_spike_is_coasted(self) -> None:
+        f = AlphaBetaFilter2D()
+        t = 0.0
+        for _ in range(30):                 # settle at (10, 0)
+            t += 1 / 30
+            f.update(10.0, 0.0, t)
+        t += 1 / 30
+        x, y, vx, vy = f.update(22.0, 0.0, t)   # 12 mm glitch
+        assert abs(x - 10.0) < 0.5              # coasted, not swallowed
+        t += 1 / 30
+        x, y, _, _ = f.update(10.0, 0.0, t)     # detection recovers
+        assert abs(x - 10.0) < 0.5
+
+    def test_sustained_motion_accepted_after_one_coast(self) -> None:
+        # A real displacement persists; the veto may coast one frame,
+        # then the filter MUST accept and converge quickly.
+        f = AlphaBetaFilter2D()
+        t = 0.0
+        for _ in range(30):
+            t += 1 / 30
+            f.update(0.0, 0.0, t)
+        xs = []
+        for _ in range(6):
+            t += 1 / 30
+            x, _, _, _ = f.update(20.0, 0.0, t)
+            xs.append(x)
+        assert xs[0] == pytest.approx(0.0, abs=0.5)   # the one coast
+        assert xs[1] > 10.0                           # accepted, opening
+        assert xs[-1] == pytest.approx(20.0, abs=2.0)
+
+    def test_impulse_profile_never_trips_veto(self) -> None:
+        # The perf-pass impulse bench moves 5 mm/frame — under the 6 mm
+        # veto threshold, so the hard fast-response requirement is
+        # untouched by the veto.
+        f = AlphaBetaFilter2D()
+        t = 0.0
+        for _ in range(30):
+            t += 1 / 30
+            f.update(0.0, 0.0, t)
+        pos = 0.0
+        first_out = None
+        for _ in range(6):
+            t += 1 / 30
+            pos += 5.0
+            x, _, _, _ = f.update(pos, 0.0, t)
+            if first_out is None:
+                first_out = x
+        assert first_out is not None and first_out > 1.5   # responded immediately

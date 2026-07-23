@@ -37,6 +37,11 @@ import numpy as np  # noqa: E402
 
 from control.ball_controller import BallController  # noqa: E402
 from control.patterns import PATTERNS, Path  # noqa: E402
+from control.plant_model import (  # noqa: E402
+    PlantParams,
+    apply_rolling_resistance,
+    plant_step,
+)
 from core.platform_state import BallState  # noqa: E402
 from cv.measurement_filter import AlphaBetaFilter2D  # noqa: E402
 from settings import (  # noqa: E402
@@ -69,23 +74,10 @@ def _apply_rolling_resistance(
     vy: float,
     roll_resist_deg: float,
 ) -> tuple[float, float, float, float]:
-    """Coulomb-style rolling resistance, roll_resist_deg equivalent tilt.
-
-    Slow ball + net tilt inside the resistance cone -> sticks (velocity
-    zeroed, no acceleration). Moving ball -> constant deceleration
-    G_EFF * roll_resist_deg opposing the velocity. Returns possibly
-    modified (ax, ay, vx, vy).
-    """
-    if roll_resist_deg <= 0.0:
-        return ax, ay, vx, vy
-    a_res = G_EFF * roll_resist_deg
-    speed = math.hypot(vx, vy)
-    if speed < 0.5 and math.hypot(ax, ay) <= a_res:
-        return 0.0, 0.0, 0.0, 0.0
-    if speed > 1e-9:
-        ax -= a_res * vx / speed
-        ay -= a_res * vy / speed
-    return ax, ay, vx, vy
+    """Delegates to control/plant_model.py (the ONE plant model — the
+    system-ID fitter and gain designer replay through the same physics).
+    Kept under the old name for existing importers."""
+    return apply_rolling_resistance(ax, ay, vx, vy, roll_resist_deg, G_EFF)
 
 
 def _path_total_len(path: Path) -> float:
@@ -179,6 +171,15 @@ def simulate_path_following(
         [(0.0, 0.0)] * max(0, int(latency_frames))
     )
 
+    plant = PlantParams(
+        g_eff=G_EFF,
+        latency_s=latency_frames * dt,   # informational; queue models it
+        stiction_deg=roll_resist_deg,
+        warp_c_deg_per_mm=warp_c_deg_per_mm,
+        bias_roll_deg=warp_bias_roll_deg,
+        bias_pitch_deg=warp_bias_pitch_deg,
+    )
+
     for _ in range(steps):
         clock.t += dt
 
@@ -201,27 +202,13 @@ def simulate_path_following(
         )
         err_trace.append(err)
 
-        # Delayed command reaches the plant this frame.
+        # Delayed command reaches the plant this frame; the shared
+        # plant model (warp + stiction + Euler) advances the ball.
         cmd_queue.append((roll_cmd, pitch_cmd))
         roll_act, pitch_act = cmd_queue.popleft()
-
-        # Plant step (semi-implicit Euler) against the warp field.
-        d_pitch = warp_c_deg_per_mm * x + warp_bias_pitch_deg
-        d_roll = -warp_c_deg_per_mm * y + warp_bias_roll_deg
-        ax = G_EFF * (pitch_act - d_pitch)
-        ay = -G_EFF * (roll_act - d_roll)
-        # Rolling resistance (Coulomb-style, roll_resist_deg equivalent
-        # tilt): a slow ball under a net tilt inside the resistance cone
-        # STICKS — without this, no ball can ever rest and every rest
-        # conclusion the sim draws is wrong (a 0.02 deg residual would
-        # accelerate a frictionless ball off the plate).
-        ax, ay, vx, vy = _apply_rolling_resistance(
-            ax, ay, vx, vy, roll_resist_deg
+        x, y, vx, vy = plant_step(
+            x, y, vx, vy, roll_act, pitch_act, dt, plant
         )
-        vx += ax * dt
-        vy += ay * dt
-        x += vx * dt
-        y += vy * dt
 
     # Wrap-aware total arc advanced: path_s_mm wraps every lap on closed
     # paths, so unwrap via the lap count.

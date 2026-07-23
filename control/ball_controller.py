@@ -8,7 +8,7 @@ BallController — facade over the decomposed ball-balancing controller
   PIDCore          (control/pid_core.py)     PID math, d-cap, integral,
                                            tilt clamp, slew
   TrimStore       (control/trim_store.py)  persistent trim offsets
-  PDAutotuner     (control/autotune.py)    step-test gain tuning sessions
+  PDAutotuner     (control/autotune.py)    SysID tuning: probe→fit→design
 
 Integral action lives INSIDE PIDCore (2026-07-23 I-term rework — the old
 gated AutoTrim integrator is gone). The `auto_trim_enabled` name is kept
@@ -131,9 +131,14 @@ class BallController:
             ),
         )
 
-        # PD autotune state machine (FG-10)
+        # Autotune pipeline (SysID rework: probe -> fit -> design)
         self._autotuner = PDAutotuner(self._arbiter, clock)
-        self._autotuner.clear_suggestion(kp, kd)
+        self._autotuner.clear_suggestion(kp, kd, ki)
+        # Prediction horizon: instance-level so an autotune Apply can
+        # calibrate it from the identified plant (pipeline latency +
+        # measured filter lag). Defaulted from settings.
+        self._predict_s = float(CONTROL_PREDICT_S)
+        self._pending_autotune_event: dict | None = None
 
         # Path following (feat/path): drives the arbiter override channel
         # (mutually exclusive with autotune, which owns the same channel).
@@ -230,7 +235,7 @@ class BallController:
     def set_gains(self, kp: float, kd: float) -> None:
         self._pd.kp = float(kp)
         self._pd.kd = float(kd)
-        self._autotuner.clear_suggestion(kp, kd)
+        self._autotuner.clear_suggestion(kp, kd, self.ki)
 
     def set_max_tilt(self, max_tilt_deg: float) -> None:
         self._pd.max_tilt_deg = float(max_tilt_deg)
@@ -419,7 +424,9 @@ class BallController:
             self._trim.cancel_home_calibration()
             # Exclusion: autotune owns the override channel next.
             self.stop_path()
-        changed = self._autotuner.set_enabled(enabled, auto_apply, self.kp, self.kd)
+        changed = self._autotuner.set_enabled(
+            enabled, auto_apply, self.kp, self.kd, self.ki
+        )
         if changed:
             # Mode change: rest evidence gathered in the old mode is stale.
             self._rest_gate.reset()
@@ -430,10 +437,42 @@ class BallController:
             # its value (like a constant trim) and thaws on disable.
 
     def apply_pd_autotune_recommendation(self) -> tuple[bool, float, float]:
-        applied, kp, kd = self._autotuner.take_recommendation(self.kp, self.kd)
+        """Apply the pending suggestion: gains + plant calibration.
+
+        With a confident plant fit, Apply also calibrates the
+        prediction horizon (pipeline latency + measured filter lag) and
+        the integral deadband (half the P-only stick offset at the new
+        kp). The next compute flags a transient pd_autotune_event
+        {"type": "applied", ...} whose payload the GUI persists to the
+        settings overlay (the home_cal_event pattern).
+        """
+        applied, kp, kd, ki = self._autotuner.take_recommendation(
+            self.kp, self.kd, self.ki
+        )
         if applied:
             self._pd.kp = float(kp)
             self._pd.kd = float(kd)
+            self._pd.ki = float(ki)
+            event: dict = {
+                "type": "applied",
+                "message": (
+                    f"applied kp={kp:.4f} kd={kd:.4f} ki={ki:.4f}"
+                ),
+                "kp": float(kp),
+                "kd": float(kd),
+                "ki": float(ki),
+            }
+            fit = self._autotuner.plant_fit
+            if fit is not None and not fit.low_confidence:
+                self._predict_s = max(0.0, min(0.15, fit.predict_s))
+                deadband = max(
+                    1.0, min(6.0, 0.5 * fit.params.stiction_deg / max(kp, 1e-6))
+                )
+                self._pd.i_err_deadband_mm = deadband
+                event["predict_s"] = self._predict_s
+                event["deadband_mm"] = deadband
+                event["g_eff"] = fit.params.g_eff
+            self._pending_autotune_event = event
         return applied, float(self.kp), float(self.kd)
 
     # ---------------------------
@@ -466,20 +505,22 @@ class BallController:
         vx = ball_state.vx_mm_s
         vy = ball_state.vy_mm_s
 
-        # PD autotune step (FG-10) — may move the arbiter override target
-        # and (in auto-apply mode) update the gains.
-        self.kp, self.kd, tune_info = self._autotuner.update(
-            x, y, vx, vy, self.kp, self.kd
+        # Autotune pipeline step (SysID rework) — during a probe this
+        # advances the script + recording; in auto-apply mode a finished
+        # design updates all three gains.
+        self.kp, self.kd, self.ki, tune_info = self._autotuner.update(
+            x, y, vx, vy, self.kp, self.kd, self.ki,
+            raw_x=ball_state.raw_x_mm, raw_y=ball_state.raw_y_mm,
         )
 
         # Latency compensation: the command computed now takes effect
         # ~2-3 frames from now (camera exposure + processing + serial +
         # servo). Control errors are computed against the ball
-        # extrapolated forward by CONTROL_PREDICT_S — ~20 deg of phase
-        # recovered at the 0.78 Hz problem mode. The alpha-beta velocity
-        # is clean enough that the extrapolation adds negligible noise.
-        px = x + vx * CONTROL_PREDICT_S
-        py = y + vy * CONTROL_PREDICT_S
+        # extrapolated forward by the prediction horizon — ~20 deg of
+        # phase recovered at the 0.78 Hz problem mode. Instance-level:
+        # an autotune Apply calibrates it from the identified plant.
+        px = x + vx * self._predict_s
+        py = y + vy * self._predict_s
 
         # Path follower (feat/path): advances the override target along the
         # loaded path at the adaptive rate, seeded at the nearest path
@@ -618,6 +659,10 @@ class BallController:
             ff=ff,
         )
 
+        # Probe recording: pair this frame's SENT command with the row
+        # update() began (exact frame pairing for the plant fit).
+        self._autotuner.record_command(res.roll_cmd, res.pitch_cmd)
+
         # Home-cal convergence watcher (after the compute so this
         # frame's integral is in the history) — may fold + complete or
         # time out, flagging a transient home_cal_event below.
@@ -655,6 +700,7 @@ class BallController:
             "rest_hold_elapsed_s": self._rest_gate.hold_elapsed_s,
             "kp": self.kp,
             "kd": self.kd,
+            "ki": self.ki,
             **self._autotuner.telemetry(),
             **self._path_follower.telemetry(),
             "target_x_mm": self.target_x_mm,
@@ -662,6 +708,11 @@ class BallController:
         }
         if tune_info:
             terms["pd_autotune_event"] = tune_info
+        # Transient applied-event from an Apply outside the compute
+        # (worker slot): carries the persistence payload for the GUI.
+        if self._pending_autotune_event is not None:
+            terms["pd_autotune_event"] = self._pending_autotune_event
+            self._pending_autotune_event = None
         # Transient (present only on fold/complete/timeout — the GUI
         # persists the folded trim on it, mirroring pd_autotune_event).
         if self._pending_trim_event is not None:

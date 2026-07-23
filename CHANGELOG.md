@@ -319,6 +319,68 @@ tilt at r=65 mm than center — ball equilibrium 8 mm inside the circle).
   group (sliders now ordered Kp/Ki/Kd), "[PID TUNE]" messages,
   vision-monitor overlay legend/status, docs. Settings keys (`PD_*`)
   and terms keys keep their names — wire/overlay compatibility.
+
+### SysID autotune rework (branch `rework/autotune-id`, 2026-07-23)
+
+The step-test autotune estimator is deleted — convicted on evidence
+(zero legs ever completed on the rig; random-walked against a KNOWN
+simulated plant; 2-scalar inversion of a model the plant is not; never
+tuned ki). Replacement: measure the plant once, design in software.
+
+#### Added
+- `control/plant_model.py` — the ONE ball-on-plate physics module
+  (extracted from path_sim, bit-identical): PlantParams, plant_step,
+  CONTINUOUS-latency command replay (linear interpolation at t−L),
+  vectorized batch replay for the fit grid.
+- `control/plant_id.py` — ~78 s gate-free ProbeScript (quiet hold →
+  safety pre-check → relay toggles ±25 mm x/y → diagonals → stiction
+  micro-steps → baseline steps), ProbeRecording (raw detections + SENT
+  commands; raw deliberately — fitting the filtered trace would bake
+  the filter's group delay into the plant latency; the filter lag is
+  measured separately by raw↔filtered cross-correlation), and
+  fit_plant: per-latency CONVEX acceleration regression over a 5 ms
+  latency grid (the replay-loss grid search it replaced demonstrably
+  trapped 10× above the true minimum), with identical prefiltering of
+  both regression sides, central-difference velocity ICs (the
+  alpha-beta velocity's lag read as +3 frames of latency), the
+  S0-measured self-rock band notched from BOTH sides (closed-loop ID
+  bias), and dither-linearized effective stiction under strong rock.
+  Confidence gating: no-improvement / on-bound / residual ≫ noise
+  floor → low_confidence.
+- `control/gain_design.py` — kp/ki/kd search on the fitted plant via
+  CRN-paired closed-loop sims of the REAL chain (step ITAE 0.40 +
+  quiet-hold RMS-and-effort 0.35 + circle tracking 0.25, normalized so
+  J = 1.0 = "no better than today"); two-round log grid + 6-seed
+  confirmation, ties toward the smaller change; the CURRENT gains are
+  always in the pool — a suggestion can never be measured-worse than
+  today. Low-confidence fits cap the change at ±30%.
+- `PDAutotuner` rewritten as the pipeline state machine (probing →
+  computing → suggestion_ready) with probe safety (ball-lost abort,
+  out-of-bounds recenter-then-abort, cancel via the existing toggle),
+  an autotuner-owned daemon compute thread (generation-tagged result
+  slot, cancel Event, inline mode for tests), and Apply that lands
+  kp/kd/ki AND calibrates the prediction horizon (fitted pipeline
+  latency + measured filter lag; `CONTROL_PREDICT_S` is now
+  instance-level) and the integral deadband — all persisted to the
+  settings overlay (whitelist grows to 16 keys) via the transient
+  `pd_autotune_event {"type": "applied"}` → GUI save path.
+- `BallState` gains optional `raw_x_mm`/`raw_y_mm` (tracker fills the
+  pre-filter detection). Terms: `ki` + 8 additive `pd_autotune_*` keys
+  (phase, progress, plant numbers, predicted cost); the 7 original
+  keys keep their names.
+- Killer tests: probe-in-sim recovers a known plant (g ±10%, L ±20 ms,
+  stiction ±0.1°, WITH and without an injected 0.8 Hz ±4 mm rock);
+  designed gains never measured-worse than current and ≥30% better
+  from a bad start, deterministically; full end-to-end session through
+  `compute_with_terms`.
+
+#### Removed
+- `_PDLegEvaluator`, `_compute_pd_from_metrics`, the wait_settle/leg
+  state machine, and 13 estimator settings keys.
+
+#### Deferred
+- Post-apply on-rig validation re-probe (before/after measured cost) —
+  follow-up; the suggestion carries the sim-predicted cost meanwhile.
 - Trajectory feedforward + latency compensation (third session: the
   ball's wobble — ~28 mm/s of motion — dominated an ~11 mm/s path
   drive; 19 laps completed but invisible as path-following). The

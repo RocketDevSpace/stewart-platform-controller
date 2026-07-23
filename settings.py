@@ -142,6 +142,17 @@ TRACKER_AB_INNOV_OPEN_MM = 1.5       # innovation below this: gains stay MIN
 TRACKER_AB_INNOV_FULL_MM = 4.0       # innovation above this: gains at MAX
 TRACKER_AB_SPEED_OPEN_MM_S = 60.0    # predicted speed below this: no opening
 TRACKER_AB_SPEED_FULL_MM_S = 150.0   # predicted speed above this: gains at MAX
+# Single-frame glitch veto (2026-07-23 path sessions): when the ball
+# transits an ArUco marker its edge partially occludes the marker and
+# the homography glitches — >4 mm single-frame position jumps at 3x
+# the base rate near the marker diagonals, which the PID then chases.
+# An innovation beyond VETO_MM coasts on the prediction for at most
+# VETO_MAX_FRAMES (then accepts, so sustained real motion is never
+# suppressed — a genuine 300 mm/s flick is delayed by one frame at
+# most, and the perf-pass impulse profile at 5 mm/frame never trips
+# the 6 mm threshold at all).
+TRACKER_AB_VETO_MM = 6.0
+TRACKER_AB_VETO_MAX_FRAMES = 1
 
 # =============================================================================
 # PD controller
@@ -183,7 +194,7 @@ PD_I_ERR_ZERO_MM = 60.0              # zero integration at/above (linear)
 # 3-minute static hold, ~17 mm/s perpetual wander). Below DEADBAND the
 # integral stops (ramping to full by 2x DEADBAND): the ball parks
 # within the stiction scale, the integral goes flat, and rest engages.
-PD_I_ERR_DEADBAND_MM = 2.0
+PD_I_ERR_DEADBAND_MM = float(_OV.get("PD_I_ERR_DEADBAND_MM", 2.0))
 # Rest may only engage once the integral is flat (|dI/dt| EMA under
 # this). Resting parks the output at trim + I with P and D dropped —
 # resting on a still-converging integral is not an equilibrium and
@@ -209,7 +220,7 @@ REST_I_RATE_MAX_DEG_S = 0.02
 PATH_FF_ENABLED = True
 PATH_FF_LOOKAHEAD_S = 0.12           # evaluate ff ahead by the pipeline lag
 PATH_FF_TILT_MAX_DEG = 1.5           # cap (polyline corners spike curvature)
-CONTROL_PREDICT_S = 0.08             # ball-state forward extrapolation
+CONTROL_PREDICT_S = float(_OV.get("CONTROL_PREDICT_S", 0.08))  # ball-state forward extrapolation
 
 # =============================================================================
 # Near-target rest mode (control/rest_gate.py)
@@ -256,28 +267,22 @@ HOME_CAL_CONVERGE_MAX_RADIUS_MM = 15.0
 HOME_CAL_TIMEOUT_S = 30.0
 
 # =============================================================================
-# PD autotune
+# AutoTune (2026-07-23 SysID rework)
 # =============================================================================
+# The step-test estimator and its 13 gate/inversion settings were
+# deleted -- tuning is now a probe -> fit -> design pipeline
+# (control/plant_id.py + control/gain_design.py; probe script and
+# search bounds are module constants there, not user tunables). The
+# old estimator was convicted on evidence: zero legs ever completed on
+# the rig (its settle gates never opened), and it random-walked when
+# run against a known simulated plant.
 PD_AUTOTUNE_ENABLED = False
 PD_AUTOTUNE_AUTO_APPLY = False
-PD_AUTOTUNE_SETTLE_RADIUS_MM = 6.0
-PD_AUTOTUNE_SETTLE_SPEED_MM_S = 18.0
-PD_AUTOTUNE_SETTLE_HOLD_S = 0.35
-PD_AUTOTUNE_TIMEOUT_S = 6.0
-PD_AUTOTUNE_MIN_TRIAL_S = 0.8
-PD_AUTOTUNE_MIN_KP = 0.005
-PD_AUTOTUNE_MAX_KP = 0.250
-PD_AUTOTUNE_MIN_KD = 0.000
-PD_AUTOTUNE_MAX_KD = 0.100
-PD_AUTOTUNE_STEP_MM: float = 40.0          # step distance from center per leg
-PD_AUTOTUNE_G_EFF: float = 171.0           # effective platform gravity (mm/s²/°)
-PD_AUTOTUNE_TARGET_ZETA: float = 0.70      # desired closed-loop damping ratio
-PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM: float = 20.0  # pre-leg settle radius
-PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S: float = 20.0  # pre-leg settle speed
-PD_AUTOTUNE_WAIT_SETTLE_HOLD_S: float = 0.5      # pre-leg settle hold duration
-PD_AUTOTUNE_MIN_OVERSHOOT_RATIO: float = 0.02    # below this → treat as overdamped
-PD_AUTOTUNE_MIN_CROSS_S: float = 0.40           # ignore first_crossing faster than this
-PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC: float = 0.50   # max fractional change per trial
+# Effective plant gain (mm/s^2 per deg). Updated by Apply after a fit;
+# also feeds the path feedforward tilt divisor.
+PD_AUTOTUNE_G_EFF: float = float(_OV.get("PD_AUTOTUNE_G_EFF", 171.0))
+PD_AUTOTUNE_ABORT_RADIUS_MM = 70.0     # probe hard-abort radius
+PD_AUTOTUNE_BALL_LOST_S = 1.0          # valid-frame gap that aborts a probe
 AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 
 # =============================================================================

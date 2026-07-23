@@ -305,7 +305,10 @@ class BallTracker:
             return self._miss()
         x_mm, y_mm, vx, vy = filtered
 
-        return BallState(x_mm=x_mm, y_mm=y_mm, vx_mm_s=vx, vy_mm_s=vy)
+        return BallState(
+            x_mm=x_mm, y_mm=y_mm, vx_mm_s=vx, vy_mm_s=vy,
+            raw_x_mm=x_mm_raw, raw_y_mm=y_mm_raw,
+        )
 
     # =========================
     # Internal: loss handling

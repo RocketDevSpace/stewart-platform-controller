@@ -446,6 +446,57 @@ trim.
 
 ---
 
+### 2026-07-23 SysID AutoTune — Measure the Plant, Design the Gains
+**Status:** Implemented (branch `rework/autotune-id`, stacked on the
+I-term rework); merge gated on the rig session
+
+**Why:** the step-test estimator completed zero legs on the rig (its
+settle gates never opened against the wobble floor) and random-walked
+against a known simulated plant. Its 2-feature model inversion cannot
+survive latency + stiction + warp + the ball's self-rock, and it never
+tuned ki.
+
+**Pipeline contract (same GUI button flow):**
+1. PROBE (~78 s, `control/plant_id.ProbeScript`, NO settle gates):
+   scripted targets through the arbiter override — quiet hold (noise +
+   self-rock measurement), safety pre-check, relay toggles ±25 mm x/y,
+   diagonals, stiction micro-steps, baseline steps. Per-frame recording
+   of raw detections + actually-sent commands. Aborts: ball lost > 1 s,
+   out of bounds (> 70 mm, recenter then 2 s grace), user toggle.
+2. FIT (background thread, < 5 s): convex per-latency acceleration
+   regression recovers (g_eff, pipeline latency, effective stiction,
+   warp, biases); filter group delay measured separately
+   (raw↔filtered cross-correlation); self-rock band notched from both
+   regression sides; confidence gate (low_confidence caps everything
+   downstream).
+3. DESIGN (background thread, ~15-30 s): kp/ki/kd search on the fitted
+   plant, CRN-paired sims of the real chain, J normalized to the
+   current gains (J = 1.0 = today); the current gains are always in
+   the candidate pool — a suggestion can NEVER be measured-worse than
+   today.
+4. APPLY: lands kp/kd/ki + calibrates the prediction horizon (fitted
+   latency + filter lag) and the integral deadband
+   (0.5·stiction/kp_new, clamped [1, 6] mm); the GUI persists gains +
+   calibrations + g_eff to the settings overlay in one save
+   (transient `pd_autotune_event {"type": "applied"}`, the
+   home_cal_event pattern). Auto-Apply = apply when design completes.
+
+**Acceptance criteria:**
+- Killer tests green (418 passed): known-plant recovery through a full
+  closed-loop probe (g ±10-15%, latency ±20-25 ms, with and without an
+  injected 0.8 Hz rock), never-worse + ≥30%-from-bad-start design,
+  deterministic, end-to-end session through compute_with_terms ✅
+- Rig session (gates the PR): AutoTune with vision on → probe ~80 s
+  with visible phase/progress → suggestion with plant numbers (sanity:
+  latency 0.06-0.12 s, g_eff 120-220) → Apply updates all three
+  sliders + user_settings.json gains + calibrations; timing strip
+  stays flat during compute; cancel mid-probe returns to normal
+  balancing; re-run after the ball swap re-identifies — pending
+- Deferred: post-apply validation re-probe (before/after measured
+  cost) — follow-up.
+
+---
+
 ## Future Features (not scheduled)
 
 ### Multi-Camera Ball Tracking
