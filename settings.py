@@ -154,6 +154,45 @@ TRACKER_AB_SPEED_FULL_MM_S = 150.0   # predicted speed above this: gains at MAX
 TRACKER_AB_VETO_MM = 6.0
 TRACKER_AB_VETO_MAX_FRAMES = 1
 
+# --- Boundary-quad platform tracking (2026-07-24) ---
+# Primary homography source: fit the platform's four gray boundary edges
+# (the ball can NEVER reach them — max center excursion ~85 mm vs the
+# ±120 mm boundary) and intersect them for the warp corners, instead of
+# the ArUco marker centers at ±60 mm that the ball occludes during path
+# transits (rig-measured: >4 mm single-frame H glitches on 19% of frames
+# near the marker diagonals, 3x baseline). ArUco is demoted to
+# acquisition seed, identity/scale reference, periodic cross-check, and
+# fallback. See cv/quad_tracker.py.
+TRACKER_QUAD_ENABLED = True
+TRACKER_QUAD_SAMPLES_PER_SIDE = 32     # edge samples per boundary side
+TRACKER_QUAD_BAND_TRACK_PX = 5         # half-width of the search band (locked)
+TRACKER_QUAD_BAND_ACQ_PX = 12          # half-width while acquiring (wider: seed error)
+TRACKER_QUAD_MIN_GRAD = 6.0            # min |edge gradient| (contrast floor —
+#                                        gray-on-gray background fails CLOSED to ArUco)
+TRACKER_QUAD_MIN_INLIERS = 12          # min surviving samples per side after trim
+TRACKER_QUAD_TRIM_RESID_PX = 0.75      # residual trim floor (max with 2.5-sigma MAD)
+TRACKER_QUAD_BALL_EXCLUDE_PX = 30.0    # drop samples near the ball (its silhouette
+#                                        can overlap the boundary from the oblique
+#                                        camera because the ball has height); 0 = off
+TRACKER_QUAD_ACQ_FRAMES = 10           # consecutive good fits required to lock
+TRACKER_QUAD_MAX_MISS_FRAMES = 6       # locked-fit failures before dropping to UNLOCKED
+TRACKER_QUAD_MAX_CORNER_STEP_PX = 15.0  # gate: max per-frame corner motion while locked
+TRACKER_QUAD_SIDE_RATIO_TOL = 0.06     # gate: side-length drift vs previous frame
+TRACKER_QUAD_MAX_ANGLE_DELTA_DEG = 5.0  # gate: corner-angle drift vs previous frame
+TRACKER_QUAD_CROSSCHECK_EVERY_N = 15   # run ArUco every N frames while locked
+TRACKER_QUAD_CROSSCHECK_TOL_PX = 4.0   # mean corner disagreement to pass a cross-check
+TRACKER_QUAD_CROSSCHECK_FAILS_TO_REACQ = 3   # consecutive fails -> force reacquire
+#   (transient disagreement prefers the QUAD — transient ArUco error IS the rig
+#   failure mode; persistent disagreement prefers ARUCO — only it carries
+#   absolute identity and scale, so a persistently divergent quad relocks)
+# Corner deadband LP (mirrors the ArUco marker-center filter): H is fully
+# static at rest yet tracks real tilt in 1-2 frames.
+TRACKER_QUAD_CORNER_DEADBAND_PX = 0.3
+TRACKER_QUAD_CORNER_FAST_PX = 1.5
+TRACKER_QUAD_CORNER_ALPHA_SLOW = 0.70
+TRACKER_QUAD_CORNER_ALPHA_FAST = 0.2
+TRACKER_QUAD_CORNER_SNAP_PX = 40.0
+
 # =============================================================================
 # PD controller
 # =============================================================================

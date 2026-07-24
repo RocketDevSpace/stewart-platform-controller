@@ -9,9 +9,14 @@ import math
 import random
 import statistics
 
+import numpy as np
 import pytest
 
-from cv.measurement_filter import AlphaBetaFilter2D, MeasurementFilter
+from cv.measurement_filter import (
+    AlphaBetaFilter2D,
+    MeasurementFilter,
+    PointDeadbandLP,
+)
 from settings import (
     BALL_VEL_FILTER_ALPHA,
     TRACKER_AB_ALPHA_MIN,
@@ -172,6 +177,50 @@ class TestMeasurementFilterModes:
         assert out is not None
         assert out == pytest.approx((30.0, -10.0, 0.0, 0.0))
         assert m._vx_f == 0.0
+
+
+class TestPointDeadbandLP:
+    """Shared homography-stability point filter (ArUco marker centers +
+    quad corners). The bit-freeze property is what makes H static at
+    rest."""
+
+    def _lp(self) -> PointDeadbandLP:
+        # The ArUco/quad shipping parameters.
+        return PointDeadbandLP(0.3, 1.5, 0.70, 0.2, 40.0)
+
+    def test_sub_deadband_jitter_freezes_bitwise(self) -> None:
+        lp = self._lp()
+        p0 = lp.filter(np.array([100.0, 200.0]))
+        rng = random.Random(1)
+        for _ in range(50):
+            out = lp.filter(
+                np.array(
+                    [100.0 + rng.uniform(-0.2, 0.2),
+                     200.0 + rng.uniform(-0.2, 0.2)]
+                )
+            )
+            assert np.array_equal(out, p0)
+
+    def test_fast_motion_tracks_within_frames(self) -> None:
+        lp = self._lp()
+        lp.filter(np.array([100.0, 200.0]))
+        target = np.array([110.0, 200.0])        # 10 px: fast regime
+        out = lp.filter(target)
+        out = lp.filter(target)
+        assert abs(float(out[0]) - 110.0) < 0.5  # alpha 0.2: 0.4 px in 2
+
+    def test_snap_resets_to_measurement(self) -> None:
+        lp = self._lp()
+        lp.filter(np.array([100.0, 200.0]))
+        out = lp.filter(np.array([300.0, 200.0]))
+        assert np.allclose(out, [300.0, 200.0])
+
+    def test_reset_reseeds(self) -> None:
+        lp = self._lp()
+        lp.filter(np.array([100.0, 200.0]))
+        lp.reset()
+        out = lp.filter(np.array([5.0, 6.0]))
+        assert np.allclose(out, [5.0, 6.0])
 
 
 class TestGlitchVeto:

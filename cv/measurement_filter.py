@@ -186,6 +186,58 @@ class AlphaBetaFilter2D:
         self._veto_streak = 0
 
 
+class PointDeadbandLP:
+    """Deadband + scheduled-alpha low-pass on one 2D point.
+
+    The homography stability filter, shared by the ArUco marker centers
+    and the boundary-quad corners (cv/quad_tracker.py): motion below the
+    deadband returns the previous filtered point UNCHANGED (so H built
+    from filtered points is bit-static at rest); motion past the fast
+    threshold blends with the fast alpha (real tilt tracks in 1-2
+    frames); in between the slow alpha smooths drift. A jump beyond
+    snap_px snaps to the measurement (camera reopen / platform moved).
+    Callers pass their own settings values — this class imports none."""
+
+    def __init__(
+        self,
+        deadband_px: float,
+        fast_px: float,
+        alpha_slow: float,
+        alpha_fast: float,
+        snap_px: float,
+    ) -> None:
+        self.deadband_px = float(deadband_px)
+        self.fast_px = float(fast_px)
+        self.alpha_slow = float(np.clip(alpha_slow, 0.0, 0.98))
+        self.alpha_fast = float(np.clip(alpha_fast, 0.0, 0.98))
+        self.snap_px = float(snap_px)
+        self._prev: np.ndarray | None = None
+
+    def filter(self, point_px: np.ndarray) -> np.ndarray:
+        """Fold one measured point in; return the filtered point."""
+        current = np.asarray(point_px, dtype=np.float32)
+        prev = self._prev
+        if prev is None:
+            filt = current
+        else:
+            d = float(np.hypot(*(current - prev)))
+            if d > self.snap_px:
+                filt = current                  # jump: reset
+            elif d <= self.deadband_px:
+                filt = prev                     # deadband: freeze
+            else:
+                alpha = (
+                    self.alpha_fast if d >= self.fast_px else self.alpha_slow
+                )
+                filt = alpha * prev + (1.0 - alpha) * current
+        self._prev = filt
+        return filt
+
+    def reset(self) -> None:
+        """Clear state; the next filter() call seeds from the measurement."""
+        self._prev = None
+
+
 class MeasurementFilter:
     """Filters raw (x, y) position measurements into a filtered position
     plus a filtered velocity estimate, per the active mode."""
