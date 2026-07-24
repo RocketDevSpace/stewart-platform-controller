@@ -182,6 +182,15 @@ TRACKER_QUAD_MAX_ANGLE_DELTA_DEG = 5.0  # gate: corner-angle drift vs previous f
 TRACKER_QUAD_CROSSCHECK_EVERY_N = 15   # run ArUco every N frames while locked
 TRACKER_QUAD_CROSSCHECK_TOL_PX = 4.0   # mean corner disagreement to pass a cross-check
 TRACKER_QUAD_CROSSCHECK_FAILS_TO_REACQ = 3   # consecutive fails -> force reacquire
+# Skip the cross-check while the ball is within this distance of ANY
+# marker center: ArUco is exactly then untrustworthy (the occlusion this
+# feature exists to defeat), and a slow marker transit otherwise reads
+# as PERSISTENT disagreement — three straight failed audits would force
+# the quad to reacquire from the glitched ArUco H (caught in sim: the
+# synthetic transit sweep reproduced the rig's >4 mm jumps through
+# exactly this path). Marker half-diagonal ~21 mm + ball radius ~15 mm
+# + margin. 0 disables the guard.
+TRACKER_QUAD_CROSSCHECK_BALL_NEAR_MARKER_MM = 45.0
 #   (transient disagreement prefers the QUAD — transient ArUco error IS the rig
 #   failure mode; persistent disagreement prefers ARUCO — only it carries
 #   absolute identity and scale, so a persistently divergent quad relocks)

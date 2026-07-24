@@ -281,6 +281,97 @@ class TestQuadPrimarySource:
         assert s.x_mm == pytest.approx(30.0, abs=2.5)
 
 
+class TestQuadRobustness:
+    """E-tests 4/6: the ball ON the boundary (exclusion + trim), and the
+    gray-on-gray fail-closed fallback with recovery."""
+
+    def test_ball_sliding_on_boundary_stays_smooth(self) -> None:
+        # The ball's silhouette overlaps the top boundary while sliding
+        # along it: the exclusion zone + trimmed fit must hold the
+        # corners still and the position glitch-free.
+        t = _tracker()
+        _run_to_lock(t, _persp_scene((-30.0, 118.0)))
+        assert t.quad.state == STATE_LOCKED
+        assert t.quad.last_corners_cam is not None
+        corners0 = t.quad.last_corners_cam.copy()
+        prev_raw: tuple[float, float] | None = None
+        for i in range(31):
+            x = -30.0 + 2.0 * i                     # 2 mm/frame slide
+            s = t.process(_persp_scene((x, 118.0)), frame_ts=2.0 + i / 30)
+            assert s is not None
+            assert t.homography_source == "quad"
+            assert s.raw_x_mm is not None and s.raw_y_mm is not None
+            if prev_raw is not None:
+                jump = float(np.hypot(s.raw_x_mm - prev_raw[0],
+                                      s.raw_y_mm - prev_raw[1]))
+                assert jump < 4.0                   # commanded 2 mm + noise
+            prev_raw = (s.raw_x_mm, s.raw_y_mm)
+        assert t.quad.last_corners_cam is not None
+        drift = np.hypot(*(t.quad.last_corners_cam - corners0).T)
+        assert float(drift.max()) < 1.0
+
+    def test_gray_on_gray_falls_to_aruco_and_relocks(self) -> None:
+        # Two boundary sides lose contrast: the quad fails CLOSED, the
+        # ladder falls to ArUco (ball still tracked, today's behavior),
+        # the lock drops after the miss budget — and restoring contrast
+        # relocks within the acquisition window.
+        t = _tracker()
+        _run_to_lock(t, _persp_scene((0.0, 0.0)))
+        flat = _persp_scene((0.0, 0.0), match_bg_sides=(0, 1))
+        for i in range(t.quad.max_miss_frames + 2):
+            s = t.process(flat, frame_ts=2.0 + i / 30)
+            assert s is not None
+            assert t.homography_source == "aruco"
+        assert t.quad.state != STATE_LOCKED
+        s = _run_to_lock(t, _persp_scene((0.0, 0.0)))
+        assert s is not None
+        assert t.quad.state == STATE_LOCKED
+        assert t.homography_source == "quad"
+
+
+class TestQuadGlitchImmunity:
+    """E-test 7: the rig failure mode reproduced and killed. A 60-frame
+    sweep slides the ball straight across marker 0, progressively
+    occluding it. Both halves are pinned because the synthetic is fully
+    deterministic (no RNG): the ArUco-only baseline DOES glitch (this
+    pin proves the scene reproduces the rig's >4 mm raw jumps), and the
+    quad path shows ZERO >4 mm jumps with the source never leaving
+    "quad" — including across cross-check frames, which the
+    ball-near-marker guard must suppress (without it, the slow transit
+    reads as persistent ArUco disagreement and forces a reacquire FROM
+    the glitched H; caught in sim before it reached the rig)."""
+
+    def _sweep_raw_jumps(self, t: BallTracker) -> list[float]:
+        jumps: list[float] = []
+        prev: tuple[float, float] | None = None
+        for i in range(60):
+            x = 40.0 + 40.0 * i / 59.0              # straight across marker 0
+            s = t.process(_persp_scene((x, 60.0)), frame_ts=2.0 + i / 30)
+            assert s is not None
+            assert s.raw_x_mm is not None and s.raw_y_mm is not None
+            if prev is not None:
+                jumps.append(float(np.hypot(s.raw_x_mm - prev[0],
+                                            s.raw_y_mm - prev[1])))
+            prev = (s.raw_x_mm, s.raw_y_mm)
+        return jumps
+
+    def test_aruco_baseline_reproduces_the_glitch(self) -> None:
+        t = _tracker()
+        t.quad_enabled = False
+        assert t.process(_persp_scene((40.0, 60.0)), frame_ts=1.0) is not None
+        jumps = self._sweep_raw_jumps(t)
+        assert max(jumps) > 4.0                     # the failure exists here
+
+    def test_quad_kills_the_glitch(self) -> None:
+        t = _tracker()
+        _run_to_lock(t, _persp_scene((40.0, 60.0)))
+        assert t.quad.state == STATE_LOCKED
+        jumps = self._sweep_raw_jumps(t)
+        assert t.homography_source == "quad"
+        assert t.quad.state == STATE_LOCKED         # never reacquired
+        assert max(jumps) < 2.5                     # commanded 0.68 mm + noise
+
+
 class TestVelocity:
     def test_first_frame_velocity_zero(self) -> None:
         t = _tracker()

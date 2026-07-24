@@ -64,6 +64,7 @@ from settings import (
     TRACKER_MIN_CONTOUR_AREA,
     TRACKER_MIN_FILL_RATIO,
     TRACKER_MIN_RADIUS_PX,
+    TRACKER_QUAD_CROSSCHECK_BALL_NEAR_MARKER_MM,
     TRACKER_QUAD_CROSSCHECK_EVERY_N,
     TRACKER_QUAD_ENABLED,
     TRACKER_WARP_GRAY_CACHE_N,
@@ -131,6 +132,9 @@ class BallTracker:
         self.quad_enabled = bool(TRACKER_QUAD_ENABLED)
         self.quad = PlatformQuadTracker(self.WARP_SIZE_PX)
         self.quad_crosscheck_every_n = max(1, int(TRACKER_QUAD_CROSSCHECK_EVERY_N))
+        self.quad_crosscheck_ball_near_marker_mm = float(
+            TRACKER_QUAD_CROSSCHECK_BALL_NEAR_MARKER_MM
+        )
         self.homography_source: str = "none"
         self._prev_ball_cam_px: tuple[float, float] | None = None
 
@@ -381,7 +385,15 @@ class BallTracker:
 
         if self.quad_enabled and self.quad.state == STATE_LOCKED:
             h_quad = self.quad.update(gray, self._prev_ball_cam_px)
-            if self._frame_counter % self.quad_crosscheck_every_n == 0:
+            # The audit is SKIPPED while the ball is near a marker:
+            # ArUco is exactly then untrustworthy (the occlusion this
+            # ladder exists to defeat), and a slow marker transit would
+            # otherwise read as persistent disagreement and force a
+            # reacquire FROM the glitched ArUco H (caught in sim).
+            if (
+                self._frame_counter % self.quad_crosscheck_every_n == 0
+                and not self._ball_near_marker()
+            ):
                 h_aruco = self._detect_and_solve(frame, gray)
                 if h_aruco is not None:
                     self._last_H = h_aruco
@@ -400,6 +412,20 @@ class BallTracker:
             # No-op while LOCKED; otherwise one acquisition step.
             self.quad.seed_from_h(h, gray)
         return h
+
+    def _ball_near_marker(self) -> bool:
+        """Was the last tracked ball position within the guard radius of
+        any marker center (mm)? Unknown position counts as clear."""
+        r = self.quad_crosscheck_ball_near_marker_mm
+        if r <= 0.0:
+            return False
+        pos = self.measurement.prev_ball_mm
+        if pos is None:
+            return False
+        for world in self.aruco_world_mm.values():
+            if np.hypot(pos[0] - world[0], pos[1] - world[1]) < r:
+                return True
+        return False
 
     def _aruco_resolve(
         self, frame: np.ndarray, gray: np.ndarray
