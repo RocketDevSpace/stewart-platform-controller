@@ -146,6 +146,7 @@ class MainWindow(QWidget):
         # last seen source + last log emit time (rate-limited 1/s).
         self._last_h_source = ""
         self._last_h_source_log_ts = 0.0
+        self._last_quad_diag_log_ts = 0.0
 
         # Mirror of control_panel settings (for routing to worker)
         self._kp = PD_DEFAULT_KP
@@ -1250,15 +1251,19 @@ class MainWindow(QWidget):
             platform_size_mm=240.0,
         )
         h_source = str(getattr(snapshot, "homography_source", ""))
+        quad_diag = getattr(snapshot, "quad_diag", None)
         self._vision_monitor.update_camera(
             getattr(snapshot, "camera_bgr", None),
             homography_source=h_source,
             quad_corners_px=getattr(snapshot, "quad_corners_px", None),
+            quad_diag=quad_diag if isinstance(quad_diag, dict) else None,
         )
         self._vision_monitor.update_mask(
             getattr(snapshot, "mask_gray", None)
         )
         self._log_h_source_transition(h_source)
+        if isinstance(quad_diag, dict):
+            self._log_quad_diag(quad_diag)
 
     def _log_h_source_transition(self, h_source: str) -> None:
         """One preview line per homography-source change ("[TRACK] H
@@ -1273,6 +1278,35 @@ class MainWindow(QWidget):
             )
             self._last_h_source_log_ts = now
         self._last_h_source = h_source
+
+    def _log_quad_diag(self, diag: dict) -> None:
+        """Every 5 s while the quad is not locked: one line saying why
+        ("[TRACK] quad acquiring 0/10: S1 low-contrast grad 2.3;
+        S3 clipped 8 in-frame") — the rig-tuning readout."""
+        now = time.perf_counter()
+        if (now - self._last_quad_diag_log_ts) < 5.0:
+            return
+        self._last_quad_diag_log_ts = now
+        sides = diag.get("sides") or []
+        fails = []
+        for k, d in enumerate(sides):
+            reason = str(d.get("reason", ""))
+            if reason == "ok":
+                continue
+            if reason == "low-contrast":
+                fails.append(f"S{k} low-contrast grad {float(d.get('grad', 0.0)):.1f}")
+            elif reason == "clipped":
+                fails.append(f"S{k} clipped {int(d.get('usable', 0))} in-frame")
+            else:
+                fails.append(f"S{k} {reason}")
+        state = str(diag.get("state", ""))
+        head = (
+            f"quad acquiring {int(diag.get('acq_good', 0))}"
+            f"/{int(diag.get('acq_frames', 0))}"
+            if state == "acquiring" else f"quad {state or 'idle'}"
+        )
+        detail = "; ".join(fails) if fails else "all sides fitting"
+        self.control_panel.append_preview(f"[TRACK] {head}: {detail}")
 
     # ------------------------------------------------------------------
     # Cleanup

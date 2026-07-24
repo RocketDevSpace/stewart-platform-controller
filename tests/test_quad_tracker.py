@@ -284,6 +284,55 @@ class TestLockedTracking:
         assert float(drift.max()) < 1.0
 
 
+class TestAcquisitionDiagnostics:
+    """last_diag: the rig-visibility readout (why is a side failing?)."""
+
+    def test_low_contrast_sides_report_reason_and_measured_grad(self) -> None:
+        qt = PlatformQuadTracker(WARP)
+        gray = _quad_frame(fg=44)                # 4-count edge << the 6.0 floor
+        qt.seed_from_h(H_TRUE, gray)
+        assert qt.last_diag is not None
+        sides = qt.last_diag["sides"]
+        assert len(sides) == 4
+        for d in sides:
+            assert d["reason"] == "low-contrast"
+            # The measured contrast is reported so min_grad can be tuned
+            # against reality; it must be a real (nonzero) measurement
+            # under the floor.
+            assert 0.0 < d["grad"] < qt.min_grad
+        assert qt.last_diag["fit_corners"] is None
+
+    def test_clipped_side_reported_when_prediction_leaves_frame(self) -> None:
+        # Shift the predicted quad so one side falls off the image edge:
+        # that side must report "clipped", not "low-contrast".
+        shifted = CORNERS_TRUE + np.array([0.0, -120.0])   # top side above frame
+        h_off = cv2.getPerspectiveTransform(
+            shifted.astype(np.float32), WARP_CORNERS
+        )
+        qt = PlatformQuadTracker(WARP)
+        qt.seed_from_h(h_off, _quad_frame())
+        assert qt.last_diag is not None
+        assert qt.last_diag["sides"][0]["reason"] == "clipped"
+
+    def test_successful_fit_reports_all_ok_with_corners(self) -> None:
+        qt = PlatformQuadTracker(WARP)
+        qt.seed_from_h(H_TRUE, _quad_frame())
+        assert qt.last_diag is not None
+        assert all(d["reason"] == "ok" for d in qt.last_diag["sides"])
+        assert all(d["inliers"] >= qt.min_inliers for d in qt.last_diag["sides"])
+        fit_corners = qt.last_diag["fit_corners"]
+        assert fit_corners is not None
+        assert np.allclose(fit_corners, CORNERS_TRUE, atol=2.0)
+
+    def test_acq_progress_counts_consecutive_goods(self) -> None:
+        qt = PlatformQuadTracker(WARP)
+        gray = _quad_frame()
+        assert qt.acq_progress == (0, qt.acq_frames)
+        qt.seed_from_h(H_TRUE, gray)
+        qt.seed_from_h(H_TRUE, gray)
+        assert qt.acq_progress == (2, qt.acq_frames)
+
+
 class TestCrossCheck:
     def _h_shifted(self, dx: float) -> np.ndarray:
         c = (CORNERS_TRUE + np.array([dx, 0.0])).astype(np.float32)

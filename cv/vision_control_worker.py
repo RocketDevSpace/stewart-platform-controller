@@ -90,6 +90,12 @@ class ControlSnapshot:
     # directly onto camera_bgr), None unless the quad is locked.
     homography_source: str = ""
     quad_corners_px: object | None = None
+    # Acquisition diagnostics while the quad is NOT locked (rig
+    # visibility: where the tracker is looking and why sides fail):
+    # {"state", "acq_good", "acq_frames", "pred_corners", "fit_corners",
+    #  "sides": [4 x {"reason", "usable", "edges", "inliers", "grad"}]}.
+    # None when locked, disabled, or no attempt has run yet.
+    quad_diag: object | None = None
 
 
 class VisionControlWorker(QtCore.QObject):
@@ -538,7 +544,7 @@ class VisionControlWorker(QtCore.QObject):
                 self._maybe_send_neutral()
 
                 timings_ms = self._build_miss_timings(t0, t1, loop_start, latest_ts)
-                h_source, quad_corners = self._quad_telemetry()
+                h_source, quad_corners, quad_diag = self._quad_telemetry()
                 snapshot = ControlSnapshot(
                     timestamp=time.time(),
                     ball_state=None,
@@ -561,6 +567,7 @@ class VisionControlWorker(QtCore.QObject):
                     worker_emit_perf_ts=time.perf_counter(),
                     homography_source=h_source,
                     quad_corners_px=quad_corners,
+                    quad_diag=quad_diag,
                 )
                 if emit_now:
                     self._snapshot_inflight = True
@@ -629,7 +636,7 @@ class VisionControlWorker(QtCore.QObject):
                     f"total={timings_ms['total']:.2f}ms",
                 )
 
-            h_source, quad_corners = self._quad_telemetry()
+            h_source, quad_corners, quad_diag = self._quad_telemetry()
             snapshot = ControlSnapshot(
                 timestamp=time.time(),
                 ball_state=ball_state,
@@ -648,6 +655,7 @@ class VisionControlWorker(QtCore.QObject):
                 worker_emit_perf_ts=time.perf_counter(),
                 homography_source=h_source,
                 quad_corners_px=quad_corners,
+                quad_diag=quad_diag,
             )
             if emit_now:
                 self._snapshot_inflight = True
@@ -688,18 +696,40 @@ class VisionControlWorker(QtCore.QObject):
     # Boundary-quad telemetry
     # ------------------------------------------------------------------
 
-    def _quad_telemetry(self) -> tuple[str, np.ndarray | None]:
-        """(homography_source, owned copy of the locked quad's corners
-        in flipped-camera coords — None unless locked)."""
+    def _quad_telemetry(self) -> tuple[str, np.ndarray | None, dict | None]:
+        """(homography_source, owned copy of the locked quad's corners,
+        acquisition diag while not locked). Everything crossing to the
+        GUI thread is copied."""
         bt = self.ball_tracker
         if bt is None:
-            return "none", None
+            return "none", None, None
         corners: np.ndarray | None = None
-        if bt.quad_enabled and bt.quad.state == "locked":
-            got = bt.quad.last_corners_cam
-            if got is not None:
-                corners = got.copy()
-        return str(bt.homography_source), corners
+        diag_out: dict | None = None
+        if bt.quad_enabled:
+            q = bt.quad
+            if q.state == "locked":
+                got = q.last_corners_cam
+                if got is not None:
+                    corners = got.copy()
+            else:
+                d = q.last_diag
+                if d is not None:
+                    acq_good, acq_frames = q.acq_progress
+                    pred = d.get("pred_corners")
+                    fitc = d.get("fit_corners")
+                    diag_out = {
+                        "state": str(q.state),
+                        "acq_good": int(acq_good),
+                        "acq_frames": int(acq_frames),
+                        "pred_corners": (
+                            None if pred is None else np.asarray(pred).copy()
+                        ),
+                        "fit_corners": (
+                            None if fitc is None else np.asarray(fitc).copy()
+                        ),
+                        "sides": [dict(s) for s in d.get("sides", [])],
+                    }
+        return str(bt.homography_source), corners, diag_out
 
     # ------------------------------------------------------------------
     # Neutral-pose fallback

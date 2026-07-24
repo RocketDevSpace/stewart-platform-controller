@@ -271,6 +271,15 @@ class PlatformQuadTracker:
         self.last_corners_cam: np.ndarray | None = None
         self.last_inliers: np.ndarray = np.zeros(4, dtype=int)
         self.last_update_ms: float = 0.0
+        # Diagnostics from the LAST fit attempt (rig visibility: why is
+        # a side failing?): {"pred_corners": (4,2), "fit_corners":
+        # (4,2)|None, "gate": str|None, "sides": [4 x {"reason",
+        # "usable", "edges", "inliers", "grad"}]}. reason: "ok" /
+        # "clipped" (too few samples in frame after ball exclusion) /
+        # "low-contrast" (edge gradient under min_grad — grad carries
+        # the measured mean peak |gradient| to tune against) /
+        # "few-inliers" / "degenerate".
+        self.last_diag: dict | None = None
         self._pred_corners: np.ndarray | None = None
         self._polarity: np.ndarray = np.zeros(4)
         self._side_offset: np.ndarray = np.zeros(4)
@@ -294,8 +303,14 @@ class PlatformQuadTracker:
         self._acq_offset_sum = np.zeros(4)
         self._miss_count = 0
         self._crosscheck_fails = 0
+        self.last_diag = None
         for lp in self._corner_lp:
             lp.reset()
+
+    @property
+    def acq_progress(self) -> tuple[int, int]:
+        """(consecutive good fits so far, fits required to lock)."""
+        return self._acq_good, self.acq_frames
 
     # =========================
     # Public API
@@ -437,6 +452,8 @@ class PlatformQuadTracker:
         if corners is None:
             return None
         if not self._corners_pass_gates(corners):
+            if self.last_diag is not None:
+                self.last_diag["gate"] = "gate-failed"
             return None
         filtered = np.stack(
             [lp.filter(c) for lp, c in zip(self._corner_lp, corners)]
@@ -557,26 +574,68 @@ class PlatformQuadTracker:
             dist = np.hypot(base[..., 0] - bp[0], base[..., 1] - bp[1])
             usable &= dist > self.ball_exclude_px
 
+        # Every side is evaluated even after one fails, so last_diag is
+        # COMPLETE on failure — the rig overlay needs to show all four
+        # verdicts, not just the first bad one.
         lines: list[LineFit] = []
         grads = np.zeros(4)
         offsets_vs_pred = np.zeros(4)
+        sides_diag: list[dict] = []
+        all_ok = True
         for k in range(4):
+            n_usable = int(usable[k].sum())
+            diag: dict = {
+                "reason": "ok", "usable": n_usable,
+                "edges": 0, "inliers": 0, "grad": 0.0,
+            }
+            # Measured contrast for tuning: mean per-sample peak
+            # |gradient| over the in-frame samples — the number
+            # min_grad is compared against.
+            g_abs = np.abs(0.5 * (prof4[k][:, 2:] - prof4[k][:, :-2]))
+            if n_usable > 0:
+                diag["grad"] = float(np.mean(g_abs.max(axis=1)[usable[k]]))
             pol = 0.0 if learn else float(self._polarity[k])
             e_off, e_grad, ok = edge_offsets(prof4[k], pol, self.min_grad)
             ok = ok & usable[k]
-            if int(ok.sum()) < self.min_inliers:
-                return None
-            pts = base[k][ok] + e_off[ok, None] * normal[k][None, :]
-            fit = fit_line_tls(pts, normal[k], self.trim_resid_px)
-            if fit is None or fit[2] < self.min_inliers:
-                return None
-            lines.append(fit)
-            if learn:
-                grads[k] = float(np.mean(e_grad[ok]))
-                n_vec, c, _ = fit
-                c_pred = 0.5 * float(n_vec @ c1[k] + n_vec @ c2[k])
-                offsets_vs_pred[k] = c - c_pred
-        self.last_inliers = np.array([ln[2] for ln in lines])
+            diag["edges"] = int(ok.sum())
+            if n_usable < self.min_inliers:
+                diag["reason"] = "clipped"
+            elif int(ok.sum()) < self.min_inliers:
+                diag["reason"] = "low-contrast"
+            else:
+                pts = base[k][ok] + e_off[ok, None] * normal[k][None, :]
+                fit = fit_line_tls(pts, normal[k], self.trim_resid_px)
+                if fit is None:
+                    diag["reason"] = "degenerate"
+                elif fit[2] < self.min_inliers:
+                    diag["reason"] = "few-inliers"
+                    diag["inliers"] = int(fit[2])
+                else:
+                    diag["inliers"] = int(fit[2])
+                    lines.append(fit)
+                    if learn:
+                        grads[k] = float(np.mean(e_grad[ok]))
+                        n_vec, c, _ = fit
+                        c_pred = 0.5 * float(n_vec @ c1[k] + n_vec @ c2[k])
+                        offsets_vs_pred[k] = c - c_pred
+            if diag["reason"] != "ok":
+                all_ok = False
+            sides_diag.append(diag)
+
+        self.last_diag = {
+            "pred_corners": np.asarray(pred_corners, dtype=np.float64).copy(),
+            "fit_corners": None,
+            "gate": None,
+            "sides": sides_diag,
+        }
+        self.last_inliers = np.array([d["inliers"] for d in sides_diag])
+        if not all_ok:
+            return None
+        # Raw silhouette corners (no offset correction) for the overlay:
+        # "the fit found the boundary HERE".
+        self.last_diag["fit_corners"] = self._corners_from_lines(
+            lines, apply_offset=False
+        )
         return lines, grads, offsets_vs_pred
 
     def _corners_from_lines(

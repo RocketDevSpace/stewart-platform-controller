@@ -79,6 +79,8 @@ class FakeQuad:
         self.state = "unlocked"
         self.last_corners_cam: np.ndarray | None = None
         self.last_update_ms = 0.0
+        self.last_diag: dict | None = None
+        self.acq_progress = (0, 10)
 
 
 class FakeTracker:
@@ -367,6 +369,56 @@ class TestQuadTelemetry:
         assert np.array_equal(got, corners)
         assert got is not corners               # crosses threads: owned copy
         assert snaps[0].homography_source == "quad"
+
+    def test_acquisition_diag_propagates_while_not_locked(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball()])
+        tracker = worker.ball_tracker
+        assert tracker is not None
+        tracker.quad_enabled = True             # type: ignore[attr-defined]
+        tracker.quad.state = "acquiring"        # type: ignore[attr-defined]
+        tracker.quad.acq_progress = (3, 10)     # type: ignore[attr-defined, misc]
+        pred = np.array([[10.0, 10.0], [600.0, 12.0], [610.0, 400.0], [8.0, 390.0]])
+        tracker.quad.last_diag = {              # type: ignore[attr-defined]
+            "pred_corners": pred,
+            "fit_corners": None,
+            "gate": None,
+            "sides": [
+                {"reason": "ok", "usable": 32, "edges": 30, "inliers": 28, "grad": 22.0},
+                {"reason": "low-contrast", "usable": 32, "edges": 4, "inliers": 0, "grad": 2.3},
+                {"reason": "ok", "usable": 32, "edges": 30, "inliers": 29, "grad": 21.0},
+                {"reason": "clipped", "usable": 8, "edges": 0, "inliers": 0, "grad": 0.0},
+            ],
+        }
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()
+        assert snaps
+        diag = snaps[0].quad_diag
+        assert isinstance(diag, dict)
+        assert diag["state"] == "acquiring"
+        assert diag["acq_good"] == 3 and diag["acq_frames"] == 10
+        assert isinstance(diag["pred_corners"], np.ndarray)
+        assert diag["pred_corners"] is not pred          # owned copy
+        assert diag["sides"][1]["reason"] == "low-contrast"
+        assert snaps[0].quad_corners_px is None          # not locked
+
+    def test_locked_quad_has_no_diag(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball()])
+        tracker = worker.ball_tracker
+        assert tracker is not None
+        tracker.quad_enabled = True             # type: ignore[attr-defined]
+        tracker.quad.state = "locked"           # type: ignore[attr-defined]
+        tracker.quad.last_corners_cam = np.zeros((4, 2))  # type: ignore[attr-defined]
+        tracker.quad.last_diag = {"sides": []}  # type: ignore[attr-defined]
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()
+        assert snaps[0].quad_diag is None
+        assert snaps[0].quad_corners_px is not None
 
     def test_quad_fit_timing_key_only_when_enabled(self) -> None:
         # Disabled (the legacy default): no key — no fabricated zeros.
