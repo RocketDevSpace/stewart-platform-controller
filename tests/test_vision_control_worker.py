@@ -72,6 +72,15 @@ class FakeCamera:
         self.closed = True
 
 
+class FakeQuad:
+    """Minimal stand-in for PlatformQuadTracker's telemetry surface."""
+
+    def __init__(self) -> None:
+        self.state = "unlocked"
+        self.last_corners_cam: np.ndarray | None = None
+        self.last_update_ms = 0.0
+
+
 class FakeTracker:
     """Returns a scripted sequence of BallState/None results."""
 
@@ -79,6 +88,11 @@ class FakeTracker:
         self.results = list(results)
         self.hsv_lower = np.array([10, 83, 125], dtype=np.uint8)
         self.hsv_upper = np.array([28, 255, 255], dtype=np.uint8)
+        # Boundary-quad telemetry surface (disabled by default so legacy
+        # tests exercise the pre-quad timing/snapshot contract).
+        self.quad_enabled = False
+        self.quad = FakeQuad()
+        self.homography_source = "aruco"
 
     def process(
         self,
@@ -310,6 +324,72 @@ class TestBackpressure:
         # The 28 fabricated zero-filled trk_* keys are gone.
         fabricated = [k for k in snaps[0].timings_ms if k.startswith("trk_")]
         assert set(fabricated) <= {"trk_cap_period", "trk_gray_mean"}
+
+
+class TestQuadTelemetry:
+    """Boundary-quad snapshot fields + the quad_fit timing key."""
+
+    def test_snapshot_carries_source_on_both_branches(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball(), None])
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()                          # valid frame
+        worker.mark_snapshot_consumed()
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()                          # miss frame
+        assert len(snaps) == 2
+        assert snaps[0].homography_source == "aruco"
+        assert snaps[1].homography_source == "aruco"   # miss branch too
+        assert snaps[0].quad_corners_px is None
+
+    def test_locked_quad_corners_are_an_owned_copy(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball()])
+        tracker = worker.ball_tracker
+        assert tracker is not None
+        tracker.quad_enabled = True             # type: ignore[attr-defined]
+        tracker.homography_source = "quad"      # type: ignore[attr-defined]
+        tracker.quad.state = "locked"           # type: ignore[attr-defined]
+        corners = np.array(
+            [[10.0, 10.0], [600.0, 12.0], [610.0, 400.0], [8.0, 390.0]]
+        )
+        tracker.quad.last_corners_cam = corners  # type: ignore[attr-defined]
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()
+        assert snaps
+        got = snaps[0].quad_corners_px
+        assert isinstance(got, np.ndarray)
+        assert np.array_equal(got, corners)
+        assert got is not corners               # crosses threads: owned copy
+        assert snaps[0].homography_source == "quad"
+
+    def test_quad_fit_timing_key_only_when_enabled(self) -> None:
+        # Disabled (the legacy default): no key — no fabricated zeros.
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball()])
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()
+        assert "quad_fit" not in snaps[0].timings_ms
+
+        # Enabled with a genuine measurement: key present with the value.
+        snaps2: list[ControlSnapshot] = []
+        worker2, camera2, _ = _make_worker([_ball()])
+        tracker2 = worker2.ball_tracker
+        assert tracker2 is not None
+        tracker2.quad_enabled = True            # type: ignore[attr-defined]
+        tracker2.quad.last_update_ms = 0.42     # type: ignore[attr-defined]
+        worker2.snapshot_ready.connect(snaps2.append)
+        worker2._last_snapshot_emit_perf = -1e9
+        camera2.advance()
+        worker2._tick()
+        assert snaps2[0].timings_ms["quad_fit"] == 0.42
 
 
 class TestSetZ:

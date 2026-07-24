@@ -82,6 +82,14 @@ class ControlSnapshot:
     warped_bgr: object | None = None
     mask_gray: object | None = None
     worker_emit_perf_ts: float = field(default=0.0)
+    # Boundary-quad telemetry (2026-07-24): which rung of the source
+    # ladder produced this frame's H ("quad"/"aruco"/"stale"/"none");
+    # set on BOTH branches — a ball miss with a good H is a different
+    # condition from H loss. quad_corners_px is an owned (4,2) copy of
+    # the locked quad's corners in flipped-camera coords (overlays
+    # directly onto camera_bgr), None unless the quad is locked.
+    homography_source: str = ""
+    quad_corners_px: object | None = None
 
 
 class VisionControlWorker(QtCore.QObject):
@@ -530,6 +538,7 @@ class VisionControlWorker(QtCore.QObject):
                 self._maybe_send_neutral()
 
                 timings_ms = self._build_miss_timings(t0, t1, loop_start, latest_ts)
+                h_source, quad_corners = self._quad_telemetry()
                 snapshot = ControlSnapshot(
                     timestamp=time.time(),
                     ball_state=None,
@@ -550,6 +559,8 @@ class VisionControlWorker(QtCore.QObject):
                     warped_bgr=warped_view,
                     mask_gray=mask_view,
                     worker_emit_perf_ts=time.perf_counter(),
+                    homography_source=h_source,
+                    quad_corners_px=quad_corners,
                 )
                 if emit_now:
                     self._snapshot_inflight = True
@@ -618,6 +629,7 @@ class VisionControlWorker(QtCore.QObject):
                     f"total={timings_ms['total']:.2f}ms",
                 )
 
+            h_source, quad_corners = self._quad_telemetry()
             snapshot = ControlSnapshot(
                 timestamp=time.time(),
                 ball_state=ball_state,
@@ -634,6 +646,8 @@ class VisionControlWorker(QtCore.QObject):
                 warped_bgr=warped_view,
                 mask_gray=mask_view,
                 worker_emit_perf_ts=time.perf_counter(),
+                homography_source=h_source,
+                quad_corners_px=quad_corners,
             )
             if emit_now:
                 self._snapshot_inflight = True
@@ -669,6 +683,23 @@ class VisionControlWorker(QtCore.QObject):
             None if warped is None else warped.copy(),
             None if mask is None else mask.copy(),
         )
+
+    # ------------------------------------------------------------------
+    # Boundary-quad telemetry
+    # ------------------------------------------------------------------
+
+    def _quad_telemetry(self) -> tuple[str, np.ndarray | None]:
+        """(homography_source, owned copy of the locked quad's corners
+        in flipped-camera coords — None unless locked)."""
+        bt = self.ball_tracker
+        if bt is None:
+            return "none", None
+        corners: np.ndarray | None = None
+        if bt.quad_enabled and bt.quad.state == "locked":
+            got = bt.quad.last_corners_cam
+            if got is not None:
+                corners = got.copy()
+        return str(bt.homography_source), corners
 
     # ------------------------------------------------------------------
     # Neutral-pose fallback
@@ -742,6 +773,14 @@ class VisionControlWorker(QtCore.QObject):
         st = self.camera.stats()
         return float(st.period_ms), float(st.gray_mean)
 
+    def _add_quad_timing(self, timings: dict) -> None:
+        """Add the "quad_fit" key ONLY when the quad tracker is enabled
+        and has a genuine measurement — no fabricated zeros (the timing
+        plot renders every present key as data)."""
+        bt = self.ball_tracker
+        if bt is not None and bt.quad_enabled and bt.quad.last_update_ms > 0.0:
+            timings["quad_fit"] = float(bt.quad.last_update_ms)
+
     def _build_miss_timings(
         self,
         t0: float,
@@ -750,7 +789,7 @@ class VisionControlWorker(QtCore.QObject):
         latest_ts: float,
     ) -> dict:
         period_ms, gray_mean = self._capture_stats_pair()
-        return {
+        timings = {
             "ball_update": (t1 - t0) * 1000.0,
             "pd_compute": 0.0,
             "ik_solve": 0.0,
@@ -765,6 +804,8 @@ class VisionControlWorker(QtCore.QObject):
             "trk_cap_period": period_ms,
             "trk_gray_mean": gray_mean,
         }
+        self._add_quad_timing(timings)
+        return timings
 
     def _build_valid_timings(
         self,
@@ -785,7 +826,7 @@ class VisionControlWorker(QtCore.QObject):
         frame_to_cmd = (
             max(0.0, (t_cmd1 - latest_ts) * 1000.0) if latest_ts > 0 else 0.0
         )
-        return {
+        timings = {
             "ball_update": (t1 - t0) * 1000.0,
             "pd_compute": (t3 - t2) * 1000.0,
             "ik_solve": (t4 - t3) * 1000.0,
@@ -798,3 +839,5 @@ class VisionControlWorker(QtCore.QObject):
             "trk_cap_period": period_ms,
             "trk_gray_mean": gray_mean,
         }
+        self._add_quad_timing(timings)
+        return timings
