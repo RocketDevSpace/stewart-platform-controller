@@ -401,6 +401,86 @@ tuned ki). Replacement: measure the plant once, design in software.
 - The path stall-thaw special case from 983583f (symptom patch,
   obsoleted by the integral) and `notify_target_changed()`.
 
+### Rig hardening: servo lag + occlusion veto (same branch, 2026-07-23)
+
+The first on-rig SysID session produced violent oscillation from a
+confident fit (g 104 vs true ~171): the model was blind to the servo's
+first-order lag, and the acceleration regression's SSE is nearly flat
+along the (servo_tau, g) ridge. Defense in depth, each layer pinned:
+
+#### Added
+- `PlantParams.servo_tau_s` + `ServoLag` — first-order actuator lag in
+  the ONE plant model, in the fit (latency × tau scan with a
+  replay-loss tie-break across the ridge's top candidates), and in the
+  gain-design closed-loop harness.
+- Fit guard: >35% deviation from the rig-anchored `PD_AUTOTUNE_G_EFF`
+  (new overlay key, measured 171) → low_confidence. Design guards:
+  trust-but-bound per-session caps (kp/kd ≤ 1.6×, |Δki| ≤ 0.02,
+  ki bound 0.05).
+- Single-frame glitch veto in `AlphaBetaFilter2D`
+  (`TRACKER_AB_VETO_MM` 6 / `TRACKER_AB_VETO_MAX_FRAMES` 1). Fourth
+  path session confirmed Hudson's occlusion hypothesis in the data:
+  >4 mm single-frame homography jumps on 19% of frames near the marker
+  diagonals (3× baseline) as the ball's edge grazes the marker inner
+  corners on the r=65 circle. An innovation beyond 6 mm coasts on the
+  prediction for at most one frame; documented trade: a genuine flick
+  onset is delayed exactly one frame (ramp pin amended 3 → 4 frames).
+- `"Circle (r=50, marker-safe)"` pattern — ball edge stays ~70 mm,
+  clear of the marker inner corners at ~85 mm; also the A/B for the
+  occlusion mechanism.
+- Test-hygiene fix: the feasibility suite pins its reference gains via
+  a hermetic wrapper (the sim defaults read the USER OVERLAY, so gains
+  saved at the rig silently moved every bound — bit us when kp 0.072
+  was saved).
+
+### Boundary-quad platform tracking (same branch, 2026-07-24)
+
+The ArUco markers sit at ±60 mm — in the ball's traffic. The platform
+BOUNDARY at ±120 mm is unreachable (max center excursion ~85 mm) and
+offers ~32 edge samples per side vs 16 marker corners. The homography
+source ladder is now quad → aruco → stale-hold → miss; ArUco is
+demoted to acquisition seed, identity/scale reference, periodic
+cross-check, and fallback.
+
+#### Added
+- `cv/quad_tracker.py` — `PlatformQuadTracker`: 32 samples/side
+  fetched with ONE `cv2.remap`, polarity-signed gradient +
+  parabolic sub-pixel edges, 2-pass trimmed TLS line fits
+  (median-centered MAD — a clustered ball silhouette cannot drag the
+  trim), corner intersection, per-corner deadband LP (bit-stable H on
+  identical frames, the ArUco contract), UNLOCKED → ACQUIRING (ArUco
+  seed; per-side polarity learned + silhouette-vs-ArUco offset frozen
+  as thickness/parallax calibration) → LOCKED with validation gates
+  (corner step / convexity / side-length + angle drift), ball-exclusion
+  zone, and a miss budget. Gray-on-gray fails CLOSED (contrast floor →
+  ArUco, today's behavior). Cost ~0.2-0.5 ms; net per-frame cost DROPS
+  (marker detection now runs every 15th frame while locked).
+- Cross-check arbitration: transient ArUco disagreement prefers the
+  QUAD (transient ArUco error IS the rig failure mode); 3 consecutive
+  failed audits force a reacquire (only ArUco carries absolute
+  identity/scale). The audit is skipped while the ball is within 45 mm
+  of a marker (`TRACKER_QUAD_CROSSCHECK_BALL_NEAR_MARKER_MM`) — a slow
+  marker transit otherwise reads as persistent disagreement and
+  reacquires FROM the glitched H (caught in sim before the rig).
+- `PointDeadbandLP` extracted to `cv/measurement_filter.py` — the
+  marker-center filter's deadband + scheduled-alpha + snap logic,
+  shared by markers and quad corners.
+- Telemetry: `ControlSnapshot.homography_source` (both branches) +
+  `quad_corners_px` (owned copy, flipped-camera coords); `"quad_fit"`
+  timing key only when enabled (no fabricated zeros); GUI camera view
+  draws the fitted quad + an `H: QUAD/ARUCO/STALE/--` badge
+  (green/yellow/orange/red); `[TRACK] H source a -> b` preview line on
+  transitions (rate-limited 1/s); timing-plot series registered.
+- Tests: `_persp_scene` (oblique perspective scene with real boundary
+  edges; ArUco-baseline pins land BEFORE the quad so failures are
+  attributable) + the deterministic marker-transit A/B — the ArUco
+  baseline REPRODUCES the rig glitch (max raw jump 7.7 mm), the quad
+  path shows zero >4 mm jumps (max 1.2 mm); two-markers-covered still
+  tracks (beyond the ArUco 3-marker floor); ball sliding ON the
+  boundary holds corners < 1 px; gray-on-gray falls to "aruco" and
+  relocks; the flat legacy `_scene` has no boundary so every existing
+  test still exercises the pure ArUco path (asserted explicitly).
+
 ---
 
 ## [Milestone-8] - 2026-06-11

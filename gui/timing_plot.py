@@ -38,6 +38,7 @@ _TIMING_KEYS = [
     "worker_to_gui_ms",
     "frame_to_cmd",
     "serial_rtt_ms",
+    "quad_fit",
     "total",
 ]
 _TIMING_COLORS = {
@@ -50,6 +51,7 @@ _TIMING_COLORS = {
     "worker_to_gui_ms":  "#64748b",
     "frame_to_cmd":      "#22d3ee",
     "serial_rtt_ms":     "#fb7185",
+    "quad_fit":          "#4ade80",
     "total":             "#e2e8f0",
 }
 _TIMING_WINDOW_S = 30.0

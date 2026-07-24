@@ -142,6 +142,10 @@ class MainWindow(QWidget):
         self._vision_counter = 0
         self._vision_z_setpoint = 0.0
         self._last_visualizer_update = 0.0
+        # Homography-source transition log (boundary-quad rework):
+        # last seen source + last log emit time (rate-limited 1/s).
+        self._last_h_source = ""
+        self._last_h_source_log_ts = 0.0
 
         # Mirror of control_panel settings (for routing to worker)
         self._kp = PD_DEFAULT_KP
@@ -1245,12 +1249,30 @@ class MainWindow(QWidget):
             # see config.PLATFORM_SIZE for the physical measurement.
             platform_size_mm=240.0,
         )
+        h_source = str(getattr(snapshot, "homography_source", ""))
         self._vision_monitor.update_camera(
-            getattr(snapshot, "camera_bgr", None)
+            getattr(snapshot, "camera_bgr", None),
+            homography_source=h_source,
+            quad_corners_px=getattr(snapshot, "quad_corners_px", None),
         )
         self._vision_monitor.update_mask(
             getattr(snapshot, "mask_gray", None)
         )
+        self._log_h_source_transition(h_source)
+
+    def _log_h_source_transition(self, h_source: str) -> None:
+        """One preview line per homography-source change ("[TRACK] H
+        source quad -> aruco"), rate-limited to 1/s so a source
+        flapping at snapshot rate cannot flood the log."""
+        if not h_source or h_source == self._last_h_source:
+            return
+        now = time.perf_counter()
+        if self._last_h_source and (now - self._last_h_source_log_ts) >= 1.0:
+            self.control_panel.append_preview(
+                f"[TRACK] H source {self._last_h_source} -> {h_source}"
+            )
+            self._last_h_source_log_ts = now
+        self._last_h_source = h_source
 
     # ------------------------------------------------------------------
     # Cleanup

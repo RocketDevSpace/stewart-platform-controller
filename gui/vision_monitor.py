@@ -41,6 +41,16 @@ _PD_COLOR = (220, 80, 220)       # magenta — PD restoration command
 _TARGET_COLOR = (80, 80, 255)    # red-ish
 _TEXT_COLOR = (210, 255, 210)    # pale green
 _PATH_COLOR = (200, 200, 0)      # teal — path polyline + carrot
+_QUAD_COLOR = (80, 255, 120)     # green — fitted boundary quad
+# Homography-source badge colors (boundary-quad rework): green when the
+# quad is the source, yellow on ArUco fallback, orange on stale-H hold,
+# red when there is no H at all.
+_H_SOURCE_COLORS = {
+    "quad": (80, 220, 80),
+    "aruco": (0, 220, 220),
+    "stale": (0, 165, 255),
+}
+_H_SOURCE_MISS_COLOR = (60, 60, 255)
 
 # PD vec scale: px per degree of computed tilt command
 _PD_VEC_SCALE_PX_PER_DEG = 18.0
@@ -247,9 +257,32 @@ def _draw_warped_overlays(
     return frame
 
 
-def _draw_camera_overlays(bgr: np.ndarray) -> np.ndarray:
+def _draw_camera_overlays(
+    bgr: np.ndarray,
+    homography_source: str = "",
+    quad_corners_px: np.ndarray | None = None,
+) -> np.ndarray:
     frame = bgr.copy()
     _put_label(frame, "CAMERA")
+
+    # Fitted boundary quad (green) — corners arrive in the same flipped-
+    # camera coords as this frame, so they draw directly.
+    if quad_corners_px is not None:
+        pts = np.round(np.asarray(quad_corners_px, dtype=np.float64))
+        poly = pts.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [poly], isClosed=True,
+                      color=_QUAD_COLOR, thickness=1, lineType=cv2.LINE_AA)
+        for x, y in pts.astype(np.int32):
+            cv2.circle(frame, (int(x), int(y)), 3, _QUAD_COLOR, -1, cv2.LINE_AA)
+
+    # Source badge under the CAMERA label: which ladder rung produced H.
+    if homography_source:
+        shown = "--" if homography_source == "none" else homography_source.upper()
+        color = _H_SOURCE_COLORS.get(homography_source, _H_SOURCE_MISS_COLOR)
+        cv2.putText(frame, f"H: {shown}", (8, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, f"H: {shown}", (8, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
     return frame
 
 
@@ -331,11 +364,16 @@ class VisionMonitorWindow(QWidget):
         h = self._warped_label.height()
         self._warped_label.setPixmap(_bgr_to_pixmap(frame, w, h))
 
-    def update_camera(self, bgr: np.ndarray | None) -> None:
+    def update_camera(
+        self,
+        bgr: np.ndarray | None,
+        homography_source: str = "",
+        quad_corners_px: np.ndarray | None = None,
+    ) -> None:
         if bgr is None:
             self._camera_label.setText("Camera: Disabled")
             return
-        frame = _draw_camera_overlays(bgr)
+        frame = _draw_camera_overlays(bgr, homography_source, quad_corners_px)
         w = self._camera_label.width()
         h = self._camera_label.height()
         self._camera_label.setPixmap(_bgr_to_pixmap(frame, w, h))

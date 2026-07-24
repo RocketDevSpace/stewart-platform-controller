@@ -497,6 +497,52 @@ tuned ki.
 
 ---
 
+### 2026-07-24 Boundary-Quad Platform Tracking — Quad Primary, ArUco Auxiliary
+**Status:** Implemented (branch `rework/autotune-id`); merge gated on
+the rig session
+
+**Why:** rig data (fourth path session) proved the ball occludes the
+ArUco markers during path transits — >4 mm single-frame homography
+jumps on 19% of frames near the marker diagonals (3× baseline),
+feeding a ~1 Hz path oscillation. The markers sit at ±60 mm, in the
+ball's traffic; the platform boundary at ±120 mm is physically
+unreachable (max center excursion ~85 mm).
+
+**Contract:**
+1. `cv/quad_tracker.py::PlatformQuadTracker` fits the four boundary
+   edges (32 sub-pixel samples/side, one `cv2.remap`, trimmed TLS,
+   corner intersection, deadband corner LP → bit-stable H at rest) and
+   builds the same camera→warp H the ArUco path builds.
+2. Source ladder in `BallTracker._resolve_homography`:
+   quad (LOCKED) → aruco → bounded stale-hold → miss, reported
+   per-frame as `homography_source`. `TRACKER_QUAD_ENABLED=False`
+   short-circuits to the pre-quad path.
+3. Acquisition needs an ArUco seed (identity/orientation/scale);
+   per-side edge polarity and silhouette-offset calibration freeze at
+   lock. Gray-on-gray background fails CLOSED to ArUco.
+4. While locked, ArUco runs every 15th frame as an audit: transient
+   disagreement keeps the quad; 3 consecutive failed audits force a
+   reacquire; the audit is SKIPPED while the ball is within 45 mm of a
+   marker (ArUco is exactly then untrustworthy).
+5. Telemetry: snapshot `homography_source` + `quad_corners_px`,
+   `quad_fit` timing (< 1 ms budget), camera-view quad overlay +
+   `H: QUAD/ARUCO/STALE/--` badge, `[TRACK]` transition log lines.
+
+**Acceptance criteria:**
+- Sim gates (469 passed): deterministic marker-transit A/B — ArUco
+  baseline reproduces the rig glitch (max raw jump 7.7 mm), quad path
+  zero >4 mm jumps (max 1.2 mm); two markers covered still tracks;
+  ball ON the boundary holds corners < 1 px; gray-on-gray falls back
+  and relocks; existing suite untouched via the flat-scene guard ✅
+- Rig session (gates the PR): badge steady at `H: QUAD` with vision
+  on; covering ONE marker with a finger keeps the badge QUAD and the
+  ball position still; covering a boundary side drops to ARUCO and
+  recovers; r=65 circle + star re-run → angle-folded glitch analysis:
+  near-diagonal >4 mm rate must drop from 19% toward the ~6%
+  baseline; `quad_fit` < 1 ms on the timing strip — pending
+
+---
+
 ## Future Features (not scheduled)
 
 ### Multi-Camera Ball Tracking
