@@ -55,6 +55,77 @@ def _tracker() -> BallTracker:
     return BallTracker(platform_size_mm=240.0, warp_size_px=WARP)
 
 
+# --- Perspective scene (boundary-quad rework, 2026-07-24) ---
+# Overhead "mm canvas": dark background, gray platform filling the full
+# +/-120 mm square, real ArUco bitmaps at +/-60 mm, orange ball — then
+# warped by a KNOWN canvas->camera homography to an oblique 640x480
+# camera frame and mirrored (the existing pre-flip convention). Unlike
+# _scene (flat warp-geometry, no visible boundary), this renders the
+# platform BOUNDARY EDGES, so the quad tracker can acquire on it; the
+# flat _scene remains the no-regression guard (quad never acquires
+# there, so every legacy test keeps exercising the pure ArUco path).
+
+_PMARGIN = 80            # canvas px of dark background around the platform
+_PCANVAS = 480 + 2 * _PMARGIN
+_PBG = 40                # background gray value
+_PFG = 128               # platform gray value
+# Canvas platform corners (TL,TR,BR,BL) -> irregular oblique camera quad.
+_PCANVAS_CORNERS = np.array(
+    [[_PMARGIN, _PMARGIN], [_PMARGIN + 480, _PMARGIN],
+     [_PMARGIN + 480, _PMARGIN + 480], [_PMARGIN, _PMARGIN + 480]],
+    dtype=np.float32,
+)
+_PCAM_QUAD = np.array(
+    [[90.0, 40.0], [560.0, 55.0], [585.0, 425.0], [60.0, 405.0]],
+    dtype=np.float32,
+)
+_H_CANVAS_TO_CAM = cv2.getPerspectiveTransform(_PCANVAS_CORNERS, _PCAM_QUAD)
+
+
+def _persp_scene(
+    ball_mm: tuple[float, float] | None,
+    cover_markers: tuple[int, ...] = (),
+    match_bg_sides: tuple[int, ...] = (),
+) -> np.ndarray:
+    """Render the oblique-camera platform scene; see the block comment.
+
+    cover_markers: marker ids left platform-gray (painted over / fully
+    occluded). match_bg_sides: boundary sides (0=top TL-TR, 1=right,
+    2=bottom, 3=left, in canvas orientation) whose OUTSIDE strip is
+    painted platform-gray — gray-on-gray, no edge contrast."""
+    canvas = np.full((_PCANVAS, _PCANVAS, 3), _PBG, dtype=np.uint8)
+    canvas[_PMARGIN:_PMARGIN + 480, _PMARGIN:_PMARGIN + 480] = _PFG
+
+    strips = {
+        0: (0, 0, _PCANVAS, _PMARGIN),                  # above the top side
+        1: (_PMARGIN + 480, 0, _PCANVAS, _PCANVAS),     # right of the right side
+        2: (0, _PMARGIN + 480, _PCANVAS, _PCANVAS),     # below the bottom side
+        3: (0, 0, _PMARGIN, _PCANVAS),                  # left of the left side
+    }
+    for side in match_bg_sides:
+        x0, y0, x1, y1 = strips[side]
+        canvas[y0:y1, x0:x1] = _PFG
+
+    marker_centers = {0: (360, 120), 1: (120, 120), 2: (120, 360), 3: (360, 360)}
+    for mid, (cx, cy) in marker_centers.items():
+        if mid in cover_markers:
+            continue
+        bmp = _marker_bitmap(mid)
+        bgr = cv2.cvtColor(bmp, cv2.COLOR_GRAY2BGR)
+        half = MARKER_PX // 2
+        canvas[_PMARGIN + cy - half:_PMARGIN + cy + half,
+               _PMARGIN + cx - half:_PMARGIN + cx + half] = bgr
+
+    if ball_mm is not None:
+        px_per_mm = 480 / 240.0
+        bx = int(_PMARGIN + 240 + ball_mm[0] * px_per_mm)
+        by = int(_PMARGIN + 240 - ball_mm[1] * px_per_mm)
+        cv2.circle(canvas, (bx, by), 14, ORANGE_BGR, -1)
+
+    cam = cv2.warpPerspective(canvas, _H_CANVAS_TO_CAM, (640, 480))
+    return cv2.flip(cam, 1)
+
+
 class TestDetection:
     def test_ball_at_center_maps_to_origin(self) -> None:
         t = _tracker()
@@ -83,6 +154,38 @@ class TestDetection:
     def test_no_markers_ever_returns_none(self) -> None:
         t = _tracker()
         assert t.process(_scene((0.0, 0.0), include_markers=False), 1.0) is None
+
+
+class TestPerspectiveSceneBaseline:
+    """Pins the _persp_scene builder itself: the ORIGINAL ArUco pipeline
+    must track on the oblique perspective scene BEFORE the quad tracker
+    builds on it (any later quad failure is then the quad's, not the
+    scene's)."""
+
+    def test_ball_center_and_offset_track(self) -> None:
+        # Fresh tracker per position: this pins the SCENE GEOMETRY (a
+        # 36 mm instant teleport would otherwise trip the glitch veto,
+        # which is filter behavior pinned elsewhere).
+        for ball_mm in ((0.0, 0.0), (30.0, -20.0)):
+            t = _tracker()
+            s = t.process(_persp_scene(ball_mm), frame_ts=1.0)
+            assert s is not None
+            assert s.x_mm == pytest.approx(ball_mm[0], abs=2.5)
+            assert s.y_mm == pytest.approx(ball_mm[1], abs=2.5)
+
+    def test_one_covered_marker_parallelogram_completes(self) -> None:
+        t = _tracker()
+        s = t.process(_persp_scene((0.0, 0.0), cover_markers=(2,)), frame_ts=1.0)
+        assert s is not None
+        assert s.x_mm == pytest.approx(0.0, abs=3.0)
+        assert s.y_mm == pytest.approx(0.0, abs=3.0)
+
+    def test_two_covered_markers_is_todays_limit(self) -> None:
+        # The ArUco path needs >= 3 markers, so TWO covered = loss. The
+        # quad integration lifts this limit — pinned in the quad E-tests.
+        t = _tracker()
+        scene = _persp_scene((0.0, 0.0), cover_markers=(1, 2))
+        assert t.process(scene, frame_ts=1.0) is None
 
 
 class TestVelocity:
