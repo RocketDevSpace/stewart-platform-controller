@@ -10,7 +10,9 @@ import cv2
 import numpy as np
 import pytest
 
+from core.platform_state import BallState
 from cv.ball_tracker import BallTracker
+from cv.quad_tracker import STATE_LOCKED, STATE_UNLOCKED
 from settings import BALL_VEL_FILTER_ALPHA, TRACKER_AB_BETA_MAX
 
 WARP = 480          # warp_size_px used in tests (matches production setting)
@@ -186,6 +188,97 @@ class TestPerspectiveSceneBaseline:
         t = _tracker()
         scene = _persp_scene((0.0, 0.0), cover_markers=(1, 2))
         assert t.process(scene, frame_ts=1.0) is None
+
+
+def _run_to_lock(t: BallTracker, scene: np.ndarray, extra: int = 2) -> BallState | None:
+    """Process enough frames of `scene` for the quad tracker to seed,
+    acquire, and lock; returns the last BallState."""
+    s: BallState | None = None
+    for i in range(t.quad.acq_frames + extra):
+        s = t.process(scene, frame_ts=1.0 + i / 30)
+    return s
+
+
+class TestQuadPrimarySource:
+    """The boundary-quad source ladder end-to-end (E-tests 1/2/3/5):
+    quad acquisition on the perspective scene, marker-occlusion immunity,
+    the beyond-ArUco 2-markers-covered case, and quad-path H stability."""
+
+    def test_acquires_locks_and_becomes_source(self) -> None:
+        for ball_mm in ((0.0, 0.0), (30.0, -20.0)):
+            t = _tracker()
+            s = _run_to_lock(t, _persp_scene(ball_mm))
+            assert t.quad.state == STATE_LOCKED
+            assert t.homography_source == "quad"
+            assert s is not None
+            assert s.x_mm == pytest.approx(ball_mm[0], abs=2.5)
+            assert s.y_mm == pytest.approx(ball_mm[1], abs=2.5)
+
+    def test_one_marker_covered_position_unmoved(self) -> None:
+        # THE rig failure mode: the ball transits a marker. With the quad
+        # as source, fully covering a marker must not move the ball.
+        t = _tracker()
+        s_clean = _run_to_lock(t, _persp_scene((30.0, -20.0)))
+        assert s_clean is not None
+        covered = _persp_scene((30.0, -20.0), cover_markers=(0,))
+        s_cov = t.process(covered, frame_ts=2.0)
+        assert s_cov is not None
+        assert t.homography_source == "quad"
+        assert s_cov.x_mm == pytest.approx(s_clean.x_mm, abs=1.0)
+        assert s_cov.y_mm == pytest.approx(s_clean.y_mm, abs=1.0)
+
+    def test_two_markers_covered_still_tracks(self) -> None:
+        # Impossible on the ArUco path (3-marker parallelogram is its
+        # floor — pinned in TestPerspectiveSceneBaseline): the quad needs
+        # no markers at all once locked. Runs past a cross-check frame;
+        # the failed ArUco solve there must not count as a strike.
+        t = _tracker()
+        s_clean = _run_to_lock(t, _persp_scene((30.0, -20.0)))
+        assert s_clean is not None
+        covered = _persp_scene((30.0, -20.0), cover_markers=(1, 2))
+        s = None
+        for i in range(20):
+            s = t.process(covered, frame_ts=2.0 + i / 30)
+            assert s is not None
+            assert t.homography_source == "quad"
+        assert t.quad.state == STATE_LOCKED
+        assert s is not None
+        assert s.x_mm == pytest.approx(s_clean.x_mm, abs=1.5)
+        assert s.y_mm == pytest.approx(s_clean.y_mm, abs=1.5)
+
+    def test_quad_path_h_bit_stable_on_identical_frames(self) -> None:
+        # Mirrors TestHomographyStability for the quad source: identical
+        # frames -> bit-identical H (corner deadband LP + fresh solve).
+        t = _tracker()
+        scene = _persp_scene((0.0, 0.0))
+        _run_to_lock(t, scene)
+        internal = cv2.flip(scene, 1)     # what process() sees post-flip
+        h1 = t._resolve_homography(internal)
+        h2 = t._resolve_homography(internal)
+        assert h1 is not None and h2 is not None
+        assert t.homography_source == "quad"
+        assert np.array_equal(h1, h2)
+
+    def test_flat_scene_never_acquires_pure_aruco_path(self) -> None:
+        # The no-regression guard, stated explicitly: the legacy flat
+        # _scene has no visible boundary (the platform fills the frame),
+        # so the quad cannot acquire and every existing test transparently
+        # exercises the unchanged ArUco path.
+        t = _tracker()
+        scene = _scene((0.0, 0.0))
+        for i in range(15):
+            assert t.process(scene, frame_ts=1.0 + i / 30) is not None
+        assert t.quad.state != STATE_LOCKED
+        assert t.homography_source == "aruco"
+
+    def test_quad_disabled_short_circuits_to_aruco(self) -> None:
+        t = _tracker()
+        t.quad_enabled = False
+        s = _run_to_lock(t, _persp_scene((30.0, -20.0)))
+        assert s is not None
+        assert t.quad.state == STATE_UNLOCKED     # never even seeded
+        assert t.homography_source == "aruco"
+        assert s.x_mm == pytest.approx(30.0, abs=2.5)
 
 
 class TestVelocity:
