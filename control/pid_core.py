@@ -152,6 +152,7 @@ class PIDCore:
         i_limit_override: float | None = None,
         v_des: tuple[float, float] = (0.0, 0.0),
         ff: tuple[float, float] = (0.0, 0.0),
+        gain_scale: float = 1.0,
     ) -> PIDResult:
         """One PID step from error vector (ex, ey) and ball velocity.
 
@@ -175,11 +176,15 @@ class PIDCore:
         ff (deg, error space): feedforward tilt added beside P/I/D
         (path centripetal pre-tilt), mapped to pitch/roll like the
         other x/y terms.
+        gain_scale scales the P and D terms ONLY (the harmonic-orbit
+        mode demotes feedback to a trim role around its feedforward);
+        the integral path is untouched — its anti-windup provisional
+        command sees the scaled pd + ff, which is what actually flies.
         """
-        p_x = self.kp * ex
-        p_y = self.kp * ey
-        d_x = self.kd * (v_des[0] - vx)
-        d_y = self.kd * (v_des[1] - vy)
+        p_x = self.kp * gain_scale * ex
+        p_y = self.kp * gain_scale * ey
+        d_x = self.kd * gain_scale * (v_des[0] - vx)
+        d_y = self.kd * gain_scale * (v_des[1] - vy)
 
         # Derivative term cap (FG-11)
         if self.d_term_limit_deg is not None:

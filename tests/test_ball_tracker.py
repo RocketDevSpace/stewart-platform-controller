@@ -10,7 +10,9 @@ import cv2
 import numpy as np
 import pytest
 
+from core.platform_state import BallState
 from cv.ball_tracker import BallTracker
+from cv.quad_tracker import STATE_LOCKED, STATE_UNLOCKED
 from settings import BALL_VEL_FILTER_ALPHA, TRACKER_AB_BETA_MAX
 
 WARP = 480          # warp_size_px used in tests (matches production setting)
@@ -55,6 +57,77 @@ def _tracker() -> BallTracker:
     return BallTracker(platform_size_mm=240.0, warp_size_px=WARP)
 
 
+# --- Perspective scene (boundary-quad rework, 2026-07-24) ---
+# Overhead "mm canvas": dark background, gray platform filling the full
+# +/-120 mm square, real ArUco bitmaps at +/-60 mm, orange ball — then
+# warped by a KNOWN canvas->camera homography to an oblique 640x480
+# camera frame and mirrored (the existing pre-flip convention). Unlike
+# _scene (flat warp-geometry, no visible boundary), this renders the
+# platform BOUNDARY EDGES, so the quad tracker can acquire on it; the
+# flat _scene remains the no-regression guard (quad never acquires
+# there, so every legacy test keeps exercising the pure ArUco path).
+
+_PMARGIN = 80            # canvas px of dark background around the platform
+_PCANVAS = 480 + 2 * _PMARGIN
+_PBG = 40                # background gray value
+_PFG = 128               # platform gray value
+# Canvas platform corners (TL,TR,BR,BL) -> irregular oblique camera quad.
+_PCANVAS_CORNERS = np.array(
+    [[_PMARGIN, _PMARGIN], [_PMARGIN + 480, _PMARGIN],
+     [_PMARGIN + 480, _PMARGIN + 480], [_PMARGIN, _PMARGIN + 480]],
+    dtype=np.float32,
+)
+_PCAM_QUAD = np.array(
+    [[90.0, 40.0], [560.0, 55.0], [585.0, 425.0], [60.0, 405.0]],
+    dtype=np.float32,
+)
+_H_CANVAS_TO_CAM = cv2.getPerspectiveTransform(_PCANVAS_CORNERS, _PCAM_QUAD)
+
+
+def _persp_scene(
+    ball_mm: tuple[float, float] | None,
+    cover_markers: tuple[int, ...] = (),
+    match_bg_sides: tuple[int, ...] = (),
+) -> np.ndarray:
+    """Render the oblique-camera platform scene; see the block comment.
+
+    cover_markers: marker ids left platform-gray (painted over / fully
+    occluded). match_bg_sides: boundary sides (0=top TL-TR, 1=right,
+    2=bottom, 3=left, in canvas orientation) whose OUTSIDE strip is
+    painted platform-gray — gray-on-gray, no edge contrast."""
+    canvas = np.full((_PCANVAS, _PCANVAS, 3), _PBG, dtype=np.uint8)
+    canvas[_PMARGIN:_PMARGIN + 480, _PMARGIN:_PMARGIN + 480] = _PFG
+
+    strips = {
+        0: (0, 0, _PCANVAS, _PMARGIN),                  # above the top side
+        1: (_PMARGIN + 480, 0, _PCANVAS, _PCANVAS),     # right of the right side
+        2: (0, _PMARGIN + 480, _PCANVAS, _PCANVAS),     # below the bottom side
+        3: (0, 0, _PMARGIN, _PCANVAS),                  # left of the left side
+    }
+    for side in match_bg_sides:
+        x0, y0, x1, y1 = strips[side]
+        canvas[y0:y1, x0:x1] = _PFG
+
+    marker_centers = {0: (360, 120), 1: (120, 120), 2: (120, 360), 3: (360, 360)}
+    for mid, (cx, cy) in marker_centers.items():
+        if mid in cover_markers:
+            continue
+        bmp = _marker_bitmap(mid)
+        bgr = cv2.cvtColor(bmp, cv2.COLOR_GRAY2BGR)
+        half = MARKER_PX // 2
+        canvas[_PMARGIN + cy - half:_PMARGIN + cy + half,
+               _PMARGIN + cx - half:_PMARGIN + cx + half] = bgr
+
+    if ball_mm is not None:
+        px_per_mm = 480 / 240.0
+        bx = int(_PMARGIN + 240 + ball_mm[0] * px_per_mm)
+        by = int(_PMARGIN + 240 - ball_mm[1] * px_per_mm)
+        cv2.circle(canvas, (bx, by), 14, ORANGE_BGR, -1)
+
+    cam = cv2.warpPerspective(canvas, _H_CANVAS_TO_CAM, (640, 480))
+    return cv2.flip(cam, 1)
+
+
 class TestDetection:
     def test_ball_at_center_maps_to_origin(self) -> None:
         t = _tracker()
@@ -83,6 +156,220 @@ class TestDetection:
     def test_no_markers_ever_returns_none(self) -> None:
         t = _tracker()
         assert t.process(_scene((0.0, 0.0), include_markers=False), 1.0) is None
+
+
+class TestPerspectiveSceneBaseline:
+    """Pins the _persp_scene builder itself: the ORIGINAL ArUco pipeline
+    must track on the oblique perspective scene BEFORE the quad tracker
+    builds on it (any later quad failure is then the quad's, not the
+    scene's)."""
+
+    def test_ball_center_and_offset_track(self) -> None:
+        # Fresh tracker per position: this pins the SCENE GEOMETRY (a
+        # 36 mm instant teleport would otherwise trip the glitch veto,
+        # which is filter behavior pinned elsewhere).
+        for ball_mm in ((0.0, 0.0), (30.0, -20.0)):
+            t = _tracker()
+            s = t.process(_persp_scene(ball_mm), frame_ts=1.0)
+            assert s is not None
+            assert s.x_mm == pytest.approx(ball_mm[0], abs=2.5)
+            assert s.y_mm == pytest.approx(ball_mm[1], abs=2.5)
+
+    def test_one_covered_marker_parallelogram_completes(self) -> None:
+        t = _tracker()
+        s = t.process(_persp_scene((0.0, 0.0), cover_markers=(2,)), frame_ts=1.0)
+        assert s is not None
+        assert s.x_mm == pytest.approx(0.0, abs=3.0)
+        assert s.y_mm == pytest.approx(0.0, abs=3.0)
+
+    def test_two_covered_markers_is_todays_limit(self) -> None:
+        # The ArUco path needs >= 3 markers, so TWO covered = loss. The
+        # quad integration lifts this limit — pinned in the quad E-tests.
+        t = _tracker()
+        scene = _persp_scene((0.0, 0.0), cover_markers=(1, 2))
+        assert t.process(scene, frame_ts=1.0) is None
+
+
+def _run_to_lock(t: BallTracker, scene: np.ndarray, extra: int = 2) -> BallState | None:
+    """Process enough frames of `scene` for the quad tracker to seed,
+    acquire, and lock; returns the last BallState."""
+    s: BallState | None = None
+    for i in range(t.quad.acq_frames + extra):
+        s = t.process(scene, frame_ts=1.0 + i / 30)
+    return s
+
+
+class TestQuadPrimarySource:
+    """The boundary-quad source ladder end-to-end (E-tests 1/2/3/5):
+    quad acquisition on the perspective scene, marker-occlusion immunity,
+    the beyond-ArUco 2-markers-covered case, and quad-path H stability."""
+
+    def test_acquires_locks_and_becomes_source(self) -> None:
+        for ball_mm in ((0.0, 0.0), (30.0, -20.0)):
+            t = _tracker()
+            s = _run_to_lock(t, _persp_scene(ball_mm))
+            assert t.quad.state == STATE_LOCKED
+            assert t.homography_source == "quad"
+            assert s is not None
+            assert s.x_mm == pytest.approx(ball_mm[0], abs=2.5)
+            assert s.y_mm == pytest.approx(ball_mm[1], abs=2.5)
+
+    def test_one_marker_covered_position_unmoved(self) -> None:
+        # THE rig failure mode: the ball transits a marker. With the quad
+        # as source, fully covering a marker must not move the ball.
+        t = _tracker()
+        s_clean = _run_to_lock(t, _persp_scene((30.0, -20.0)))
+        assert s_clean is not None
+        covered = _persp_scene((30.0, -20.0), cover_markers=(0,))
+        s_cov = t.process(covered, frame_ts=2.0)
+        assert s_cov is not None
+        assert t.homography_source == "quad"
+        assert s_cov.x_mm == pytest.approx(s_clean.x_mm, abs=1.0)
+        assert s_cov.y_mm == pytest.approx(s_clean.y_mm, abs=1.0)
+
+    def test_two_markers_covered_still_tracks(self) -> None:
+        # Impossible on the ArUco path (3-marker parallelogram is its
+        # floor — pinned in TestPerspectiveSceneBaseline): the quad needs
+        # no markers at all once locked. Runs past a cross-check frame;
+        # the failed ArUco solve there must not count as a strike.
+        t = _tracker()
+        s_clean = _run_to_lock(t, _persp_scene((30.0, -20.0)))
+        assert s_clean is not None
+        covered = _persp_scene((30.0, -20.0), cover_markers=(1, 2))
+        s = None
+        for i in range(20):
+            s = t.process(covered, frame_ts=2.0 + i / 30)
+            assert s is not None
+            assert t.homography_source == "quad"
+        assert t.quad.state == STATE_LOCKED
+        assert s is not None
+        assert s.x_mm == pytest.approx(s_clean.x_mm, abs=1.5)
+        assert s.y_mm == pytest.approx(s_clean.y_mm, abs=1.5)
+
+    def test_quad_path_h_bit_stable_on_identical_frames(self) -> None:
+        # Mirrors TestHomographyStability for the quad source: identical
+        # frames -> bit-identical H (corner deadband LP + fresh solve).
+        t = _tracker()
+        scene = _persp_scene((0.0, 0.0))
+        _run_to_lock(t, scene)
+        internal = cv2.flip(scene, 1)     # what process() sees post-flip
+        h1 = t._resolve_homography(internal)
+        h2 = t._resolve_homography(internal)
+        assert h1 is not None and h2 is not None
+        assert t.homography_source == "quad"
+        assert np.array_equal(h1, h2)
+
+    def test_flat_scene_never_acquires_pure_aruco_path(self) -> None:
+        # The no-regression guard, stated explicitly: the legacy flat
+        # _scene has no visible boundary (the platform fills the frame),
+        # so the quad cannot acquire and every existing test transparently
+        # exercises the unchanged ArUco path.
+        t = _tracker()
+        scene = _scene((0.0, 0.0))
+        for i in range(15):
+            assert t.process(scene, frame_ts=1.0 + i / 30) is not None
+        assert t.quad.state != STATE_LOCKED
+        assert t.homography_source == "aruco"
+
+    def test_quad_disabled_short_circuits_to_aruco(self) -> None:
+        t = _tracker()
+        t.quad_enabled = False
+        s = _run_to_lock(t, _persp_scene((30.0, -20.0)))
+        assert s is not None
+        assert t.quad.state == STATE_UNLOCKED     # never even seeded
+        assert t.homography_source == "aruco"
+        assert s.x_mm == pytest.approx(30.0, abs=2.5)
+
+
+class TestQuadRobustness:
+    """E-tests 4/6: the ball ON the boundary (exclusion + trim), and the
+    gray-on-gray fail-closed fallback with recovery."""
+
+    def test_ball_sliding_on_boundary_stays_smooth(self) -> None:
+        # The ball's silhouette overlaps the top boundary while sliding
+        # along it: the exclusion zone + trimmed fit must hold the
+        # corners still and the position glitch-free.
+        t = _tracker()
+        _run_to_lock(t, _persp_scene((-30.0, 118.0)))
+        assert t.quad.state == STATE_LOCKED
+        assert t.quad.last_corners_cam is not None
+        corners0 = t.quad.last_corners_cam.copy()
+        prev_raw: tuple[float, float] | None = None
+        for i in range(31):
+            x = -30.0 + 2.0 * i                     # 2 mm/frame slide
+            s = t.process(_persp_scene((x, 118.0)), frame_ts=2.0 + i / 30)
+            assert s is not None
+            assert t.homography_source == "quad"
+            assert s.raw_x_mm is not None and s.raw_y_mm is not None
+            if prev_raw is not None:
+                jump = float(np.hypot(s.raw_x_mm - prev_raw[0],
+                                      s.raw_y_mm - prev_raw[1]))
+                assert jump < 4.0                   # commanded 2 mm + noise
+            prev_raw = (s.raw_x_mm, s.raw_y_mm)
+        assert t.quad.last_corners_cam is not None
+        drift = np.hypot(*(t.quad.last_corners_cam - corners0).T)
+        assert float(drift.max()) < 1.0
+
+    def test_gray_on_gray_falls_to_aruco_and_relocks(self) -> None:
+        # Two boundary sides lose contrast: the quad fails CLOSED, the
+        # ladder falls to ArUco (ball still tracked, today's behavior),
+        # the lock drops after the miss budget — and restoring contrast
+        # relocks within the acquisition window.
+        t = _tracker()
+        _run_to_lock(t, _persp_scene((0.0, 0.0)))
+        flat = _persp_scene((0.0, 0.0), match_bg_sides=(0, 1))
+        for i in range(t.quad.max_miss_frames + 2):
+            s = t.process(flat, frame_ts=2.0 + i / 30)
+            assert s is not None
+            assert t.homography_source == "aruco"
+        assert t.quad.state != STATE_LOCKED
+        s = _run_to_lock(t, _persp_scene((0.0, 0.0)))
+        assert s is not None
+        assert t.quad.state == STATE_LOCKED
+        assert t.homography_source == "quad"
+
+
+class TestQuadGlitchImmunity:
+    """E-test 7: the rig failure mode reproduced and killed. A 60-frame
+    sweep slides the ball straight across marker 0, progressively
+    occluding it. Both halves are pinned because the synthetic is fully
+    deterministic (no RNG): the ArUco-only baseline DOES glitch (this
+    pin proves the scene reproduces the rig's >4 mm raw jumps), and the
+    quad path shows ZERO >4 mm jumps with the source never leaving
+    "quad" — including across cross-check frames, which the
+    ball-near-marker guard must suppress (without it, the slow transit
+    reads as persistent ArUco disagreement and forces a reacquire FROM
+    the glitched H; caught in sim before it reached the rig)."""
+
+    def _sweep_raw_jumps(self, t: BallTracker) -> list[float]:
+        jumps: list[float] = []
+        prev: tuple[float, float] | None = None
+        for i in range(60):
+            x = 40.0 + 40.0 * i / 59.0              # straight across marker 0
+            s = t.process(_persp_scene((x, 60.0)), frame_ts=2.0 + i / 30)
+            assert s is not None
+            assert s.raw_x_mm is not None and s.raw_y_mm is not None
+            if prev is not None:
+                jumps.append(float(np.hypot(s.raw_x_mm - prev[0],
+                                            s.raw_y_mm - prev[1])))
+            prev = (s.raw_x_mm, s.raw_y_mm)
+        return jumps
+
+    def test_aruco_baseline_reproduces_the_glitch(self) -> None:
+        t = _tracker()
+        t.quad_enabled = False
+        assert t.process(_persp_scene((40.0, 60.0)), frame_ts=1.0) is not None
+        jumps = self._sweep_raw_jumps(t)
+        assert max(jumps) > 4.0                     # the failure exists here
+
+    def test_quad_kills_the_glitch(self) -> None:
+        t = _tracker()
+        _run_to_lock(t, _persp_scene((40.0, 60.0)))
+        assert t.quad.state == STATE_LOCKED
+        jumps = self._sweep_raw_jumps(t)
+        assert t.homography_source == "quad"
+        assert t.quad.state == STATE_LOCKED         # never reacquired
+        assert max(jumps) < 2.5                     # commanded 0.68 mm + noise
 
 
 class TestVelocity:

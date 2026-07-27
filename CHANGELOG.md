@@ -319,6 +319,68 @@ tilt at r=65 mm than center — ball equilibrium 8 mm inside the circle).
   group (sliders now ordered Kp/Ki/Kd), "[PID TUNE]" messages,
   vision-monitor overlay legend/status, docs. Settings keys (`PD_*`)
   and terms keys keep their names — wire/overlay compatibility.
+
+### SysID autotune rework (branch `rework/autotune-id`, 2026-07-23)
+
+The step-test autotune estimator is deleted — convicted on evidence
+(zero legs ever completed on the rig; random-walked against a KNOWN
+simulated plant; 2-scalar inversion of a model the plant is not; never
+tuned ki). Replacement: measure the plant once, design in software.
+
+#### Added
+- `control/plant_model.py` — the ONE ball-on-plate physics module
+  (extracted from path_sim, bit-identical): PlantParams, plant_step,
+  CONTINUOUS-latency command replay (linear interpolation at t−L),
+  vectorized batch replay for the fit grid.
+- `control/plant_id.py` — ~78 s gate-free ProbeScript (quiet hold →
+  safety pre-check → relay toggles ±25 mm x/y → diagonals → stiction
+  micro-steps → baseline steps), ProbeRecording (raw detections + SENT
+  commands; raw deliberately — fitting the filtered trace would bake
+  the filter's group delay into the plant latency; the filter lag is
+  measured separately by raw↔filtered cross-correlation), and
+  fit_plant: per-latency CONVEX acceleration regression over a 5 ms
+  latency grid (the replay-loss grid search it replaced demonstrably
+  trapped 10× above the true minimum), with identical prefiltering of
+  both regression sides, central-difference velocity ICs (the
+  alpha-beta velocity's lag read as +3 frames of latency), the
+  S0-measured self-rock band notched from BOTH sides (closed-loop ID
+  bias), and dither-linearized effective stiction under strong rock.
+  Confidence gating: no-improvement / on-bound / residual ≫ noise
+  floor → low_confidence.
+- `control/gain_design.py` — kp/ki/kd search on the fitted plant via
+  CRN-paired closed-loop sims of the REAL chain (step ITAE 0.40 +
+  quiet-hold RMS-and-effort 0.35 + circle tracking 0.25, normalized so
+  J = 1.0 = "no better than today"); two-round log grid + 6-seed
+  confirmation, ties toward the smaller change; the CURRENT gains are
+  always in the pool — a suggestion can never be measured-worse than
+  today. Low-confidence fits cap the change at ±30%.
+- `PDAutotuner` rewritten as the pipeline state machine (probing →
+  computing → suggestion_ready) with probe safety (ball-lost abort,
+  out-of-bounds recenter-then-abort, cancel via the existing toggle),
+  an autotuner-owned daemon compute thread (generation-tagged result
+  slot, cancel Event, inline mode for tests), and Apply that lands
+  kp/kd/ki AND calibrates the prediction horizon (fitted pipeline
+  latency + measured filter lag; `CONTROL_PREDICT_S` is now
+  instance-level) and the integral deadband — all persisted to the
+  settings overlay (whitelist grows to 16 keys) via the transient
+  `pd_autotune_event {"type": "applied"}` → GUI save path.
+- `BallState` gains optional `raw_x_mm`/`raw_y_mm` (tracker fills the
+  pre-filter detection). Terms: `ki` + 8 additive `pd_autotune_*` keys
+  (phase, progress, plant numbers, predicted cost); the 7 original
+  keys keep their names.
+- Killer tests: probe-in-sim recovers a known plant (g ±10%, L ±20 ms,
+  stiction ±0.1°, WITH and without an injected 0.8 Hz ±4 mm rock);
+  designed gains never measured-worse than current and ≥30% better
+  from a bad start, deterministically; full end-to-end session through
+  `compute_with_terms`.
+
+#### Removed
+- `_PDLegEvaluator`, `_compute_pd_from_metrics`, the wait_settle/leg
+  state machine, and 13 estimator settings keys.
+
+#### Deferred
+- Post-apply on-rig validation re-probe (before/after measured cost) —
+  follow-up; the suggestion carries the sim-predicted cost meanwhile.
 - Trajectory feedforward + latency compensation (third session: the
   ball's wobble — ~28 mm/s of motion — dominated an ~11 mm/s path
   drive; 19 laps completed but invisible as path-following). The
@@ -338,6 +400,141 @@ tilt at r=65 mm than center — ball equilibrium 8 mm inside the circle).
   and its 11 `AUTO_TRIM_*` settings keys.
 - The path stall-thaw special case from 983583f (symptom patch,
   obsoleted by the integral) and `notify_target_changed()`.
+
+### Rig hardening: servo lag + occlusion veto (same branch, 2026-07-23)
+
+The first on-rig SysID session produced violent oscillation from a
+confident fit (g 104 vs true ~171): the model was blind to the servo's
+first-order lag, and the acceleration regression's SSE is nearly flat
+along the (servo_tau, g) ridge. Defense in depth, each layer pinned:
+
+#### Added
+- `PlantParams.servo_tau_s` + `ServoLag` — first-order actuator lag in
+  the ONE plant model, in the fit (latency × tau scan with a
+  replay-loss tie-break across the ridge's top candidates), and in the
+  gain-design closed-loop harness.
+- Fit guard: >35% deviation from the rig-anchored `PD_AUTOTUNE_G_EFF`
+  (new overlay key, measured 171) → low_confidence. Design guards:
+  trust-but-bound per-session caps (kp/kd ≤ 1.6×, |Δki| ≤ 0.02,
+  ki bound 0.05).
+- Single-frame glitch veto in `AlphaBetaFilter2D`
+  (`TRACKER_AB_VETO_MM` 6 / `TRACKER_AB_VETO_MAX_FRAMES` 1). Fourth
+  path session confirmed Hudson's occlusion hypothesis in the data:
+  >4 mm single-frame homography jumps on 19% of frames near the marker
+  diagonals (3× baseline) as the ball's edge grazes the marker inner
+  corners on the r=65 circle. An innovation beyond 6 mm coasts on the
+  prediction for at most one frame; documented trade: a genuine flick
+  onset is delayed exactly one frame (ramp pin amended 3 → 4 frames).
+- `"Circle (r=50, marker-safe)"` pattern — ball edge stays ~70 mm,
+  clear of the marker inner corners at ~85 mm; also the A/B for the
+  occlusion mechanism.
+- Test-hygiene fix: the feasibility suite pins its reference gains via
+  a hermetic wrapper (the sim defaults read the USER OVERLAY, so gains
+  saved at the rig silently moved every bound — bit us when kp 0.072
+  was saved).
+
+### Boundary-quad platform tracking (same branch, 2026-07-24)
+
+The ArUco markers sit at ±60 mm — in the ball's traffic. The platform
+BOUNDARY at ±120 mm is unreachable (max center excursion ~85 mm) and
+offers ~32 edge samples per side vs 16 marker corners. The homography
+source ladder is now quad → aruco → stale-hold → miss; ArUco is
+demoted to acquisition seed, identity/scale reference, periodic
+cross-check, and fallback.
+
+#### Added
+- `cv/quad_tracker.py` — `PlatformQuadTracker`: 32 samples/side
+  fetched with ONE `cv2.remap`, polarity-signed gradient +
+  parabolic sub-pixel edges, 2-pass trimmed TLS line fits
+  (median-centered MAD — a clustered ball silhouette cannot drag the
+  trim), corner intersection, per-corner deadband LP (bit-stable H on
+  identical frames, the ArUco contract), UNLOCKED → ACQUIRING (ArUco
+  seed; per-side polarity learned + silhouette-vs-ArUco offset frozen
+  as thickness/parallax calibration) → LOCKED with validation gates
+  (corner step / convexity / side-length + angle drift), ball-exclusion
+  zone, and a miss budget. Gray-on-gray fails CLOSED (contrast floor →
+  ArUco, today's behavior). Cost ~0.2-0.5 ms; net per-frame cost DROPS
+  (marker detection now runs every 15th frame while locked).
+- Cross-check arbitration: transient ArUco disagreement prefers the
+  QUAD (transient ArUco error IS the rig failure mode); 3 consecutive
+  failed audits force a reacquire (only ArUco carries absolute
+  identity/scale). The audit is skipped while the ball is within 45 mm
+  of a marker (`TRACKER_QUAD_CROSSCHECK_BALL_NEAR_MARKER_MM`) — a slow
+  marker transit otherwise reads as persistent disagreement and
+  reacquires FROM the glitched H (caught in sim before the rig).
+- `PointDeadbandLP` extracted to `cv/measurement_filter.py` — the
+  marker-center filter's deadband + scheduled-alpha + snap logic,
+  shared by markers and quad corners.
+- Telemetry: `ControlSnapshot.homography_source` (both branches) +
+  `quad_corners_px` (owned copy, flipped-camera coords); `"quad_fit"`
+  timing key only when enabled (no fabricated zeros); GUI camera view
+  draws the fitted quad + an `H: QUAD/ARUCO/STALE/--` badge
+  (green/yellow/orange/red); `[TRACK] H source a -> b` preview line on
+  transitions (rate-limited 1/s); timing-plot series registered.
+- Tests: `_persp_scene` (oblique perspective scene with real boundary
+  edges; ArUco-baseline pins land BEFORE the quad so failures are
+  attributable) + the deterministic marker-transit A/B — the ArUco
+  baseline REPRODUCES the rig glitch (max raw jump 7.7 mm), the quad
+  path shows zero >4 mm jumps (max 1.2 mm); two-markers-covered still
+  tracks (beyond the ArUco 3-marker floor); ball sliding ON the
+  boundary holds corners < 1 px; gray-on-gray falls to "aruco" and
+  relocks; the flat legacy `_scene` has no boundary so every existing
+  test still exercises the pure ArUco path (asserted explicitly).
+- Rig-feedback hardening (same day): acquisition diagnostics (per-side
+  fail reasons with the MEASURED edge gradient, predicted/fitted quad
+  overlay, `[TRACK]` log lines) after the quad silently never locked;
+  and the BASELINE-RELATIVE cross-check after a metronomic ~1.5 s
+  unlock/relock cycle — ArUco's 2x boundary extrapolation is
+  structurally wrong on a real lens, so the audit now alarms on CHANGE
+  from the lock-time residual (slow blend on passes; raw > 25 px is a
+  hard identity-slip strike), with the audit disagreement surfaced
+  on-screen.
+
+### Harmonic orbit — feedforward-driven smooth circles (2026-07-27)
+
+A SEPARATE mode from carrot path following (which is preserved
+unchanged): the reference is CLOCK-driven at constant angular rate —
+the pacing law's error->speed coupling is the circle jank source — the
+platform plays a smooth rotating tilt tuned to the plant, and feedback
+is demoted to a trim role.
+
+#### Added
+- `control/orbit.py` — `HarmonicOrbit`: analytic feedforward
+  (centripetal tilt omega^2*r/g_eff as a rotating vector, phase-
+  advanced by the actuation delay; tangential term during spin-up) +
+  the mode's heart, a LEARNED per-phase correction table (iterative
+  learning control, 24 bins) that absorbs the plate-specific
+  disturbances — the bowl warp needs ~0.28 deg at r=50, dwarfing the
+  0.19 deg analytic term, and it is periodic at orbit frequency.
+  States: entrain (seed at the ball's angle/radius, ramp over 4 s —
+  pick the ball up, never drag) -> track (learning) -> recover (error
+  tripwire re-entrains with the table frozen). Update law
+  `delta_c = mu*gamma*(ref-ball)`, `gamma = kp_eff - omega^2/g_eff`
+  (the in-phase inverse of the closed-loop map; feedback-dominated at
+  these gains). Three sim-caught failure modes made structural:
+  bin-transit writes + a Gaussian write kernel band-limit learning
+  below the scaled-gain resonance (point-writes pumped sign-flipped
+  harmonics n>=3 to divergence); the integral runs only in
+  entrain/recover and freezes for all of track (running, it out-gains
+  the scaled P-term at orbit frequency with 90 deg lag and fights the
+  table; frozen mid-chase, it snapshots a bogus DC).
+- `PIDCore.compute(gain_scale=...)` — scales P/D only; default 1.0 is
+  bit-identical (pinned).
+- BallController wiring: same override-channel discipline as the path
+  follower, all mode exclusions pairwise, rest suppressed, 11 additive
+  `orbit_*` terms keys (dated TERMS amendment).
+- `tools/path_sim.py`: `simulate_orbit` + `simulate_carrot_circle` on
+  a richer shared plant (fractional latency + servo lag + rig warp;
+  `simulate_path_following` stays byte-identical). Measured A/B at
+  r=50 v=40: orbit lap-ripple learning curve 7.3 -> 0.8 mm, converged
+  mean radius error 1.9 mm vs the carrot's 7.0 mm (the bowl pulls the
+  carrot inside the circle and the pacing law cannot see radius
+  error); tangential speed std 0.38 vs 0.55 mm/s. Kicks: 20 mm
+  absorbed, 40 mm re-converges. All pinned (tests/test_orbit_sim.py).
+- GUI: "Harmonic Orbit" toggle + radius spinbox (30-70 mm) in the Path
+  Following group (speed shared with the Path Speed slider), reference
+  ring overlay, "orbit: track · lap N · err · ilc" status line, worker
+  slots with the never-auto-start rule.
 
 ---
 

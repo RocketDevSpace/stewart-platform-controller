@@ -30,7 +30,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 import settings_store
-from control.patterns import PATTERNS
+from control.patterns import PATTERNS, circle
 from control.pose_commander import PoseCommander
 from control.routine_runner import RoutineRunner
 from core.ik_engine import IKEngine
@@ -53,6 +53,9 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    ORBIT_CONE_OMEGA_RAD_S,
+    ORBIT_CONE_TILT_DEG,
+    ORBIT_RADIUS_MM,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KI,
@@ -89,6 +92,10 @@ class MainWindow(QWidget):
     vision_path_pattern_selected = QtCore.pyqtSignal(str)
     vision_path_following_set = QtCore.pyqtSignal(bool)
     vision_path_speed_updated = QtCore.pyqtSignal(float)
+    vision_orbit_set = QtCore.pyqtSignal(bool)
+    vision_orbit_radius_updated = QtCore.pyqtSignal(float)
+    vision_orbit_cone_tilt_updated = QtCore.pyqtSignal(float)
+    vision_orbit_cone_omega_updated = QtCore.pyqtSignal(float)
     vision_snapshot_consumed = QtCore.pyqtSignal()
 
     def __init__(self) -> None:
@@ -142,6 +149,11 @@ class MainWindow(QWidget):
         self._vision_counter = 0
         self._vision_z_setpoint = 0.0
         self._last_visualizer_update = 0.0
+        # Homography-source transition log (boundary-quad rework):
+        # last seen source + last log emit time (rate-limited 1/s).
+        self._last_h_source = ""
+        self._last_h_source_log_ts = 0.0
+        self._last_quad_diag_log_ts = 0.0
 
         # Mirror of control_panel settings (for routing to worker)
         self._kp = PD_DEFAULT_KP
@@ -164,6 +176,11 @@ class MainWindow(QWidget):
         self._path_following_active = False
         self._path_speed_mm_s = float(PATH_SPEED_MM_S)
         self._last_path_status = ""
+        # Harmonic orbit mirrors (worker owns the truth via terms)
+        self._orbit_active = False
+        self._orbit_radius_mm = float(ORBIT_RADIUS_MM)
+        self._orbit_cone_tilt_deg = float(ORBIT_CONE_TILT_DEG)
+        self._orbit_cone_omega_rad_s = float(ORBIT_CONE_OMEGA_RAD_S)
 
         # --- Routine timer ---
         self._routine_timer = QtCore.QTimer()
@@ -211,6 +228,16 @@ class MainWindow(QWidget):
             self._on_path_pattern_selected
         )
         self.control_panel.path_toggled.connect(self._on_path_toggled)
+        self.control_panel.orbit_toggled.connect(self._on_orbit_toggled)
+        self.control_panel.orbit_radius_changed.connect(
+            self._on_orbit_radius_changed
+        )
+        self.control_panel.orbit_cone_tilt_changed.connect(
+            self._on_orbit_cone_tilt_changed
+        )
+        self.control_panel.orbit_cone_omega_changed.connect(
+            self._on_orbit_cone_omega_changed
+        )
         self.control_panel.path_speed_changed.connect(
             self._on_path_speed_changed
         )
@@ -584,6 +611,47 @@ class MainWindow(QWidget):
                 "[AUTO HOME] timed out without converging — nothing saved"
             )
 
+    def _handle_autotune_applied_event(self, event: dict) -> None:
+        """Transient controller event: an autotune Apply landed. Persist
+        the applied gains — and, when the fit was confident enough to
+        calibrate them, the prediction horizon / integral deadband /
+        plant gain — to the settings overlay (the home_cal_event
+        pattern: persist the event payload, not GUI mirrors that can be
+        a frame stale)."""
+        kp = float(event.get("kp", self._kp))
+        kd = float(event.get("kd", self._kd))
+        ki = float(event.get("ki", self._ki))
+        overrides: dict = {
+            "PD_DEFAULT_KP": kp,
+            "PD_DEFAULT_KD": kd,
+            "PD_DEFAULT_KI": ki,
+        }
+        detail = f"kp={kp:.4f}, kd={kd:.4f}, ki={ki:.4f}"
+        # Calibration keys are present only when the plant fit was
+        # confident — persist exactly what was applied, nothing more.
+        if "predict_s" in event:
+            overrides["CONTROL_PREDICT_S"] = float(event["predict_s"])
+            detail += f", predict={float(event['predict_s']) * 1000.0:.0f}ms"
+        if "deadband_mm" in event:
+            overrides["PD_I_ERR_DEADBAND_MM"] = float(event["deadband_mm"])
+            detail += f", deadband={float(event['deadband_mm']):.1f}mm"
+        if "g_eff" in event:
+            overrides["PD_AUTOTUNE_G_EFF"] = float(event["g_eff"])
+            detail += f", g={float(event['g_eff']):.0f}"
+        try:
+            settings_store.save_user_overrides(overrides)
+            self.control_panel.append_preview(
+                f"[PID TUNE] applied + saved to user_settings.json ({detail})"
+            )
+        except OSError as exc:
+            self.control_panel.append_preview(
+                f"[PID TUNE] applied but save failed: {exc}"
+            )
+        self._kp = kp
+        self._kd = kd
+        self._ki = ki
+        self.control_panel.sync_kp_kd(kp, kd, ki)
+
     def _on_autotune_enable_clicked(self, enabled: bool) -> None:
         self._pd_autotune_enabled = enabled
         if not enabled:
@@ -687,6 +755,9 @@ class MainWindow(QWidget):
         self._home_calibration_active = False
         self.control_panel.sync_calibrate_button(False)
         self.vision_calibrate_home_set.emit(False)
+        self._orbit_active = False
+        self.control_panel.sync_orbit_button(False)
+        self.vision_orbit_set.emit(False)
 
         if label in PATTERNS:
             path = PATTERNS[label]()
@@ -698,6 +769,65 @@ class MainWindow(QWidget):
     def _on_path_speed_changed(self, mm_s: float) -> None:
         self._path_speed_mm_s = float(mm_s)
         self.vision_path_speed_updated.emit(self._path_speed_mm_s)
+
+    def _stop_orbit(self, message: str) -> None:
+        """Shared orbit stop: worker signal, button sync, overlay clear."""
+        self._orbit_active = False
+        self.control_panel.sync_orbit_button(False)
+        self.vision_orbit_set.emit(False)
+        self._vision_monitor.set_path_overlay(None)
+        self.control_panel.append_preview(message)
+
+    def _on_orbit_toggled(self, enabled: bool) -> None:
+        if not enabled:
+            self._stop_orbit("[ORBIT] stopped")
+            return
+
+        if not self._vision_enabled or self._vision_worker is None:
+            self.control_panel.append_preview("[ORBIT] start vision mode first")
+            self.control_panel.sync_orbit_button(False)
+            return
+
+        # Mutual exclusion mirrors (the controller enforces this too —
+        # belt and braces): autotune, home-cal, and path release.
+        self._pd_autotune_enabled = False
+        self._pd_autotune_auto_apply = False
+        self._pd_autotune_has_suggestion = False
+        self.control_panel.sync_autotune_buttons(False, False)
+        self.vision_pd_autotune_enabled.emit(False)
+        self.vision_pd_autotune_auto_apply.emit(False)
+        self._home_calibration_active = False
+        self.control_panel.sync_calibrate_button(False)
+        self.vision_calibrate_home_set.emit(False)
+        self._path_following_active = False
+        self.control_panel.sync_path_button(False)
+        self.vision_path_following_set.emit(False)
+
+        # Reference circle overlay (pure geometry for display).
+        ring = circle(radius_mm=self._orbit_radius_mm)
+        self._vision_monitor.set_path_overlay(ring.points, ring.closed)
+        self._orbit_active = True
+        self.vision_orbit_set.emit(True)
+        self.control_panel.append_preview(
+            f"[ORBIT] harmonic orbit r={self._orbit_radius_mm:.0f} mm"
+        )
+
+    def _on_orbit_radius_changed(self, radius_mm: float) -> None:
+        self._orbit_radius_mm = float(radius_mm)
+        self.vision_orbit_radius_updated.emit(self._orbit_radius_mm)
+        self.vision_orbit_cone_tilt_updated.emit(self._orbit_cone_tilt_deg)
+        self.vision_orbit_cone_omega_updated.emit(self._orbit_cone_omega_rad_s)
+        if self._orbit_active:
+            ring = circle(radius_mm=self._orbit_radius_mm)
+            self._vision_monitor.set_path_overlay(ring.points, ring.closed)
+
+    def _on_orbit_cone_tilt_changed(self, deg: float) -> None:
+        self._orbit_cone_tilt_deg = float(deg)
+        self.vision_orbit_cone_tilt_updated.emit(self._orbit_cone_tilt_deg)
+
+    def _on_orbit_cone_omega_changed(self, rad_s: float) -> None:
+        self._orbit_cone_omega_rad_s = float(rad_s)
+        self.vision_orbit_cone_omega_updated.emit(self._orbit_cone_omega_rad_s)
 
     # ------------------------------------------------------------------
     # Vision mode enable / disable
@@ -814,6 +944,18 @@ class MainWindow(QWidget):
         self.vision_path_speed_updated.connect(
             self._vision_worker.set_path_speed
         )
+        self.vision_orbit_set.connect(
+            self._vision_worker.set_orbit_enabled
+        )
+        self.vision_orbit_radius_updated.connect(
+            self._vision_worker.set_orbit_radius
+        )
+        self.vision_orbit_cone_tilt_updated.connect(
+            self._vision_worker.set_orbit_cone_tilt
+        )
+        self.vision_orbit_cone_omega_updated.connect(
+            self._vision_worker.set_orbit_cone_omega
+        )
         self.vision_snapshot_consumed.connect(
             self._vision_worker.mark_snapshot_consumed
         )
@@ -834,6 +976,7 @@ class MainWindow(QWidget):
             self.control_panel.current_pattern()
         )
         self.vision_path_speed_updated.emit(self._path_speed_mm_s)
+        self.vision_orbit_radius_updated.emit(self._orbit_radius_mm)
         self.vision_hsv_updated.emit(*self.control_panel.get_hsv())
 
     def _stop_vision_worker_async(self) -> None:
@@ -867,6 +1010,14 @@ class MainWindow(QWidget):
              self._vision_worker.set_path_following),
             (self.vision_path_speed_updated,
              self._vision_worker.set_path_speed),
+            (self.vision_orbit_set,
+             self._vision_worker.set_orbit_enabled),
+            (self.vision_orbit_radius_updated,
+             self._vision_worker.set_orbit_radius),
+            (self.vision_orbit_cone_tilt_updated,
+             self._vision_worker.set_orbit_cone_tilt),
+            (self.vision_orbit_cone_omega_updated,
+             self._vision_worker.set_orbit_cone_omega),
             (self.vision_snapshot_consumed,
              self._vision_worker.mark_snapshot_consumed),
         ]:
@@ -911,6 +1062,8 @@ class MainWindow(QWidget):
         self.control_panel.sync_calibrate_button(False)
         self._path_following_active = False
         self.control_panel.sync_path_button(False)
+        self._orbit_active = False
+        self.control_panel.sync_orbit_button(False)
         self.control_panel.set_path_status("path: idle")
         self._last_path_status = ""
         self._vision_monitor.set_path_overlay(None)
@@ -1017,6 +1170,7 @@ class MainWindow(QWidget):
             self._sync_auto_trim_from_terms(terms)
             self._sync_home_calibration_from_terms(terms)
             self._sync_path_from_terms(terms)
+            self._sync_orbit_from_terms(terms)
 
             # Timing plot — derived metrics measured HERE are injected at
             # the call site; the widget owns history/trim/redraw cadence.
@@ -1037,6 +1191,10 @@ class MainWindow(QWidget):
                 self.control_panel.append_preview(
                     f"[PID TUNE] {tune_evt.get('message', '')}"
                 )
+                # An Apply carries the persistence payload (gains +
+                # optional plant calibration) — save it to the overlay.
+                if tune_evt.get("type") == "applied":
+                    self._handle_autotune_applied_event(tune_evt)
 
             # Home-cal completion / Save-Trim fold events (transient)
             home_evt = terms.get("home_cal_event")
@@ -1092,10 +1250,16 @@ class MainWindow(QWidget):
             return
         kp = float(terms.get("kp", self._kp))
         kd = float(terms.get("kd", self._kd))
-        if abs(kp - self._kp) > 1e-6 or abs(kd - self._kd) > 1e-6:
+        ki = float(terms.get("ki", self._ki))
+        if (
+            abs(kp - self._kp) > 1e-6
+            or abs(kd - self._kd) > 1e-6
+            or abs(ki - self._ki) > 1e-6
+        ):
             self._kp = kp
             self._kd = kd
-            self.control_panel.sync_kp_kd(kp, kd)
+            self._ki = ki
+            self.control_panel.sync_kp_kd(kp, kd, ki)
 
     def _sync_target_from_terms(self, terms: dict) -> None:
         if self.control_panel.any_slider_down("target"):
@@ -1150,6 +1314,27 @@ class MainWindow(QWidget):
             self._last_path_status = status
             self.control_panel.set_path_status(status)
 
+    def _sync_orbit_from_terms(self, terms: dict) -> None:
+        if "orbit_active" not in terms:
+            return
+        active = bool(terms["orbit_active"])
+        if active != self._orbit_active:
+            self._orbit_active = active
+            self.control_panel.sync_orbit_button(active)
+        if not active:
+            return
+        # While orbiting, the shared status label shows the orbit line
+        # (path is idle — the modes are mutually exclusive).
+        status = (
+            f"orbit: {terms.get('orbit_state', 'idle')} · "
+            f"lap {int(terms.get('orbit_lap', 0))} · "
+            f"err {float(terms.get('orbit_err_mm', 0.0)):.1f}mm · "
+            f"ilc {float(terms.get('orbit_ilc_deg', 0.0)):.2f}deg"
+        )
+        if status != self._last_path_status:
+            self._last_path_status = status
+            self.control_panel.set_path_status(status)
+
     def _sync_autotune_from_terms(self, terms: dict) -> None:
         enabled = bool(
             terms.get("pd_autotune_enabled", self._pd_autotune_enabled)
@@ -1194,12 +1379,74 @@ class MainWindow(QWidget):
             # see config.PLATFORM_SIZE for the physical measurement.
             platform_size_mm=240.0,
         )
+        h_source = str(getattr(snapshot, "homography_source", ""))
+        quad_diag = getattr(snapshot, "quad_diag", None)
         self._vision_monitor.update_camera(
-            getattr(snapshot, "camera_bgr", None)
+            getattr(snapshot, "camera_bgr", None),
+            homography_source=h_source,
+            quad_corners_px=getattr(snapshot, "quad_corners_px", None),
+            quad_diag=quad_diag if isinstance(quad_diag, dict) else None,
         )
         self._vision_monitor.update_mask(
             getattr(snapshot, "mask_gray", None)
         )
+        self._log_h_source_transition(h_source)
+        if isinstance(quad_diag, dict):
+            self._log_quad_diag(quad_diag)
+
+    def _log_h_source_transition(self, h_source: str) -> None:
+        """One preview line per homography-source change ("[TRACK] H
+        source quad -> aruco"), rate-limited to 1/s so a source
+        flapping at snapshot rate cannot flood the log."""
+        if not h_source or h_source == self._last_h_source:
+            return
+        now = time.perf_counter()
+        if self._last_h_source and (now - self._last_h_source_log_ts) >= 1.0:
+            self.control_panel.append_preview(
+                f"[TRACK] H source {self._last_h_source} -> {h_source}"
+            )
+            self._last_h_source_log_ts = now
+        self._last_h_source = h_source
+
+    def _log_quad_diag(self, diag: dict) -> None:
+        """Every 5 s while the quad is not locked: one line saying why
+        ("[TRACK] quad acquiring 0/10: S1 low-contrast grad 2.3;
+        S3 clipped 8 in-frame") — the rig-tuning readout."""
+        now = time.perf_counter()
+        if (now - self._last_quad_diag_log_ts) < 5.0:
+            return
+        self._last_quad_diag_log_ts = now
+        if str(diag.get("state", "")) == "locked":
+            # Only worth a line when the audit is striking.
+            strikes = int(diag.get("audit_strikes", 0))
+            if strikes > 0:
+                self.control_panel.append_preview(
+                    f"[TRACK] quad audit disagree "
+                    f"{float(diag.get('audit_px', 0.0)):.1f}px "
+                    f"(raw {float(diag.get('audit_raw_px', 0.0)):.1f}px) "
+                    f"strike {strikes}"
+                )
+            return
+        sides = diag.get("sides") or []
+        fails = []
+        for k, d in enumerate(sides):
+            reason = str(d.get("reason", ""))
+            if reason == "ok":
+                continue
+            if reason == "low-contrast":
+                fails.append(f"S{k} low-contrast grad {float(d.get('grad', 0.0)):.1f}")
+            elif reason == "clipped":
+                fails.append(f"S{k} clipped {int(d.get('usable', 0))} in-frame")
+            else:
+                fails.append(f"S{k} {reason}")
+        state = str(diag.get("state", ""))
+        head = (
+            f"quad acquiring {int(diag.get('acq_good', 0))}"
+            f"/{int(diag.get('acq_frames', 0))}"
+            if state == "acquiring" else f"quad {state or 'idle'}"
+        )
+        detail = "; ".join(fails) if fails else "all sides fitting"
+        self.control_panel.append_preview(f"[TRACK] {head}: {detail}")
 
     # ------------------------------------------------------------------
     # Cleanup

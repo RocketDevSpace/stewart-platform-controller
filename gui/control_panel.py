@@ -15,12 +15,14 @@ from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
     QSlider,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -34,6 +36,14 @@ from settings import (
     GUI_LOG_MAX_LINES,
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
+    ORBIT_CONE_OMEGA_MAX_RAD_S,
+    ORBIT_CONE_OMEGA_RAD_S,
+    ORBIT_CONE_TILT_DEG,
+    ORBIT_CONE_TILT_MAX_DEG,
+    ORBIT_CONE_TILT_MIN_DEG,
+    ORBIT_RADIUS_MAX_MM,
+    ORBIT_RADIUS_MIN_MM,
+    ORBIT_RADIUS_MM,
     PATH_SPEED_MAX_MM_S,
     PATH_SPEED_MIN_MM_S,
     PATH_SPEED_MM_S,
@@ -101,6 +111,10 @@ class ControlPanel(QWidget):
     path_pattern_selected = pyqtSignal(str)          # "" = placeholder
     path_toggled = pyqtSignal(bool)
     path_speed_changed = pyqtSignal(float)           # mm/s
+    orbit_toggled = pyqtSignal(bool)
+    orbit_radius_changed = pyqtSignal(float)         # mm
+    orbit_cone_tilt_changed = pyqtSignal(float)      # deg
+    orbit_cone_omega_changed = pyqtSignal(float)     # rad/s; 0 = auto
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -113,6 +127,7 @@ class ControlPanel(QWidget):
         self._autotune_enabled = False
         self._autotune_auto_apply = False
         self._path_following = False
+        self._orbit_active = False
 
         main_layout = QHBoxLayout()
         main_layout.addLayout(self._build_slider_column())
@@ -259,7 +274,8 @@ class ControlPanel(QWidget):
         tune.setSpacing(2)
         tune.setContentsMargins(6, 10, 6, 6)
 
-        # Kp max 300 supports PD_AUTOTUNE_MAX_KP = 0.250
+        # Kp max 300 (0.300) leaves headroom over the gain-design
+        # search's kp upper bound (0.150 — control/gain_design.py)
         self._kp_label, self._kp_slider = self._make_scaled_slider(
             tune, "Kp: {:.3f}", 0, 300,
             float(PD_DEFAULT_KP), 1000.0, self._on_kp_changed,
@@ -422,6 +438,49 @@ class ControlPanel(QWidget):
             float(PATH_SPEED_MM_S), 1.0, self._on_path_speed_changed,
         )
 
+        # Harmonic orbit: the feedforward-driven smooth-circle mode.
+        # Mutually exclusive with Follow Path (both here and in the
+        # controller); speed comes from the shared Path Speed slider.
+        orbit_row = QHBoxLayout()
+        self._orbit_btn = self._make_toggle_button(
+            "Harmonic Orbit", self._on_orbit_toggled
+        )
+        orbit_row.addWidget(self._orbit_btn)
+        self._orbit_radius_spin = QSpinBox()
+        self._orbit_radius_spin.setRange(
+            int(ORBIT_RADIUS_MIN_MM), int(ORBIT_RADIUS_MAX_MM)
+        )
+        self._orbit_radius_spin.setSingleStep(5)
+        self._orbit_radius_spin.setValue(int(ORBIT_RADIUS_MM))
+        self._orbit_radius_spin.setSuffix(" mm")
+        self._orbit_radius_spin.valueChanged.connect(self._on_orbit_radius_changed)
+        orbit_row.addWidget(self._orbit_radius_spin)
+        self._orbit_tilt_spin = QDoubleSpinBox()
+        self._orbit_tilt_spin.setRange(
+            float(ORBIT_CONE_TILT_MIN_DEG), float(ORBIT_CONE_TILT_MAX_DEG)
+        )
+        self._orbit_tilt_spin.setSingleStep(0.25)
+        self._orbit_tilt_spin.setValue(float(ORBIT_CONE_TILT_DEG))
+        self._orbit_tilt_spin.setSuffix(" °")
+        self._orbit_tilt_spin.setToolTip(
+            "Cone tilt amplitude — the platform's rotating tilt in cone mode"
+        )
+        self._orbit_tilt_spin.valueChanged.connect(self._on_orbit_tilt_changed)
+        orbit_row.addWidget(self._orbit_tilt_spin)
+        self._orbit_omega_spin = QDoubleSpinBox()
+        self._orbit_omega_spin.setRange(0.0, float(ORBIT_CONE_OMEGA_MAX_RAD_S))
+        self._orbit_omega_spin.setSingleStep(0.1)
+        self._orbit_omega_spin.setValue(float(ORBIT_CONE_OMEGA_RAD_S))
+        self._orbit_omega_spin.setSuffix(" rad/s")
+        self._orbit_omega_spin.setSpecialValueText("ω auto")
+        self._orbit_omega_spin.setToolTip(
+            "Cone angular frequency — 0 = auto (derived from tilt + radius "
+            "via the warp-spring physics)"
+        )
+        self._orbit_omega_spin.valueChanged.connect(self._on_orbit_omega_changed)
+        orbit_row.addWidget(self._orbit_omega_spin)
+        pg.addLayout(orbit_row)
+
         self._path_status_label = QLabel("path: idle")
         pg.addWidget(self._path_status_label)
 
@@ -563,10 +622,38 @@ class ControlPanel(QWidget):
 
     def _on_path_toggled(self) -> None:
         self._path_following = not self._path_following
+        if self._path_following and self._orbit_active:
+            # Panel-level exclusion mirror (the controller enforces it
+            # authoritatively): starting one mode drops the other.
+            self.sync_orbit_button(False)
         self._set_toggle_text(
             self._path_follow_btn, "Follow Path", self._path_following
         )
         self.path_toggled.emit(self._path_following)
+
+    def _on_orbit_toggled(self) -> None:
+        self._orbit_active = not self._orbit_active
+        if self._orbit_active and self._path_following:
+            self.sync_path_button(False)
+        self._set_toggle_text(
+            self._orbit_btn, "Harmonic Orbit", self._orbit_active
+        )
+        self.orbit_toggled.emit(self._orbit_active)
+
+    def _on_orbit_radius_changed(self) -> None:
+        self.orbit_radius_changed.emit(float(self._orbit_radius_spin.value()))
+
+    def _on_orbit_tilt_changed(self) -> None:
+        self.orbit_cone_tilt_changed.emit(float(self._orbit_tilt_spin.value()))
+
+    def _on_orbit_omega_changed(self) -> None:
+        self.orbit_cone_omega_changed.emit(float(self._orbit_omega_spin.value()))
+
+    def orbit_cone_tilt_deg(self) -> float:
+        return float(self._orbit_tilt_spin.value())
+
+    def orbit_cone_omega_rad_s(self) -> float:
+        return float(self._orbit_omega_spin.value())
 
     def _on_path_speed_changed(self) -> None:
         mm_s = float(self._path_speed_slider.value())
@@ -643,7 +730,7 @@ class ControlPanel(QWidget):
         groups: dict[str, tuple[QSlider, ...]] = {
             "target": (self._target_x_slider, self._target_y_slider),
             "trim": (self._trim_roll_slider, self._trim_pitch_slider),
-            "gains": (self._kp_slider, self._kd_slider),
+            "gains": (self._kp_slider, self._ki_slider, self._kd_slider),
         }
         return any(sld.isSliderDown() for sld in groups[group])
 
@@ -696,7 +783,7 @@ class ControlPanel(QWidget):
     # without triggering re-emission (blockSignals pattern).
     # ------------------------------------------------------------------
 
-    def sync_kp_kd(self, kp: float, kd: float) -> None:
+    def sync_kp_kd(self, kp: float, kd: float, ki: float | None = None) -> None:
         self._kp_slider.blockSignals(True)
         self._kp_slider.setValue(round(kp * 1000))
         self._kp_label.setText(f"Kp: {kp:.3f}")
@@ -706,6 +793,14 @@ class ControlPanel(QWidget):
         self._kd_slider.setValue(round(kd * 1000))
         self._kd_label.setText(f"Kd: {kd:.3f}")
         self._kd_slider.blockSignals(False)
+
+        # ki is optional so pre-SysID callers (kp/kd-only syncs) keep
+        # working; None means "leave the Ki slider alone".
+        if ki is not None:
+            self._ki_slider.blockSignals(True)
+            self._ki_slider.setValue(round(ki * 1000))
+            self._ki_label.setText(f"Ki: {ki:.3f}")
+            self._ki_slider.blockSignals(False)
 
     def sync_target(self, x_mm: float, y_mm: float) -> None:
         self._target_x_slider.blockSignals(True)
@@ -752,6 +847,15 @@ class ControlPanel(QWidget):
         self._path_follow_btn.blockSignals(True)
         self._set_toggle_text(self._path_follow_btn, "Follow Path", active)
         self._path_follow_btn.blockSignals(False)
+
+    def sync_orbit_button(self, active: bool) -> None:
+        self._orbit_active = active
+        self._orbit_btn.blockSignals(True)
+        self._set_toggle_text(self._orbit_btn, "Harmonic Orbit", active)
+        self._orbit_btn.blockSignals(False)
+
+    def orbit_radius_mm(self) -> float:
+        return float(self._orbit_radius_spin.value())
 
     def set_path_status(self, text: str) -> None:
         self._path_status_label.setText(text)

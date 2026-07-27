@@ -41,6 +41,23 @@ _PD_COLOR = (220, 80, 220)       # magenta — PD restoration command
 _TARGET_COLOR = (80, 80, 255)    # red-ish
 _TEXT_COLOR = (210, 255, 210)    # pale green
 _PATH_COLOR = (200, 200, 0)      # teal — path polyline + carrot
+_QUAD_COLOR = (80, 255, 120)     # green — fitted boundary quad
+# Homography-source badge colors (boundary-quad rework): green when the
+# quad is the source, yellow on ArUco fallback, orange on stale-H hold,
+# red when there is no H at all.
+_H_SOURCE_COLORS = {
+    "quad": (80, 220, 80),
+    "aruco": (0, 220, 220),
+    "stale": (0, 165, 255),
+}
+_H_SOURCE_MISS_COLOR = (60, 60, 255)
+# Acquisition-diagnostic overlay: predicted search quad drawn per side —
+# green when that side's boundary fit passed, red when it failed; the
+# raw fitted silhouette (when all four passed) in cyan.
+_QUAD_SIDE_OK_COLOR = (80, 220, 80)
+_QUAD_SIDE_BAD_COLOR = (60, 60, 255)
+_QUAD_FIT_COLOR = (255, 220, 80)     # cyan-ish
+_QUAD_DIAG_TEXT_COLOR = (0, 220, 220)
 
 # PD vec scale: px per degree of computed tilt command
 _PD_VEC_SCALE_PX_PER_DEG = 18.0
@@ -155,15 +172,28 @@ def _draw_warped_overlays(
     cv2.line(frame, (tx - 14, ty), (tx + 14, ty), _TARGET_COLOR, 1, cv2.LINE_AA)
     cv2.line(frame, (tx, ty - 14), (tx, ty + 14), _TARGET_COLOR, 1, cv2.LINE_AA)
 
-    # Path following: moving carrot at the follower's current target +
-    # progress text bottom-right.
-    if control_terms is not None and bool(control_terms.get("path_active")):
+    # Path following OR harmonic orbit: moving target dot + status text
+    # bottom-right (the modes are mutually exclusive).
+    path_active = control_terms is not None and bool(
+        control_terms.get("path_active")
+    )
+    orbit_active = control_terms is not None and bool(
+        control_terms.get("orbit_active")
+    )
+    if control_terms is not None and (path_active or orbit_active):
         cv2.circle(frame, (tx, ty), 5, _PATH_COLOR, -1, cv2.LINE_AA)
-        path_txt = (
-            f"PATH {control_terms.get('path_state', '')} "
-            f"lap {int(control_terms.get('path_lap', 0))} "
-            f"{float(control_terms.get('path_progress', 0.0)):.0%}"
-        )
+        if orbit_active:
+            path_txt = (
+                f"ORBIT {control_terms.get('orbit_state', '')} "
+                f"lap {int(control_terms.get('orbit_lap', 0))} "
+                f"err {float(control_terms.get('orbit_err_mm', 0.0)):.1f}mm"
+            )
+        else:
+            path_txt = (
+                f"PATH {control_terms.get('path_state', '')} "
+                f"lap {int(control_terms.get('path_lap', 0))} "
+                f"{float(control_terms.get('path_progress', 0.0)):.0%}"
+            )
         size, _base = cv2.getTextSize(
             path_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1
         )
@@ -247,9 +277,101 @@ def _draw_warped_overlays(
     return frame
 
 
-def _draw_camera_overlays(bgr: np.ndarray) -> np.ndarray:
+def _put_small(
+    frame: np.ndarray, text: str, org: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    cv2.putText(frame, text, org,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(frame, text, org,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+
+def _draw_quad_diag(frame: np.ndarray, quad_diag: dict) -> None:
+    """Acquisition diagnostics: the ArUco-predicted search quad with
+    per-side pass/fail colors, the raw fitted silhouette when all four
+    sides passed, an acq progress line, and one line per failing side
+    ("S1 low-contrast g=2.3/6.0 in=32") so a rig session can SEE why
+    the quad is not locking."""
+    pred = quad_diag.get("pred_corners")
+    sides = quad_diag.get("sides") or []
+    if pred is not None and len(sides) == 4:
+        pts = np.round(np.asarray(pred, dtype=np.float64)).astype(np.int32)
+        for k in range(4):
+            ok = sides[k].get("reason") == "ok"
+            col = _QUAD_SIDE_OK_COLOR if ok else _QUAD_SIDE_BAD_COLOR
+            p1 = (int(pts[k][0]), int(pts[k][1]))
+            p2 = (int(pts[(k + 1) % 4][0]), int(pts[(k + 1) % 4][1]))
+            cv2.line(frame, p1, p2, col, 1, cv2.LINE_AA)
+    fitc = quad_diag.get("fit_corners")
+    if fitc is not None:
+        poly = np.round(np.asarray(fitc, dtype=np.float64)).astype(
+            np.int32
+        ).reshape(-1, 1, 2)
+        cv2.polylines(frame, [poly], isClosed=True,
+                      color=_QUAD_FIT_COLOR, thickness=1, lineType=cv2.LINE_AA)
+
+    state = str(quad_diag.get("state", ""))
+    if state == "acquiring":
+        head = (
+            f"QUAD acq {int(quad_diag.get('acq_good', 0))}"
+            f"/{int(quad_diag.get('acq_frames', 0))}"
+        )
+    else:
+        head = f"QUAD {state or 'idle'}"
+    _put_small(frame, head, (8, 72), _QUAD_DIAG_TEXT_COLOR)
+    y = 90
+    for k, d in enumerate(sides):
+        reason = str(d.get("reason", ""))
+        if reason == "ok":
+            continue
+        txt = (
+            f"S{k} {reason} g={float(d.get('grad', 0.0)):.1f} "
+            f"in={int(d.get('usable', 0))}"
+        )
+        _put_small(frame, txt, (8, y), _QUAD_SIDE_BAD_COLOR)
+        y += 16
+
+
+def _draw_camera_overlays(
+    bgr: np.ndarray,
+    homography_source: str = "",
+    quad_corners_px: np.ndarray | None = None,
+    quad_diag: dict | None = None,
+) -> np.ndarray:
     frame = bgr.copy()
     _put_label(frame, "CAMERA")
+
+    # Fitted boundary quad (green) — corners arrive in the same flipped-
+    # camera coords as this frame, so they draw directly.
+    if quad_corners_px is not None:
+        pts = np.round(np.asarray(quad_corners_px, dtype=np.float64))
+        poly = pts.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [poly], isClosed=True,
+                      color=_QUAD_COLOR, thickness=1, lineType=cv2.LINE_AA)
+        for x, y in pts.astype(np.int32):
+            cv2.circle(frame, (int(x), int(y)), 3, _QUAD_COLOR, -1, cv2.LINE_AA)
+        # Locked-state audit readout: change-from-baseline px + strikes.
+        if quad_diag is not None and quad_diag.get("audit_px") is not None:
+            strikes = int(quad_diag.get("audit_strikes", 0))
+            col = (
+                _QUAD_SIDE_OK_COLOR if strikes == 0 else _QUAD_SIDE_BAD_COLOR
+            )
+            txt = f"audit {float(quad_diag['audit_px']):.1f}px"
+            if strikes:
+                txt += f" strike {strikes}"
+            _put_small(frame, txt, (8, 72), col)
+    elif quad_diag is not None:
+        _draw_quad_diag(frame, quad_diag)
+
+    # Source badge under the CAMERA label: which ladder rung produced H.
+    if homography_source:
+        shown = "--" if homography_source == "none" else homography_source.upper()
+        color = _H_SOURCE_COLORS.get(homography_source, _H_SOURCE_MISS_COLOR)
+        cv2.putText(frame, f"H: {shown}", (8, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, f"H: {shown}", (8, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
     return frame
 
 
@@ -331,11 +453,19 @@ class VisionMonitorWindow(QWidget):
         h = self._warped_label.height()
         self._warped_label.setPixmap(_bgr_to_pixmap(frame, w, h))
 
-    def update_camera(self, bgr: np.ndarray | None) -> None:
+    def update_camera(
+        self,
+        bgr: np.ndarray | None,
+        homography_source: str = "",
+        quad_corners_px: np.ndarray | None = None,
+        quad_diag: dict | None = None,
+    ) -> None:
         if bgr is None:
             self._camera_label.setText("Camera: Disabled")
             return
-        frame = _draw_camera_overlays(bgr)
+        frame = _draw_camera_overlays(
+            bgr, homography_source, quad_corners_px, quad_diag
+        )
         w = self._camera_label.width()
         h = self._camera_label.height()
         self._camera_label.setPixmap(_bgr_to_pixmap(frame, w, h))

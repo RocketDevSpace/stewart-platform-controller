@@ -225,6 +225,42 @@ class TestFeedforward:
         assert res.ff_vec == (0.5, 0.3)
 
 
+class TestGainScale:
+    """gain_scale (harmonic orbit, 2026-07-27): scales P and D only —
+    the integral path is untouched, and the default is bit-identical
+    to the pre-parameter behavior."""
+
+    def test_scale_halves_p_and_d_exactly(self) -> None:
+        clock = FakeClock()
+        pd = _make(clock)
+        res = pd.compute(10.0, -4.0, 30.0, 0.0, 0.0, 0.0, gain_scale=0.5)
+        assert res.p_term == pytest.approx((0.045 * 0.5 * 10.0,
+                                            0.045 * 0.5 * -4.0))
+        assert res.d_term[0] == pytest.approx(0.022 * 0.5 * -30.0)
+
+    def test_default_bit_identical(self) -> None:
+        clock_a, clock_b = FakeClock(), FakeClock()
+        a, b = _make(clock_a), _make(clock_b)
+        for _ in range(30):
+            clock_a.advance(1 / 30)
+            clock_b.advance(1 / 30)
+            ra = a.compute(8.0, 3.0, 5.0, -2.0, 0.1, -0.2)
+            rb = b.compute(8.0, 3.0, 5.0, -2.0, 0.1, -0.2, gain_scale=1.0)
+            assert ra == rb
+
+    def test_integral_rate_unaffected_by_scale(self) -> None:
+        # Same error, same time: the integral steps identically whether
+        # the p/d feedback is scaled or not (ki uses raw error).
+        clock_a, clock_b = FakeClock(), FakeClock()
+        a, b = _make(clock_a), _make(clock_b)
+        for _ in range(30):
+            clock_a.advance(1 / 30)
+            clock_b.advance(1 / 30)
+            ra = a.compute(10.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            rb = b.compute(10.0, 0.0, 0.0, 0.0, 0.0, 0.0, gain_scale=0.5)
+        assert ra.i_term == pytest.approx(rb.i_term)
+
+
 class TestFoldAndResets:
     def test_take_integrator_maps_and_zeros(self) -> None:
         clock = FakeClock()

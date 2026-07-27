@@ -8,7 +8,7 @@ BallController — facade over the decomposed ball-balancing controller
   PIDCore          (control/pid_core.py)     PID math, d-cap, integral,
                                            tilt clamp, slew
   TrimStore       (control/trim_store.py)  persistent trim offsets
-  PDAutotuner     (control/autotune.py)    step-test gain tuning sessions
+  PDAutotuner     (control/autotune.py)    SysID tuning: probe→fit→design
 
 Integral action lives INSIDE PIDCore (2026-07-23 I-term rework — the old
 gated AutoTrim integrator is gone). The `auto_trim_enabled` name is kept
@@ -22,6 +22,7 @@ from collections import deque
 from collections.abc import Callable
 
 from control.autotune import PDAutotuner
+from control.orbit import HarmonicOrbit
 from control.path_follower import PathFollower
 from control.patterns import Path
 from control.pid_core import PIDCore
@@ -131,13 +132,23 @@ class BallController:
             ),
         )
 
-        # PD autotune state machine (FG-10)
+        # Autotune pipeline (SysID rework: probe -> fit -> design)
         self._autotuner = PDAutotuner(self._arbiter, clock)
-        self._autotuner.clear_suggestion(kp, kd)
+        self._autotuner.clear_suggestion(kp, kd, ki)
+        # Prediction horizon: instance-level so an autotune Apply can
+        # calibrate it from the identified plant (pipeline latency +
+        # measured filter lag). Defaulted from settings.
+        self._predict_s = float(CONTROL_PREDICT_S)
+        self._pending_autotune_event: dict | None = None
 
         # Path following (feat/path): drives the arbiter override channel
         # (mutually exclusive with autotune, which owns the same channel).
         self._path_follower = PathFollower(clock)
+
+        # Harmonic orbit (2026-07-27): the feedforward-driven smooth-
+        # circle mode. Drives the same override channel — pairwise
+        # mutually exclusive with path/autotune/home-cal.
+        self._orbit = HarmonicOrbit(clock)
 
         # Home-cal convergence watching + fold events (I-term rework).
         # The controller runs the detector because only it sees both the
@@ -182,6 +193,16 @@ class BallController:
     @property
     def path_following_active(self) -> bool:
         return self._path_follower.active
+
+    @property
+    def orbit_active(self) -> bool:
+        return self._orbit.active
+
+    @property
+    def orbit_cone_active(self) -> bool:
+        """True when the open-loop cone is running (the only mode that
+        may run blind, i.e. without the ball)."""
+        return self._orbit.active and self._orbit.cone_only
 
     # ---------------------------
     # Gains / limits
@@ -230,7 +251,7 @@ class BallController:
     def set_gains(self, kp: float, kd: float) -> None:
         self._pd.kp = float(kp)
         self._pd.kd = float(kd)
-        self._autotuner.clear_suggestion(kp, kd)
+        self._autotuner.clear_suggestion(kp, kd, self.ki)
 
     def set_max_tilt(self, max_tilt_deg: float) -> None:
         self._pd.max_tilt_deg = float(max_tilt_deg)
@@ -269,6 +290,7 @@ class BallController:
     def start_home_calibration(self) -> None:
         # Exclusion: calibration needs a stationary center target.
         self.stop_path()
+        self.stop_orbit()
         self.auto_trim_enabled = True
         # Deliberate unification (M10): home-cal routes its center target
         # through the manual setpoint. The GUI already emits set_target(0,0)
@@ -385,14 +407,15 @@ class BallController:
         """Begin following the loaded path.
 
         Mutual exclusion: the follower drives the arbiter's override
-        channel — the same channel autotune owns — so autotune and
-        home calibration are force-disabled first. No override is written
-        here; the first compute_with_terms with a valid ball seeds the
-        target at the nearest path point (the platform does not move on
-        start until the ball is seen).
+        channel — the same channel autotune owns — so autotune, home
+        calibration, and the harmonic orbit are force-disabled first.
+        No override is written here; the first compute_with_terms with
+        a valid ball seeds the target at the nearest path point (the
+        platform does not move on start until the ball is seen).
         """
         self._trim.cancel_home_calibration()
         self.set_pd_autotune(False)
+        self.stop_orbit()
         self._rest_gate.reset()
         return self._path_follower.start()
 
@@ -411,6 +434,64 @@ class BallController:
         self._rest_gate.reset()
 
     # ---------------------------
+    # Harmonic orbit coordination (2026-07-27)
+    # ---------------------------
+
+    def set_orbit_radius(self, radius_mm: float) -> None:
+        self._orbit.set_radius(float(radius_mm))
+
+    def set_orbit_speed(self, mm_s: float) -> None:
+        self._orbit.set_speed(float(mm_s))
+
+    def set_orbit_cone_tilt(self, deg: float) -> None:
+        self._orbit.set_cone_tilt(float(deg))
+
+    def set_orbit_cone_omega(self, rad_s: float) -> None:
+        self._orbit.set_cone_omega(float(rad_s))
+
+    def compute_orbit_blind(self) -> tuple[float, float] | None:
+        """Cone-mode command with NO ball: lets the rig run and watch
+        the cone with the ball off the platform, and keeps the motion
+        continuous between camera frames. Only the open-loop cone may
+        run blind (every closed-loop mode needs the ball); returns
+        (roll_cmd, pitch_cmd) through the normal PID pipeline (trim +
+        tilt clamp + slew continuity), or None when not applicable."""
+        if not (self.enabled and self._orbit.active and self._orbit.cone_only):
+            return None
+        cmd = self._orbit.update_blind(float(PD_AUTOTUNE_G_EFF))
+        res = self._pd.compute(
+            0.0, 0.0, 0.0, 0.0, self.roll_offset, self.pitch_offset,
+            freeze_integrator=True,
+            ff=cmd.ff_deg,
+            gain_scale=0.0,
+        )
+        return res.roll_cmd, res.pitch_cmd
+
+    def start_orbit(self) -> bool:
+        """Begin the harmonic orbit. Same exclusion discipline as
+        start_path: the orbit drives the arbiter override channel, so
+        home-cal, autotune, and path following are force-disabled
+        first. The seed happens on the first compute with a ball."""
+        self._trim.cancel_home_calibration()
+        self.set_pd_autotune(False)
+        self.stop_path()
+        self._rest_gate.reset()
+        return self._orbit.start()
+
+    def stop_orbit(self) -> None:
+        """Stop orbiting with the motion-free target transfer (the
+        stop_path pattern): the manual target absorbs the current
+        active target before the override clears."""
+        if not self._orbit.active:
+            return
+        self._orbit.stop()
+        if self._arbiter.override_active:
+            fx, fy = self._arbiter.active
+            self._arbiter.set_manual(fx, fy)
+            self._arbiter.clear_override()
+        self._rest_gate.reset()
+
+    # ---------------------------
     # Autotune coordination
     # ---------------------------
 
@@ -419,7 +500,10 @@ class BallController:
             self._trim.cancel_home_calibration()
             # Exclusion: autotune owns the override channel next.
             self.stop_path()
-        changed = self._autotuner.set_enabled(enabled, auto_apply, self.kp, self.kd)
+            self.stop_orbit()
+        changed = self._autotuner.set_enabled(
+            enabled, auto_apply, self.kp, self.kd, self.ki
+        )
         if changed:
             # Mode change: rest evidence gathered in the old mode is stale.
             self._rest_gate.reset()
@@ -430,10 +514,42 @@ class BallController:
             # its value (like a constant trim) and thaws on disable.
 
     def apply_pd_autotune_recommendation(self) -> tuple[bool, float, float]:
-        applied, kp, kd = self._autotuner.take_recommendation(self.kp, self.kd)
+        """Apply the pending suggestion: gains + plant calibration.
+
+        With a confident plant fit, Apply also calibrates the
+        prediction horizon (pipeline latency + measured filter lag) and
+        the integral deadband (half the P-only stick offset at the new
+        kp). The next compute flags a transient pd_autotune_event
+        {"type": "applied", ...} whose payload the GUI persists to the
+        settings overlay (the home_cal_event pattern).
+        """
+        applied, kp, kd, ki = self._autotuner.take_recommendation(
+            self.kp, self.kd, self.ki
+        )
         if applied:
             self._pd.kp = float(kp)
             self._pd.kd = float(kd)
+            self._pd.ki = float(ki)
+            event: dict = {
+                "type": "applied",
+                "message": (
+                    f"applied kp={kp:.4f} kd={kd:.4f} ki={ki:.4f}"
+                ),
+                "kp": float(kp),
+                "kd": float(kd),
+                "ki": float(ki),
+            }
+            fit = self._autotuner.plant_fit
+            if fit is not None and not fit.low_confidence:
+                self._predict_s = max(0.0, min(0.15, fit.predict_s))
+                deadband = max(
+                    1.0, min(6.0, 0.5 * fit.params.stiction_deg / max(kp, 1e-6))
+                )
+                self._pd.i_err_deadband_mm = deadband
+                event["predict_s"] = self._predict_s
+                event["deadband_mm"] = deadband
+                event["g_eff"] = fit.params.g_eff
+            self._pending_autotune_event = event
         return applied, float(self.kp), float(self.kd)
 
     # ---------------------------
@@ -466,20 +582,22 @@ class BallController:
         vx = ball_state.vx_mm_s
         vy = ball_state.vy_mm_s
 
-        # PD autotune step (FG-10) — may move the arbiter override target
-        # and (in auto-apply mode) update the gains.
-        self.kp, self.kd, tune_info = self._autotuner.update(
-            x, y, vx, vy, self.kp, self.kd
+        # Autotune pipeline step (SysID rework) — during a probe this
+        # advances the script + recording; in auto-apply mode a finished
+        # design updates all three gains.
+        self.kp, self.kd, self.ki, tune_info = self._autotuner.update(
+            x, y, vx, vy, self.kp, self.kd, self.ki,
+            raw_x=ball_state.raw_x_mm, raw_y=ball_state.raw_y_mm,
         )
 
         # Latency compensation: the command computed now takes effect
         # ~2-3 frames from now (camera exposure + processing + serial +
         # servo). Control errors are computed against the ball
-        # extrapolated forward by CONTROL_PREDICT_S — ~20 deg of phase
-        # recovered at the 0.78 Hz problem mode. The alpha-beta velocity
-        # is clean enough that the extrapolation adds negligible noise.
-        px = x + vx * CONTROL_PREDICT_S
-        py = y + vy * CONTROL_PREDICT_S
+        # extrapolated forward by the prediction horizon — ~20 deg of
+        # phase recovered at the 0.78 Hz problem mode. Instance-level:
+        # an autotune Apply calibrates it from the identified plant.
+        px = x + vx * self._predict_s
+        py = y + vy * self._predict_s
 
         # Path follower (feat/path): advances the override target along the
         # loaded path at the adaptive rate, seeded at the nearest path
@@ -495,6 +613,25 @@ class BallController:
             ):
                 self._arbiter.set_override(ptx, pty)
 
+        # Harmonic orbit (2026-07-27): clock-driven reference through
+        # the same override channel. The ILC error uses the FILTERED
+        # ball (x, y) — the table's phase bookkeeping owns delay
+        # attribution; feedback error still uses the predicted (px, py).
+        orbit_cmd = None
+        if self._orbit.active:
+            orbit_cmd = self._orbit.update(
+                x, y,
+                lead_s=self._predict_s,
+                g_eff=float(PD_AUTOTUNE_G_EFF),
+                kp_eff=self.kp * self._orbit.feedback_scale,
+            )
+            tgt = (orbit_cmd.target_x_mm, orbit_cmd.target_y_mm)
+            if not (
+                self._arbiter.override_active
+                and self._arbiter.active == tgt
+            ):
+                self._arbiter.set_override(*tgt)
+
         target_x, target_y = self._arbiter.active
         pos_vec_x = target_x - px
         pos_vec_y = target_y - py
@@ -507,7 +644,12 @@ class BallController:
         # the drive: path motion is commanded, error only corrects.
         v_des = (0.0, 0.0)
         ff = (0.0, 0.0)
-        if PATH_FF_ENABLED and self._path_follower.active:
+        if orbit_cmd is not None:
+            # Orbit mode: the analytic + learned tilt (already clamped
+            # inside the orbit) and the reference velocity.
+            v_des = orbit_cmd.v_des_mm_s
+            ff = orbit_cmd.ff_deg
+        elif PATH_FF_ENABLED and self._path_follower.active:
             vdx, vdy, adx, ady = self._path_follower.feedforward(
                 PATH_FF_LOOKAHEAD_S
             )
@@ -531,6 +673,11 @@ class BallController:
         integral_frozen = (
             not (self.auto_trim_enabled and self.enabled)
             or self._autotuner.enabled
+            # Orbit TRACK: the DC handoff is done — a running integral
+            # at orbit frequency out-gains the scaled P-term with 90 deg
+            # lag and chases the rotating error, fighting the learning
+            # table (sim-caught). It runs during entrain/recover.
+            or self._orbit.wants_integral_frozen
         )
 
         # Near-target rest gate (perf pass). Evaluated from the same error
@@ -567,6 +714,7 @@ class BallController:
         if (
             self.home_calibration_active
             or path_following
+            or self._orbit.active
             or integral_blocks_entry
         ):
             # Home calibration needs ACTIVE PID driving the ball to center
@@ -616,7 +764,17 @@ class BallController:
             ),
             v_des=v_des,
             ff=ff,
+            # Orbit modes scale the feedback: the trim scale in the
+            # closed-loop mode, ZERO in cone mode (pure open-loop cone
+            # — the plate never chases the ball).
+            gain_scale=(
+                self._orbit.feedback_scale if self._orbit.active else 1.0
+            ),
         )
+
+        # Probe recording: pair this frame's SENT command with the row
+        # update() began (exact frame pairing for the plant fit).
+        self._autotuner.record_command(res.roll_cmd, res.pitch_cmd)
 
         # Home-cal convergence watcher (after the compute so this
         # frame's integral is in the history) — may fold + complete or
@@ -655,13 +813,20 @@ class BallController:
             "rest_hold_elapsed_s": self._rest_gate.hold_elapsed_s,
             "kp": self.kp,
             "kd": self.kd,
+            "ki": self.ki,
             **self._autotuner.telemetry(),
             **self._path_follower.telemetry(),
+            **self._orbit.telemetry(),
             "target_x_mm": self.target_x_mm,
             "target_y_mm": self.target_y_mm,
         }
         if tune_info:
             terms["pd_autotune_event"] = tune_info
+        # Transient applied-event from an Apply outside the compute
+        # (worker slot): carries the persistence payload for the GUI.
+        if self._pending_autotune_event is not None:
+            terms["pd_autotune_event"] = self._pending_autotune_event
+            self._pending_autotune_event = None
         # Transient (present only on fold/complete/timeout — the GUI
         # persists the folded trim on it, mirroring pd_autotune_event).
         if self._pending_trim_event is not None:

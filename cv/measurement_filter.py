@@ -43,6 +43,8 @@ from settings import (
     TRACKER_AB_INNOV_OPEN_MM,
     TRACKER_AB_SPEED_FULL_MM_S,
     TRACKER_AB_SPEED_OPEN_MM_S,
+    TRACKER_AB_VETO_MAX_FRAMES,
+    TRACKER_AB_VETO_MM,
     TRACKER_FILTER_MODE,
     TRACKER_MAX_SPEED_MM_S,
     TRACKER_POS_FILTER_ALPHA_FAST,
@@ -85,6 +87,8 @@ class AlphaBetaFilter2D:
         innov_full_mm: float = TRACKER_AB_INNOV_FULL_MM,
         speed_open_mm_s: float = TRACKER_AB_SPEED_OPEN_MM_S,
         speed_full_mm_s: float = TRACKER_AB_SPEED_FULL_MM_S,
+        veto_mm: float = TRACKER_AB_VETO_MM,
+        veto_max_frames: int = TRACKER_AB_VETO_MAX_FRAMES,
     ) -> None:
         self.alpha_min = float(alpha_min)
         self.alpha_max = float(alpha_max)
@@ -94,12 +98,15 @@ class AlphaBetaFilter2D:
         self.innov_full_mm = float(innov_full_mm)
         self.speed_open_mm_s = float(speed_open_mm_s)
         self.speed_full_mm_s = float(speed_full_mm_s)
+        self.veto_mm = float(veto_mm)
+        self.veto_max_frames = int(veto_max_frames)
 
         self._x: float = 0.0
         self._y: float = 0.0
         self._vx: float = 0.0
         self._vy: float = 0.0
         self._prev_t: float | None = None
+        self._veto_streak: int = 0
 
     @property
     def vx(self) -> float:
@@ -132,6 +139,25 @@ class AlphaBetaFilter2D:
         ry = float(z_y) - y_pred
         r_mag = math.hypot(rx, ry)
 
+        # Single-frame glitch veto: an innovation beyond veto_mm on top
+        # of the predicted motion (ArUco occlusion glitches measure
+        # 4-15 mm; real inter-frame motion at path speeds is ~1.5 mm)
+        # coasts on the prediction instead of folding the glitch in.
+        # At most veto_max_frames consecutive coasts — a sustained
+        # offset is real motion and gets accepted (a genuine flick is
+        # delayed by at most one frame).
+        if (
+            self.veto_mm > 0.0
+            and r_mag > self.veto_mm
+            and self._veto_streak < self.veto_max_frames
+        ):
+            self._veto_streak += 1
+            self._x = x_pred
+            self._y = y_pred
+            self._prev_t = float(t)
+            return self._x, self._y, self._vx, self._vy
+        self._veto_streak = 0
+
         g_inn = _unit_ramp(r_mag, self.innov_open_mm, self.innov_full_mm)
         g_spd = _unit_ramp(
             math.hypot(vx_pred, vy_pred),
@@ -157,6 +183,59 @@ class AlphaBetaFilter2D:
         self._vx = 0.0
         self._vy = 0.0
         self._prev_t = None
+        self._veto_streak = 0
+
+
+class PointDeadbandLP:
+    """Deadband + scheduled-alpha low-pass on one 2D point.
+
+    The homography stability filter, shared by the ArUco marker centers
+    and the boundary-quad corners (cv/quad_tracker.py): motion below the
+    deadband returns the previous filtered point UNCHANGED (so H built
+    from filtered points is bit-static at rest); motion past the fast
+    threshold blends with the fast alpha (real tilt tracks in 1-2
+    frames); in between the slow alpha smooths drift. A jump beyond
+    snap_px snaps to the measurement (camera reopen / platform moved).
+    Callers pass their own settings values — this class imports none."""
+
+    def __init__(
+        self,
+        deadband_px: float,
+        fast_px: float,
+        alpha_slow: float,
+        alpha_fast: float,
+        snap_px: float,
+    ) -> None:
+        self.deadband_px = float(deadband_px)
+        self.fast_px = float(fast_px)
+        self.alpha_slow = float(np.clip(alpha_slow, 0.0, 0.98))
+        self.alpha_fast = float(np.clip(alpha_fast, 0.0, 0.98))
+        self.snap_px = float(snap_px)
+        self._prev: np.ndarray | None = None
+
+    def filter(self, point_px: np.ndarray) -> np.ndarray:
+        """Fold one measured point in; return the filtered point."""
+        current = np.asarray(point_px, dtype=np.float32)
+        prev = self._prev
+        if prev is None:
+            filt = current
+        else:
+            d = float(np.hypot(*(current - prev)))
+            if d > self.snap_px:
+                filt = current                  # jump: reset
+            elif d <= self.deadband_px:
+                filt = prev                     # deadband: freeze
+            else:
+                alpha = (
+                    self.alpha_fast if d >= self.fast_px else self.alpha_slow
+                )
+                filt = alpha * prev + (1.0 - alpha) * current
+        self._prev = filt
+        return filt
+
+    def reset(self) -> None:
+        """Clear state; the next filter() call seeds from the measurement."""
+        self._prev = None
 
 
 class MeasurementFilter:

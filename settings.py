@@ -142,6 +142,77 @@ TRACKER_AB_INNOV_OPEN_MM = 1.5       # innovation below this: gains stay MIN
 TRACKER_AB_INNOV_FULL_MM = 4.0       # innovation above this: gains at MAX
 TRACKER_AB_SPEED_OPEN_MM_S = 60.0    # predicted speed below this: no opening
 TRACKER_AB_SPEED_FULL_MM_S = 150.0   # predicted speed above this: gains at MAX
+# Single-frame glitch veto (2026-07-23 path sessions): when the ball
+# transits an ArUco marker its edge partially occludes the marker and
+# the homography glitches — >4 mm single-frame position jumps at 3x
+# the base rate near the marker diagonals, which the PID then chases.
+# An innovation beyond VETO_MM coasts on the prediction for at most
+# VETO_MAX_FRAMES (then accepts, so sustained real motion is never
+# suppressed — a genuine 300 mm/s flick is delayed by one frame at
+# most, and the perf-pass impulse profile at 5 mm/frame never trips
+# the 6 mm threshold at all).
+TRACKER_AB_VETO_MM = 6.0
+TRACKER_AB_VETO_MAX_FRAMES = 1
+
+# --- Boundary-quad platform tracking (2026-07-24) ---
+# Primary homography source: fit the platform's four gray boundary edges
+# (the ball can NEVER reach them — max center excursion ~85 mm vs the
+# ±120 mm boundary) and intersect them for the warp corners, instead of
+# the ArUco marker centers at ±60 mm that the ball occludes during path
+# transits (rig-measured: >4 mm single-frame H glitches on 19% of frames
+# near the marker diagonals, 3x baseline). ArUco is demoted to
+# acquisition seed, identity/scale reference, periodic cross-check, and
+# fallback. See cv/quad_tracker.py.
+TRACKER_QUAD_ENABLED = True
+TRACKER_QUAD_SAMPLES_PER_SIDE = 32     # edge samples per boundary side
+TRACKER_QUAD_BAND_TRACK_PX = 5         # half-width of the search band (locked)
+TRACKER_QUAD_BAND_ACQ_PX = 12          # half-width while acquiring (wider: seed error)
+TRACKER_QUAD_MIN_GRAD = 6.0            # min |edge gradient| (contrast floor —
+#                                        gray-on-gray background fails CLOSED to ArUco)
+TRACKER_QUAD_MIN_INLIERS = 12          # min surviving samples per side after trim
+TRACKER_QUAD_TRIM_RESID_PX = 0.75      # residual trim floor (max with 2.5-sigma MAD)
+TRACKER_QUAD_BALL_EXCLUDE_PX = 30.0    # drop samples near the ball (its silhouette
+#                                        can overlap the boundary from the oblique
+#                                        camera because the ball has height); 0 = off
+TRACKER_QUAD_ACQ_FRAMES = 10           # consecutive good fits required to lock
+TRACKER_QUAD_MAX_MISS_FRAMES = 6       # locked-fit failures before dropping to UNLOCKED
+TRACKER_QUAD_MAX_CORNER_STEP_PX = 15.0  # gate: max per-frame corner motion while locked
+TRACKER_QUAD_SIDE_RATIO_TOL = 0.06     # gate: side-length drift vs previous frame
+TRACKER_QUAD_MAX_ANGLE_DELTA_DEG = 5.0  # gate: corner-angle drift vs previous frame
+TRACKER_QUAD_CROSSCHECK_EVERY_N = 15   # run ArUco every N frames while locked
+# The audit is BASELINE-RELATIVE (rig finding 2026-07-24): ArUco must
+# extrapolate the +/-60 mm marker square 2x outward to predict the
+# +/-120 mm boundary corners, and real-lens radial distortion makes that
+# prediction structurally wrong by several px — the quad measures where
+# the boundary actually IS. On the rig the raw disagreement exceeded the
+# old absolute tolerance on EVERY audit, so 3 strikes (45 frames = 1.5 s)
+# force-reacquired the quad in a perfectly periodic unlock/relock cycle.
+# The residual at lock time is now stored as the baseline; audits alarm
+# on CHANGE from it (genuine drift), with a slow blend on passes to
+# follow tilt. A raw disagreement over SLIP_PX is a hard strike
+# regardless of baseline (identity slip / false structure).
+TRACKER_QUAD_CROSSCHECK_TOL_PX = 4.0   # mean |change from baseline| to pass
+TRACKER_QUAD_CROSSCHECK_SLIP_PX = 25.0  # raw disagreement = hard strike
+TRACKER_QUAD_CROSSCHECK_FAILS_TO_REACQ = 3   # consecutive fails -> force reacquire
+# Skip the cross-check while the ball is within this distance of ANY
+# marker center: ArUco is exactly then untrustworthy (the occlusion this
+# feature exists to defeat), and a slow marker transit otherwise reads
+# as PERSISTENT disagreement — three straight failed audits would force
+# the quad to reacquire from the glitched ArUco H (caught in sim: the
+# synthetic transit sweep reproduced the rig's >4 mm jumps through
+# exactly this path). Marker half-diagonal ~21 mm + ball radius ~15 mm
+# + margin. 0 disables the guard.
+TRACKER_QUAD_CROSSCHECK_BALL_NEAR_MARKER_MM = 45.0
+#   (transient disagreement prefers the QUAD — transient ArUco error IS the rig
+#   failure mode; persistent disagreement prefers ARUCO — only it carries
+#   absolute identity and scale, so a persistently divergent quad relocks)
+# Corner deadband LP (mirrors the ArUco marker-center filter): H is fully
+# static at rest yet tracks real tilt in 1-2 frames.
+TRACKER_QUAD_CORNER_DEADBAND_PX = 0.3
+TRACKER_QUAD_CORNER_FAST_PX = 1.5
+TRACKER_QUAD_CORNER_ALPHA_SLOW = 0.70
+TRACKER_QUAD_CORNER_ALPHA_FAST = 0.2
+TRACKER_QUAD_CORNER_SNAP_PX = 40.0
 
 # =============================================================================
 # PD controller
@@ -183,7 +254,7 @@ PD_I_ERR_ZERO_MM = 60.0              # zero integration at/above (linear)
 # 3-minute static hold, ~17 mm/s perpetual wander). Below DEADBAND the
 # integral stops (ramping to full by 2x DEADBAND): the ball parks
 # within the stiction scale, the integral goes flat, and rest engages.
-PD_I_ERR_DEADBAND_MM = 2.0
+PD_I_ERR_DEADBAND_MM = float(_OV.get("PD_I_ERR_DEADBAND_MM", 2.0))
 # Rest may only engage once the integral is flat (|dI/dt| EMA under
 # this). Resting parks the output at trim + I with P and D dropped —
 # resting on a still-converging integral is not an equilibrium and
@@ -209,7 +280,7 @@ REST_I_RATE_MAX_DEG_S = 0.02
 PATH_FF_ENABLED = True
 PATH_FF_LOOKAHEAD_S = 0.12           # evaluate ff ahead by the pipeline lag
 PATH_FF_TILT_MAX_DEG = 1.5           # cap (polyline corners spike curvature)
-CONTROL_PREDICT_S = 0.08             # ball-state forward extrapolation
+CONTROL_PREDICT_S = float(_OV.get("CONTROL_PREDICT_S", 0.08))  # ball-state forward extrapolation
 
 # =============================================================================
 # Near-target rest mode (control/rest_gate.py)
@@ -256,28 +327,22 @@ HOME_CAL_CONVERGE_MAX_RADIUS_MM = 15.0
 HOME_CAL_TIMEOUT_S = 30.0
 
 # =============================================================================
-# PD autotune
+# AutoTune (2026-07-23 SysID rework)
 # =============================================================================
+# The step-test estimator and its 13 gate/inversion settings were
+# deleted -- tuning is now a probe -> fit -> design pipeline
+# (control/plant_id.py + control/gain_design.py; probe script and
+# search bounds are module constants there, not user tunables). The
+# old estimator was convicted on evidence: zero legs ever completed on
+# the rig (its settle gates never opened), and it random-walked when
+# run against a known simulated plant.
 PD_AUTOTUNE_ENABLED = False
 PD_AUTOTUNE_AUTO_APPLY = False
-PD_AUTOTUNE_SETTLE_RADIUS_MM = 6.0
-PD_AUTOTUNE_SETTLE_SPEED_MM_S = 18.0
-PD_AUTOTUNE_SETTLE_HOLD_S = 0.35
-PD_AUTOTUNE_TIMEOUT_S = 6.0
-PD_AUTOTUNE_MIN_TRIAL_S = 0.8
-PD_AUTOTUNE_MIN_KP = 0.005
-PD_AUTOTUNE_MAX_KP = 0.250
-PD_AUTOTUNE_MIN_KD = 0.000
-PD_AUTOTUNE_MAX_KD = 0.100
-PD_AUTOTUNE_STEP_MM: float = 40.0          # step distance from center per leg
-PD_AUTOTUNE_G_EFF: float = 171.0           # effective platform gravity (mm/s²/°)
-PD_AUTOTUNE_TARGET_ZETA: float = 0.70      # desired closed-loop damping ratio
-PD_AUTOTUNE_WAIT_SETTLE_RADIUS_MM: float = 20.0  # pre-leg settle radius
-PD_AUTOTUNE_WAIT_SETTLE_SPEED_MM_S: float = 20.0  # pre-leg settle speed
-PD_AUTOTUNE_WAIT_SETTLE_HOLD_S: float = 0.5      # pre-leg settle hold duration
-PD_AUTOTUNE_MIN_OVERSHOOT_RATIO: float = 0.02    # below this → treat as overdamped
-PD_AUTOTUNE_MIN_CROSS_S: float = 0.40           # ignore first_crossing faster than this
-PD_AUTOTUNE_MAX_GAIN_DELTA_FRAC: float = 0.50   # max fractional change per trial
+# Effective plant gain (mm/s^2 per deg). Updated by Apply after a fit;
+# also feeds the path feedforward tilt divisor.
+PD_AUTOTUNE_G_EFF: float = float(_OV.get("PD_AUTOTUNE_G_EFF", 171.0))
+PD_AUTOTUNE_ABORT_RADIUS_MM = 70.0     # probe hard-abort radius
+PD_AUTOTUNE_BALL_LOST_S = 1.0          # valid-frame gap that aborts a probe
 AUTOTUNE_LOG_PATH: str = "autotune_session.log"
 
 # =============================================================================
@@ -301,6 +366,122 @@ PATH_FULL_SPEED_RADIUS_MM = 10.0
 # Radial clamp; just inside the 84.85 mm ArUco marker-corner radius.
 PATH_MAX_RADIUS_MM = 85.0
 PATH_POINT_SPACING_MM = 2.0       # uniform resample spacing
+
+# =============================================================================
+# Harmonic orbit (control/orbit.py)
+# =============================================================================
+# A SEPARATE mode from path following: a clock-driven circular reference
+# with analytic feedforward tilt (rotating centripetal vector, phase-
+# advanced by the actuation delay) plus a LEARNED per-phase correction
+# table (iterative learning control — the plate-specific warp/drag
+# harmonics dwarf the analytic term: bowl warp alone needs ~0.28 deg at
+# r=50 vs 0.19 deg centripetal at v=40). Feedback is demoted to a trim
+# role (p/d scaled; integral untouched for DC trim). Speed reuses the
+# Path Speed slider (PATH_SPEED_* bounds).
+ORBIT_RADIUS_MM = 50.0            # default reference radius (marker-safe)
+ORBIT_RADIUS_MIN_MM = 30.0        # GUI spinbox bounds
+ORBIT_RADIUS_MAX_MM = 70.0
+ORBIT_SPINUP_S = 4.0              # omega 0 -> target ramp (also the r ramp window)
+ORBIT_ENTRAIN_MIN_RADIUS_MM = 15.0  # entrain radius floor (atan2 stability)
+# p/d scale while orbiting (integral untouched). Second rig session:
+# raised 0.5 -> 1.0 — at half gains the P authority (0.036 deg/mm) was
+# under the rig's stiction breakaway (0.3-0.5 deg = a +/-8-14 mm dead
+# band), producing a 0.25-0.33 Hz stick-slip radial limit cycle with
+# 5-10 mm amplitude at exactly the scaled-gain resonance. Full gains
+# halve the sim ripple on the rig-like plant (3.2 -> 1.4 mm) with no
+# instability; "feedback demoted to trim" is achieved by the ff+table
+# carrying the drive, not by weakening the corrector.
+ORBIT_FB_GAIN_SCALE = 1.0
+ORBIT_FF_TILT_MAX_DEG = 8.5       # ff vector-norm cap (analytic + learned;
+#                                   must clear ORBIT_CONE_TILT_MAX_DEG —
+#                                   1.5 silently truncated the cone)
+ORBIT_ILC_BINS = 24               # per-phase correction bins (15 deg/bin)
+ORBIT_ILC_MU = 0.5                # learning rate (fraction of residual per bin-visit)
+ORBIT_ILC_LEAK = 0.02             # per-LAP table leak (mis-learned corrections age out)
+ORBIT_ILC_CLAMP_DEG = 1.2         # per-bin correction vector-norm clamp
+#   Raised 0.8 -> 1.2 (second rig session): the rig's DC-plus-rotating
+#   correction exceeds 0.8 — 11-13 of 24 bins sat PINNED at the old
+#   clamp (starved), which is exactly the logged outward radius offset
+#   (ball riding 10+ mm outside the ring). At 1.2 the sim table peaks
+#   at ~1.18 with zero saturated bins and the radius error collapses
+#   3.1 -> 0.6 mm.
+# Gaussian write kernel width: each bin-transit update is spread over
+# neighboring bins, BAND-LIMITING what the table can learn. Sim-caught:
+# harmonics at n*omega above the scaled-gain resonance sqrt(g*kp_eff)
+# have a sign-flipped closed-loop response, so point-writes PUMP them
+# (n=3-4 grew to the clamp and the orbit diverged after 4 laps). At
+# sigma=2.5 of 24 bins the fundamental learns at 0.81x speed while n=3
+# is attenuated 0.15x — under the per-lap smoothing + leak damping
+# even at mu=0.5 (fundamental contraction ~0.68/lap).
+ORBIT_ILC_WRITE_SIGMA_BINS = 2.5
+ORBIT_LEARN_GATE_MM = 30.0        # no learning above this tracking error
+ORBIT_RECOVER_MM = 45.0           # error tripwire -> RECOVER (freeze + re-entrain)
+ORBIT_RECOVER_FRAMES = 20         # consecutive frames above the tripwire
+# Phase governor (first rig session, 2026-07-27): under the rig's real
+# stiction (~0.3-0.5 deg equivalent — the sim assumed 0.06) the pure
+# clock reference OUTRUNS the ball; the trailing error crossed the old
+# 30 mm tripwire and the orbit churned recover->entrain forever (data:
+# omega collapsing and re-ramping all session, radius ripple 5-10 mm,
+# the table never got uninterrupted laps to learn; reproduced in sim at
+# stiction 0.45). A WEAK phase-locked loop slews the reference phase
+# toward the ball's actual angle: sustained lag is absorbed, but the
+# bandwidth (~0.02 Hz in track) is far below jank frequencies, so —
+# unlike carrot pacing — measurement jitter cannot couple into the
+# reference. Entrain/recover use a STRONG lock (the reference stays
+# glued to the ball until capture), and TRACK entry additionally
+# requires the error under ORBIT_TRACK_ENTRY_ERR_MM so the integral
+# never freezes on a bad state.
+ORBIT_PHASE_GOV_TRACK_PER_S = 0.15    # rad/s of phase slew per rad of lag
+ORBIT_PHASE_GOV_TRACK_CAP = 0.2       # cap as a fraction of omega
+ORBIT_PHASE_GOV_ENTRAIN_PER_S = 1.5   # strong lock while entraining
+ORBIT_TRACK_ENTRY_ERR_MM = 25.0       # capture gate for entrain -> track
+# --- Cone mode (third rig session, 2026-07-27) ---
+# Hudson's clarified intent: the platform's DOMINANT motion is the
+# CONE itself — a pure open-loop rotating tilt (feedback OFF, integral
+# frozen, no ball chasing) — and the ball falls into orbit because the
+# physics says so. The plate's bowl warp acts as a central SPRING
+# (omega_n = sqrt(g_eff*warp_c) ~ 0.97 rad/s at the rig-measured
+# 0.0055 deg/mm — sim-caught: the naive gA/omega^2 formula missed it
+# and the ball landed at 88 mm instead of 50), so the driven orbit is
+# R = g_eff*A / (omega^2 - omega_n^2), ridden 180 deg out of phase
+# with the tilt (driving above the warp resonance). Inverted: A is
+# chosen ABOVE the rig's stiction breakaway (~0.3-0.5 deg) so the
+# ball actually rolls, and the rate follows from the dialed radius:
+#   omega = sqrt(g_eff * (warp_c + A/R))
+# At A=0.6, r=50: omega=1.73 rad/s (0.28 Hz, ~3.6 s/rev, ~86 mm/s).
+# ORBIT_CONE_ONLY=True makes the Harmonic Orbit button drive this
+# mode; the closed-loop reference/ILC machinery stays available
+# behind the flag.
+ORBIT_CONE_ONLY = True
+# Cone amplitude. First rig attempt used 0.6 deg — the steady-state
+# textbook number — which moves the platform EDGE by ~1.3 mm:
+# invisible, and marginal against the real breakaway net of trim
+# errors ("genuinely not even moving"). 2.0 deg swings the edge
+# ~4 mm at omega=2.8 rad/s (r=50: one rev per ~2.3 s, predicted ball
+# speed ~140 mm/s) — an unmistakable cone. Live-tunable from the GUI
+# spinbox (ORBIT_CONE_TILT_MIN/MAX bounds).
+ORBIT_CONE_TILT_DEG = 2.0
+ORBIT_CONE_TILT_MIN_DEG = 0.25
+ORBIT_CONE_TILT_MAX_DEG = 8.0     # rig ask; the vision tilt clamp is 10
+# Manual angular-frequency override, rad/s. 0 = AUTO (derived from the
+# tilt + dialed radius via the warp-spring physics). Manual values may
+# sit on either side of the warp resonance (~0.97 rad/s): above it the
+# ball rides anti-phase, below it in-phase; near it the predicted ring
+# blows up (display capped at the platform edge).
+ORBIT_CONE_OMEGA_RAD_S = 0.0
+ORBIT_CONE_OMEGA_MAX_RAD_S = 6.0
+ORBIT_CONE_WARP_C = 0.0055        # rig-measured bowl coefficient (deg/mm)
+# Center corrector — the ONLY feedback in cone mode, and it acts on
+# the per-lap AVERAGE ball position (the orbit center), never the
+# instantaneous ball, so it cannot jitter the cone. Needed because the
+# warp spring is weak: sim-caught, a mere 0.3 deg residual trim bias
+# shifts the orbit center ~50 mm and the untethered orbit drifts off
+# the platform (a naive PID integral is WORSE — at cone frequency its
+# 90-deg-lagged chase pumps the orbit instead). Center estimate: EMA
+# with tau ~1.5 lap periods; correction: slow DC-tilt integrator with
+# closed-loop time constant ~ warp_c/(gain) ~ 8 s.
+ORBIT_CONE_CENTER_GAIN = 0.0007   # deg of DC tilt per mm of center error per s
+ORBIT_CONE_DC_CLAMP_DEG = 1.0     # DC correction clamp
 
 # =============================================================================
 # Loop rates

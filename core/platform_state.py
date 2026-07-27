@@ -64,3 +64,9 @@ class BallState:
     vy_mm_s: float
     z_mm: Optional[float] = None
     vz_mm_s: Optional[float] = None
+    # Raw (pre-filter) detection, when the producer has it (additive,
+    # 2026-07-23 SysID rework): the plant-ID recording fits against raw
+    # positions — fitting the filtered trace would bake the filter's
+    # group delay into the identified plant latency.
+    raw_x_mm: Optional[float] = None
+    raw_y_mm: Optional[float] = None

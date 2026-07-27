@@ -446,6 +446,148 @@ trim.
 
 ---
 
+### 2026-07-23 SysID AutoTune — Measure the Plant, Design the Gains
+**Status:** Implemented (branch `rework/autotune-id`, stacked on the
+I-term rework); merge gated on the rig session
+
+**Why:** the step-test estimator completed zero legs on the rig (its
+settle gates never opened against the wobble floor) and random-walked
+against a known simulated plant. Its 2-feature model inversion cannot
+survive latency + stiction + warp + the ball's self-rock, and it never
+tuned ki.
+
+**Pipeline contract (same GUI button flow):**
+1. PROBE (~78 s, `control/plant_id.ProbeScript`, NO settle gates):
+   scripted targets through the arbiter override — quiet hold (noise +
+   self-rock measurement), safety pre-check, relay toggles ±25 mm x/y,
+   diagonals, stiction micro-steps, baseline steps. Per-frame recording
+   of raw detections + actually-sent commands. Aborts: ball lost > 1 s,
+   out of bounds (> 70 mm, recenter then 2 s grace), user toggle.
+2. FIT (background thread, < 5 s): convex per-latency acceleration
+   regression recovers (g_eff, pipeline latency, effective stiction,
+   warp, biases); filter group delay measured separately
+   (raw↔filtered cross-correlation); self-rock band notched from both
+   regression sides; confidence gate (low_confidence caps everything
+   downstream).
+3. DESIGN (background thread, ~15-30 s): kp/ki/kd search on the fitted
+   plant, CRN-paired sims of the real chain, J normalized to the
+   current gains (J = 1.0 = today); the current gains are always in
+   the candidate pool — a suggestion can NEVER be measured-worse than
+   today.
+4. APPLY: lands kp/kd/ki + calibrates the prediction horizon (fitted
+   latency + filter lag) and the integral deadband
+   (0.5·stiction/kp_new, clamped [1, 6] mm); the GUI persists gains +
+   calibrations + g_eff to the settings overlay in one save
+   (transient `pd_autotune_event {"type": "applied"}`, the
+   home_cal_event pattern). Auto-Apply = apply when design completes.
+
+**Acceptance criteria:**
+- Killer tests green (418 passed): known-plant recovery through a full
+  closed-loop probe (g ±10-15%, latency ±20-25 ms, with and without an
+  injected 0.8 Hz rock), never-worse + ≥30%-from-bad-start design,
+  deterministic, end-to-end session through compute_with_terms ✅
+- Rig session (gates the PR): AutoTune with vision on → probe ~80 s
+  with visible phase/progress → suggestion with plant numbers (sanity:
+  latency 0.06-0.12 s, g_eff 120-220) → Apply updates all three
+  sliders + user_settings.json gains + calibrations; timing strip
+  stays flat during compute; cancel mid-probe returns to normal
+  balancing; re-run after the ball swap re-identifies — pending
+- Deferred: post-apply validation re-probe (before/after measured
+  cost) — follow-up.
+
+---
+
+### 2026-07-24 Boundary-Quad Platform Tracking — Quad Primary, ArUco Auxiliary
+**Status:** Implemented (branch `rework/autotune-id`); merge gated on
+the rig session
+
+**Why:** rig data (fourth path session) proved the ball occludes the
+ArUco markers during path transits — >4 mm single-frame homography
+jumps on 19% of frames near the marker diagonals (3× baseline),
+feeding a ~1 Hz path oscillation. The markers sit at ±60 mm, in the
+ball's traffic; the platform boundary at ±120 mm is physically
+unreachable (max center excursion ~85 mm).
+
+**Contract:**
+1. `cv/quad_tracker.py::PlatformQuadTracker` fits the four boundary
+   edges (32 sub-pixel samples/side, one `cv2.remap`, trimmed TLS,
+   corner intersection, deadband corner LP → bit-stable H at rest) and
+   builds the same camera→warp H the ArUco path builds.
+2. Source ladder in `BallTracker._resolve_homography`:
+   quad (LOCKED) → aruco → bounded stale-hold → miss, reported
+   per-frame as `homography_source`. `TRACKER_QUAD_ENABLED=False`
+   short-circuits to the pre-quad path.
+3. Acquisition needs an ArUco seed (identity/orientation/scale);
+   per-side edge polarity and silhouette-offset calibration freeze at
+   lock. Gray-on-gray background fails CLOSED to ArUco.
+4. While locked, ArUco runs every 15th frame as an audit: transient
+   disagreement keeps the quad; 3 consecutive failed audits force a
+   reacquire; the audit is SKIPPED while the ball is within 45 mm of a
+   marker (ArUco is exactly then untrustworthy).
+5. Telemetry: snapshot `homography_source` + `quad_corners_px`,
+   `quad_fit` timing (< 1 ms budget), camera-view quad overlay +
+   `H: QUAD/ARUCO/STALE/--` badge, `[TRACK]` transition log lines.
+
+**Acceptance criteria:**
+- Sim gates (469 passed): deterministic marker-transit A/B — ArUco
+  baseline reproduces the rig glitch (max raw jump 7.7 mm), quad path
+  zero >4 mm jumps (max 1.2 mm); two markers covered still tracks;
+  ball ON the boundary holds corners < 1 px; gray-on-gray falls back
+  and relocks; existing suite untouched via the flat-scene guard ✅
+- Rig session (gates the PR): badge steady at `H: QUAD` with vision
+  on; covering ONE marker with a finger keeps the badge QUAD and the
+  ball position still; covering a boundary side drops to ARUCO and
+  recovers; r=65 circle + star re-run → angle-folded glitch analysis:
+  near-diagonal >4 mm rate must drop from 19% toward the ~6%
+  baseline; `quad_fit` < 1 ms on the timing strip — pending
+
+---
+
+### 2026-07-27 Harmonic Orbit — Feedforward-Driven Smooth Circles
+**Status:** Implemented (branch `rework/autotune-id`); merge gated on
+the rig session
+
+**Why:** carrot path-following circles remain visibly janky — the
+pacing law couples tracking error into reference speed. Hudson's ask:
+a predefined smooth periodic platform motion tuned to the plant that
+carries the ball around the circle, with only micro-corrections. A
+SEPARATE mode; path following is preserved unchanged.
+
+**Contract:**
+1. `control/orbit.py::HarmonicOrbit`: clock-driven reference at
+   omega = v/R (no error pacing), analytic feedforward (rotating
+   centripetal tilt, phase-advanced by the actuation delay ~ predict_s)
+   + a learned 24-bin per-phase correction table (ILC) that absorbs
+   the plate-specific periodic disturbances (warp ~0.28 deg at r=50 >
+   the 0.19 deg analytic term). Learning: one Gaussian-kernel write
+   per bin transit, gamma = kp_eff − omega²/g_eff, leak + clamp +
+   per-lap smoothing; omega soft-clamped below 0.85x the scaled-gain
+   resonance.
+2. States: entrain (seed at the ball, 4 s spin-up) → track (learning;
+   integral FROZEN — it owns DC only during entrain/recover) → recover
+   (>30 mm for 10 frames: table frozen, re-entrain — never drag).
+3. Feedback trim: `PIDCore.compute(gain_scale=0.5)` (p/d only); same
+   override-channel + mutual-exclusion discipline as path following;
+   rest suppressed; stop = motion-free transfer.
+4. GUI: Harmonic Orbit toggle + radius spinbox (30–70 mm) in the Path
+   Following group; speed = the shared Path Speed slider; reference
+   ring overlay; "orbit: track · lap N · err · ilc" status.
+
+**Acceptance criteria:**
+- Sim gates (526 passed): ILC convergence arbiter (lap RMS 15→1.5 mm,
+  harmonics clean); A/B on the shared rig-warp + servo-lag plant —
+  orbit mean radius error < 0.5x the carrot's (measured 1.9 vs
+  7.0 mm) and tangential speed std < 0.85x (0.38 vs 0.55 mm/s);
+  20/40 mm kick recovery; determinism; exclusion edges; TERMS
+  amendment ✅
+- Rig session (gates the PR): enable Harmonic Orbit at r=50 → ball
+  spirals out over ~4 s and laps continuously; the status error
+  visibly SHRINKS over the first ~5 laps (the table learning); a light
+  nudge re-converges smoothly with no lurch; motion history visibly
+  smoother than Follow Path on the same circle — pending
+
+---
+
 ## Future Features (not scheduled)
 
 ### Multi-Camera Ball Tracking

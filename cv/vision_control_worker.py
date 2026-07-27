@@ -35,6 +35,9 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    ORBIT_CONE_OMEGA_RAD_S,
+    ORBIT_CONE_TILT_DEG,
+    ORBIT_RADIUS_MM,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KI,
@@ -82,6 +85,20 @@ class ControlSnapshot:
     warped_bgr: object | None = None
     mask_gray: object | None = None
     worker_emit_perf_ts: float = field(default=0.0)
+    # Boundary-quad telemetry (2026-07-24): which rung of the source
+    # ladder produced this frame's H ("quad"/"aruco"/"stale"/"none");
+    # set on BOTH branches — a ball miss with a good H is a different
+    # condition from H loss. quad_corners_px is an owned (4,2) copy of
+    # the locked quad's corners in flipped-camera coords (overlays
+    # directly onto camera_bgr), None unless the quad is locked.
+    homography_source: str = ""
+    quad_corners_px: object | None = None
+    # Acquisition diagnostics while the quad is NOT locked (rig
+    # visibility: where the tracker is looking and why sides fail):
+    # {"state", "acq_good", "acq_frames", "pred_corners", "fit_corners",
+    #  "sides": [4 x {"reason", "usable", "edges", "inliers", "grad"}]}.
+    # None when locked, disabled, or no attempt has run yet.
+    quad_diag: object | None = None
 
 
 class VisionControlWorker(QtCore.QObject):
@@ -155,6 +172,14 @@ class VisionControlWorker(QtCore.QObject):
         # always begins with the follower idle.
         self._path_pattern_init: str = ""
         self._path_speed_init = float(PATH_SPEED_MM_S)
+        # Harmonic orbit: radius + cone tilt cached; orbiting itself
+        # never cached.
+        self._orbit_radius_init = float(ORBIT_RADIUS_MM)
+        self._orbit_cone_tilt_init = float(ORBIT_CONE_TILT_DEG)
+        self._orbit_cone_omega_init = float(ORBIT_CONE_OMEGA_RAD_S)
+        # Blind-cone send throttle (cone runs without the ball, driven
+        # by the fallback QTimer between/without camera frames).
+        self._last_blind_orbit_send = 0.0
 
         self._timer: QtCore.QTimer | None = None
         self._running = False
@@ -261,6 +286,10 @@ class VisionControlWorker(QtCore.QObject):
                     PATTERNS[self._path_pattern_init]()
                 )
             self.ball_controller.set_path_speed(self._path_speed_init)
+            self.ball_controller.set_orbit_radius(self._orbit_radius_init)
+            self.ball_controller.set_orbit_speed(self._path_speed_init)
+            self.ball_controller.set_orbit_cone_tilt(self._orbit_cone_tilt_init)
+            self.ball_controller.set_orbit_cone_omega(self._orbit_cone_omega_init)
 
         # Event-driven tick: every published frame nudges _tick via the
         # queued _frame_arrived bridge (the QTimer below stays as the
@@ -443,9 +472,41 @@ class VisionControlWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot(float)
     def set_path_speed(self, mm_s: float) -> None:
+        """One slider feeds both modes: the path follower AND the
+        harmonic orbit take their tangential speed from here."""
         self._path_speed_init = float(mm_s)
         if self.ball_controller is not None:
             self.ball_controller.set_path_speed(float(mm_s))
+            self.ball_controller.set_orbit_speed(float(mm_s))
+
+    @QtCore.pyqtSlot(bool)
+    def set_orbit_enabled(self, enabled: bool) -> None:
+        """Start/stop the harmonic orbit. Deliberately NOT cached:
+        orbiting never auto-starts on a fresh session."""
+        if self.ball_controller is None:
+            return
+        if bool(enabled):
+            self.ball_controller.start_orbit()
+        else:
+            self.ball_controller.stop_orbit()
+
+    @QtCore.pyqtSlot(float)
+    def set_orbit_radius(self, radius_mm: float) -> None:
+        self._orbit_radius_init = float(radius_mm)
+        if self.ball_controller is not None:
+            self.ball_controller.set_orbit_radius(float(radius_mm))
+
+    @QtCore.pyqtSlot(float)
+    def set_orbit_cone_tilt(self, deg: float) -> None:
+        self._orbit_cone_tilt_init = float(deg)
+        if self.ball_controller is not None:
+            self.ball_controller.set_orbit_cone_tilt(float(deg))
+
+    @QtCore.pyqtSlot(float)
+    def set_orbit_cone_omega(self, rad_s: float) -> None:
+        self._orbit_cone_omega_init = float(rad_s)
+        if self.ball_controller is not None:
+            self.ball_controller.set_orbit_cone_omega(float(rad_s))
 
     # ------------------------------------------------------------------
     # Inner loop
@@ -474,9 +535,13 @@ class VisionControlWorker(QtCore.QObject):
         self._counter += 1
 
         try:
-            # Stale frame: no new frame since last processed — skip silently.
-            # Do NOT reset controller state or advance miss count.
+            # Stale frame: no new frame since last processed — skip
+            # silently (no controller reset, no miss count). The BLIND
+            # cone still advances here: the fallback QTimer drives it
+            # between (or entirely without) camera frames, so the cone
+            # is smooth and camera-independent.
             if not self.camera.has_new_frame(self._last_frame_ts):
+                self._maybe_send_blind_orbit()
                 return
 
             # Single-pass read+flip into a reusable buffer. The two
@@ -524,12 +589,18 @@ class VisionControlWorker(QtCore.QObject):
                 self._was_missing = True
                 self._valid_streak = 0
 
-                # Neutral-pose fallback: on sustained ball loss, level the
-                # platform (throttled). This is the SAFETY action — it runs
-                # outside the reacquire gate and needs no tracking_valid.
-                self._maybe_send_neutral()
+                # Blind cone: with the ball absent the open-loop cone
+                # KEEPS RUNNING (rig testing without a ball). The
+                # neutral-pose safety fallback is suppressed while it
+                # does — leveling the plate would fight the cone.
+                if not self._maybe_send_blind_orbit():
+                    # Neutral-pose fallback: on sustained ball loss,
+                    # level the platform (throttled). The SAFETY action —
+                    # runs outside the reacquire gate.
+                    self._maybe_send_neutral()
 
                 timings_ms = self._build_miss_timings(t0, t1, loop_start, latest_ts)
+                h_source, quad_corners, quad_diag = self._quad_telemetry()
                 snapshot = ControlSnapshot(
                     timestamp=time.time(),
                     ball_state=None,
@@ -550,6 +621,9 @@ class VisionControlWorker(QtCore.QObject):
                     warped_bgr=warped_view,
                     mask_gray=mask_view,
                     worker_emit_perf_ts=time.perf_counter(),
+                    homography_source=h_source,
+                    quad_corners_px=quad_corners,
+                    quad_diag=quad_diag,
                 )
                 if emit_now:
                     self._snapshot_inflight = True
@@ -618,6 +692,7 @@ class VisionControlWorker(QtCore.QObject):
                     f"total={timings_ms['total']:.2f}ms",
                 )
 
+            h_source, quad_corners, quad_diag = self._quad_telemetry()
             snapshot = ControlSnapshot(
                 timestamp=time.time(),
                 ball_state=ball_state,
@@ -634,6 +709,9 @@ class VisionControlWorker(QtCore.QObject):
                 warped_bgr=warped_view,
                 mask_gray=mask_view,
                 worker_emit_perf_ts=time.perf_counter(),
+                homography_source=h_source,
+                quad_corners_px=quad_corners,
+                quad_diag=quad_diag,
             )
             if emit_now:
                 self._snapshot_inflight = True
@@ -669,6 +747,89 @@ class VisionControlWorker(QtCore.QObject):
             None if warped is None else warped.copy(),
             None if mask is None else mask.copy(),
         )
+
+    # ------------------------------------------------------------------
+    # Boundary-quad telemetry
+    # ------------------------------------------------------------------
+
+    def _quad_telemetry(self) -> tuple[str, np.ndarray | None, dict | None]:
+        """(homography_source, owned copy of the locked quad's corners,
+        acquisition diag while not locked). Everything crossing to the
+        GUI thread is copied."""
+        bt = self.ball_tracker
+        if bt is None:
+            return "none", None, None
+        corners: np.ndarray | None = None
+        diag_out: dict | None = None
+        if bt.quad_enabled:
+            q = bt.quad
+            if q.state == "locked":
+                got = q.last_corners_cam
+                if got is not None:
+                    corners = got.copy()
+                if q.last_audit_px is not None:
+                    diag_out = {
+                        "state": "locked",
+                        "audit_px": float(q.last_audit_px),
+                        "audit_raw_px": float(q.last_audit_raw_px or 0.0),
+                        "audit_strikes": int(q.audit_strikes),
+                    }
+            else:
+                d = q.last_diag
+                if d is not None:
+                    acq_good, acq_frames = q.acq_progress
+                    pred = d.get("pred_corners")
+                    fitc = d.get("fit_corners")
+                    diag_out = {
+                        "state": str(q.state),
+                        "acq_good": int(acq_good),
+                        "acq_frames": int(acq_frames),
+                        "pred_corners": (
+                            None if pred is None else np.asarray(pred).copy()
+                        ),
+                        "fit_corners": (
+                            None if fitc is None else np.asarray(fitc).copy()
+                        ),
+                        "sides": [dict(s) for s in d.get("sides", [])],
+                    }
+        return str(bt.homography_source), corners, diag_out
+
+    # ------------------------------------------------------------------
+    # Blind cone (orbit without the ball)
+    # ------------------------------------------------------------------
+
+    def _maybe_send_blind_orbit(self) -> bool:
+        """Advance and send the open-loop cone with no ball data.
+
+        Returns True when the cone is active (whether or not a command
+        went out this tick — the throttle bounds the send rate to
+        ~60 Hz; the streaming serial writer is latest-wins, and the T
+        protocol's 0.1-deg grid keeps the motion smooth)."""
+        ctrl = self.ball_controller
+        if ctrl is None:
+            return False
+        now = time.perf_counter()
+        if (now - self._last_blind_orbit_send) < (1.0 / 60.0):
+            return ctrl.orbit_cone_active
+        blind = ctrl.compute_orbit_blind()
+        if blind is None:
+            return False
+        self._last_blind_orbit_send = now
+        roll_cmd, pitch_cmd = blind
+        z = self._z_setpoint
+        ik_result = self._ik.solve(
+            Pose(x=0.0, y=0.0, z=z, roll=roll_cmd, pitch=pitch_cmd, yaw=0.0),
+            self._prev_arm_points,
+        )
+        if ik_result.success and self._command_sender is not None:
+            self._prev_arm_points = ik_result.arm_points
+            try:
+                self._command_sender(
+                    [float(a) for a in ik_result.servo_angles_deg]
+                )
+            except Exception as exc:
+                self.error.emit(f"blind orbit send failed: {exc}")
+        return True
 
     # ------------------------------------------------------------------
     # Neutral-pose fallback
@@ -742,6 +903,14 @@ class VisionControlWorker(QtCore.QObject):
         st = self.camera.stats()
         return float(st.period_ms), float(st.gray_mean)
 
+    def _add_quad_timing(self, timings: dict) -> None:
+        """Add the "quad_fit" key ONLY when the quad tracker is enabled
+        and has a genuine measurement — no fabricated zeros (the timing
+        plot renders every present key as data)."""
+        bt = self.ball_tracker
+        if bt is not None and bt.quad_enabled and bt.quad.last_update_ms > 0.0:
+            timings["quad_fit"] = float(bt.quad.last_update_ms)
+
     def _build_miss_timings(
         self,
         t0: float,
@@ -750,7 +919,7 @@ class VisionControlWorker(QtCore.QObject):
         latest_ts: float,
     ) -> dict:
         period_ms, gray_mean = self._capture_stats_pair()
-        return {
+        timings = {
             "ball_update": (t1 - t0) * 1000.0,
             "pd_compute": 0.0,
             "ik_solve": 0.0,
@@ -765,6 +934,8 @@ class VisionControlWorker(QtCore.QObject):
             "trk_cap_period": period_ms,
             "trk_gray_mean": gray_mean,
         }
+        self._add_quad_timing(timings)
+        return timings
 
     def _build_valid_timings(
         self,
@@ -785,7 +956,7 @@ class VisionControlWorker(QtCore.QObject):
         frame_to_cmd = (
             max(0.0, (t_cmd1 - latest_ts) * 1000.0) if latest_ts > 0 else 0.0
         )
-        return {
+        timings = {
             "ball_update": (t1 - t0) * 1000.0,
             "pd_compute": (t3 - t2) * 1000.0,
             "ik_solve": (t4 - t3) * 1000.0,
@@ -798,3 +969,5 @@ class VisionControlWorker(QtCore.QObject):
             "trk_cap_period": period_ms,
             "trk_gray_mean": gray_mean,
         }
+        self._add_quad_timing(timings)
+        return timings

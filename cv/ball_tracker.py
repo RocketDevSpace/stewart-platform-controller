@@ -1,8 +1,19 @@
 """
 cv/ball_tracker.py
 
-Pure detection pipeline: ArUco corner tracking -> perspective warp -> HSV
-masking -> contour analysis -> BallState with filtered velocity.
+Pure detection pipeline: homography (boundary-quad primary, ArUco
+auxiliary) -> perspective warp -> HSV masking -> contour analysis ->
+BallState with filtered velocity.
+
+Homography source ladder (2026-07-24 boundary-quad rework): once the
+PlatformQuadTracker (cv/quad_tracker.py) is LOCKED on the platform's
+boundary edges it is the per-frame H source — the ball can occlude the
+ArUco markers at +/-60 mm (rig-measured H glitches during path
+transits) but can never reach the +/-120 mm boundary. ArUco is demoted
+to acquisition seed, every-Nth-frame cross-check, and fallback:
+quad -> aruco -> bounded stale-hold -> miss, reported per-frame in
+homography_source. TRACKER_QUAD_ENABLED=False short-circuits to the
+pre-quad ArUco-only path.
 
 No camera, no threads, no I/O (M11): frames are handed in via process(),
 which makes the whole pipeline testable with synthetic images. Camera
@@ -36,7 +47,8 @@ import cv2
 import numpy as np
 
 from core.platform_state import BallState
-from cv.measurement_filter import MeasurementFilter
+from cv.measurement_filter import MeasurementFilter, PointDeadbandLP
+from cv.quad_tracker import STATE_LOCKED, PlatformQuadTracker
 from settings import (
     TRACKER_ARUCO_CENTER_ALPHA_FAST,
     TRACKER_ARUCO_CENTER_ALPHA_SLOW,
@@ -52,8 +64,15 @@ from settings import (
     TRACKER_MIN_CONTOUR_AREA,
     TRACKER_MIN_FILL_RATIO,
     TRACKER_MIN_RADIUS_PX,
+    TRACKER_QUAD_CROSSCHECK_BALL_NEAR_MARKER_MM,
+    TRACKER_QUAD_CROSSCHECK_EVERY_N,
+    TRACKER_QUAD_ENABLED,
     TRACKER_WARP_GRAY_CACHE_N,
 )
+
+# The >40 px marker-center/quad-corner snap threshold (camera reopened /
+# platform physically moved) — shared with the boundary-quad corner LP.
+_CENTER_SNAP_PX = 40.0
 
 
 class BallTracker:
@@ -88,7 +107,7 @@ class BallTracker:
         self._last_H: np.ndarray | None = None
         self._aruco_hold_count = 0
         self._aruco_lost = False       # a redetect attempt has failed
-        self._marker_centers_lp: dict[int, np.ndarray] = {}
+        self._marker_lp: dict[int, PointDeadbandLP] = {}
         self._frame_counter = 0
         self.aruco_detect_scale = float(TRACKER_ARUCO_DETECT_SCALE)
         self.aruco_redetect_every_n = max(1, int(TRACKER_ARUCO_REDETECT_EVERY_N))
@@ -102,6 +121,22 @@ class BallTracker:
         self.aruco_center_fast_px = float(TRACKER_ARUCO_CENTER_FAST_PX)
         self.aruco_fullres_subpix = bool(TRACKER_ARUCO_FULLRES_SUBPIX)
         self.max_aruco_hold_frames = int(TRACKER_MAX_ARUCO_HOLD_FRAMES)
+
+        # --- Boundary-quad primary source (2026-07-24) ---
+        # The quad tracker fits the platform's boundary edges (which the
+        # ball can never occlude) and, once LOCKED, replaces per-frame
+        # ArUco detection as the homography source; ArUco is demoted to
+        # acquisition seed, every-Nth-frame cross-check, and fallback.
+        # homography_source reports what produced this frame's H:
+        # "quad" / "aruco" / "stale" / "none".
+        self.quad_enabled = bool(TRACKER_QUAD_ENABLED)
+        self.quad = PlatformQuadTracker(self.WARP_SIZE_PX)
+        self.quad_crosscheck_every_n = max(1, int(TRACKER_QUAD_CROSSCHECK_EVERY_N))
+        self.quad_crosscheck_ball_near_marker_mm = float(
+            TRACKER_QUAD_CROSSCHECK_BALL_NEAR_MARKER_MM
+        )
+        self.homography_source: str = "none"
+        self._prev_ball_cam_px: tuple[float, float] | None = None
 
         # --- Ball detection params ---
         self.min_radius_px = float(TRACKER_MIN_RADIUS_PX)
@@ -289,6 +324,12 @@ class BallTracker:
 
         (bx, by), _radius = ball
 
+        # Camera-space ball position for the quad tracker's exclusion
+        # zone next frame (the ball's silhouette can overlap a boundary
+        # line from the oblique camera).
+        if self.quad_enabled:
+            self._prev_ball_cam_px = self._warp_to_cam_px(H, float(bx), float(by))
+
         cx = self.WARP_SIZE_PX // 2
         cy = self.WARP_SIZE_PX // 2
         mm_per_px = self.PLATFORM_SIZE_MM / self.WARP_SIZE_PX
@@ -305,7 +346,10 @@ class BallTracker:
             return self._miss()
         x_mm, y_mm, vx, vy = filtered
 
-        return BallState(x_mm=x_mm, y_mm=y_mm, vx_mm_s=vx, vy_mm_s=vy)
+        return BallState(
+            x_mm=x_mm, y_mm=y_mm, vx_mm_s=vx, vy_mm_s=vy,
+            raw_x_mm=x_mm_raw, raw_y_mm=y_mm_raw,
+        )
 
     # =========================
     # Internal: loss handling
@@ -319,6 +363,7 @@ class BallTracker:
         its stale pre-loss position (that was a live landmine whenever
         TRACKER_POS_FILTER_ENABLED was turned on)."""
         self.measurement.reset()
+        self._prev_ball_cam_px = None
         return None
 
     # =========================
@@ -326,22 +371,81 @@ class BallTracker:
     # =========================
 
     def _resolve_homography(self, frame: np.ndarray) -> np.ndarray | None:
-        """Return the camera->warp homography for this frame, honoring the
-        redetect cadence and the bounded stale-hold policy."""
+        """Return the camera->warp homography for this frame via the
+        source ladder: quad (LOCKED) -> ArUco -> bounded stale-hold ->
+        miss. Sets homography_source accordingly.
+
+        While the quad is LOCKED it is the source; ArUco runs only every
+        quad_crosscheck_every_n frames to audit it (and to keep the
+        stale-hold cache warm for fallback). While the quad is not
+        locked this is exactly the pre-quad behavior — ArUco every
+        frame — plus seeding the quad's acquisition from each success.
+        The shared gray is computed ONCE here for both consumers."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.quad_enabled and self.quad.state == STATE_LOCKED:
+            h_quad = self.quad.update(gray, self._prev_ball_cam_px)
+            # The audit is SKIPPED while the ball is near a marker:
+            # ArUco is exactly then untrustworthy (the occlusion this
+            # ladder exists to defeat), and a slow marker transit would
+            # otherwise read as persistent disagreement and force a
+            # reacquire FROM the glitched ArUco H (caught in sim).
+            if (
+                self._frame_counter % self.quad_crosscheck_every_n == 0
+                and not self._ball_near_marker()
+            ):
+                h_aruco = self._detect_and_solve(frame, gray)
+                if h_aruco is not None:
+                    self._last_H = h_aruco
+                    self._aruco_hold_count = 0
+                    self._aruco_lost = False
+                    self.quad.notify_aruco_h(h_aruco)
+            # A forced reacquire inside notify_aruco_h drops the lock —
+            # then this frame's quad H is discarded along with it.
+            if h_quad is not None and self.quad.state == STATE_LOCKED:
+                self.homography_source = "quad"
+                return h_quad
+
+        h, source = self._aruco_resolve(frame, gray)
+        self.homography_source = source
+        if self.quad_enabled and h is not None and source == "aruco":
+            # No-op while LOCKED; otherwise one acquisition step.
+            self.quad.seed_from_h(h, gray)
+        return h
+
+    def _ball_near_marker(self) -> bool:
+        """Was the last tracked ball position within the guard radius of
+        any marker center (mm)? Unknown position counts as clear."""
+        r = self.quad_crosscheck_ball_near_marker_mm
+        if r <= 0.0:
+            return False
+        pos = self.measurement.prev_ball_mm
+        if pos is None:
+            return False
+        for world in self.aruco_world_mm.values():
+            if np.hypot(pos[0] - world[0], pos[1] - world[1]) < r:
+                return True
+        return False
+
+    def _aruco_resolve(
+        self, frame: np.ndarray, gray: np.ndarray
+    ) -> tuple[np.ndarray | None, str]:
+        """The ArUco rung: redetect cadence + the bounded stale-hold
+        policy (pre-quad behavior, unchanged). Returns (H, source)."""
         attempt_detect = (
             self._last_H is None
             or self._aruco_lost  # in loss state: try EVERY frame
             or (self._frame_counter % self.aruco_redetect_every_n == 0)
         )
         if not attempt_detect:
-            return self._last_H
+            return self._last_H, "aruco"
 
-        H = self._detect_and_solve(frame)
+        H = self._detect_and_solve(frame, gray)
         if H is not None:
             self._last_H = H
             self._aruco_hold_count = 0
             self._aruco_lost = False
-            return H
+            return H, "aruco"
 
         # Detection failed: serve the cached H for a bounded number of
         # attempts, then invalidate it — never fabricate positions forever.
@@ -351,14 +455,16 @@ class BallTracker:
             and self._aruco_hold_count < self.max_aruco_hold_frames
         ):
             self._aruco_hold_count += 1
-            return self._last_H
+            return self._last_H, "stale"
         self._last_H = None
-        return None
+        return None, "none"
 
-    def _detect_and_solve(self, frame: np.ndarray) -> np.ndarray | None:
-        """One full marker detection + homography solve; None on failure."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
+    def _detect_and_solve(
+        self, frame: np.ndarray, gray: np.ndarray
+    ) -> np.ndarray | None:
+        """One full marker detection + homography solve; None on failure.
+        gray is the caller-computed grayscale of frame (shared with the
+        quad tracker — computed once per frame)."""
         if self.aruco_detect_scale < 0.99:
             gray_detect = cv2.resize(
                 gray, None,
@@ -486,29 +592,24 @@ class BallTracker:
     ) -> np.ndarray:
         """Deadband + scheduled-alpha low-pass on one marker center.
 
-        Motion below the deadband returns the previous filtered center
-        UNCHANGED (H fully static at rest); motion past the fast threshold
-        blends with the fast alpha (real tilt tracks in 1-2 frames);
-        in between the slow alpha smooths drift. A >40 px jump snaps
-        (camera reopen / platform moved)."""
-        current = np.asarray(center_px, dtype=np.float32)
-        prev = self._marker_centers_lp.get(int(marker_id))
-        if prev is None:
-            filt = current
-        else:
-            d = float(np.hypot(*(current - prev)))
-            if d > 40.0:
-                filt = current                      # jump: reset
-            elif d <= self.aruco_center_deadband_px:
-                filt = prev                         # deadband: freeze
-            else:
-                if d >= self.aruco_center_fast_px:
-                    alpha = self.aruco_center_alpha_fast
-                else:
-                    alpha = self.aruco_center_alpha_slow
-                filt = alpha * prev + (1.0 - alpha) * current
-        self._marker_centers_lp[int(marker_id)] = filt
-        return filt
+        Delegates to the shared PointDeadbandLP (cv/measurement_filter.py
+        — the same filter the quad tracker runs on its corners): motion
+        below the deadband returns the previous filtered center UNCHANGED
+        (H fully static at rest); motion past the fast threshold blends
+        with the fast alpha (real tilt tracks in 1-2 frames); in between
+        the slow alpha smooths drift. A >40 px jump snaps (camera reopen
+        / platform moved)."""
+        lp = self._marker_lp.get(int(marker_id))
+        if lp is None:
+            lp = PointDeadbandLP(
+                self.aruco_center_deadband_px,
+                self.aruco_center_fast_px,
+                self.aruco_center_alpha_slow,
+                self.aruco_center_alpha_fast,
+                _CENTER_SNAP_PX,
+            )
+            self._marker_lp[int(marker_id)] = lp
+        return lp.filter(center_px)
 
     # =========================
     # Ball detection
@@ -553,6 +654,23 @@ class BallTracker:
     # =========================
     # Helpers
     # =========================
+
+    @staticmethod
+    def _warp_to_cam_px(
+        h_cam_to_warp: np.ndarray, wx: float, wy: float
+    ) -> tuple[float, float] | None:
+        """Project one warp-px point back to (flipped) camera px."""
+        try:
+            h_inv = np.linalg.inv(np.asarray(h_cam_to_warp, dtype=np.float64))
+        except np.linalg.LinAlgError:
+            return None
+        pt = cv2.perspectiveTransform(
+            np.array([[[wx, wy]]], dtype=np.float64), h_inv
+        )
+        x, y = float(pt[0, 0, 0]), float(pt[0, 0, 1])
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return None
+        return x, y
 
     def mm_to_warp_px(self, x_mm: float, y_mm: float) -> list[float]:
         px_per_mm = self.WARP_SIZE_PX / self.PLATFORM_SIZE_MM

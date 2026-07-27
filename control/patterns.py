@@ -157,6 +157,12 @@ def from_points(
 # Labels state the actual motion envelope (they populate the GUI dropdown,
 # mirroring routines/ROUTINES).
 PATTERNS: dict[str, Callable[[], Path]] = {
+    # r=50 keeps the BALL'S EDGE (~+15-20 mm past its center) clear of
+    # the ArUco inner corners at ~84.85 mm. Rig data 2026-07-23: on the
+    # r=65 circle the ball grazes a marker 4x per lap — tracking-glitch
+    # rate (>4 mm single-frame jumps) tripled near the diagonals and
+    # fed a ~1 Hz path oscillation.
+    "Circle (r=50, marker-safe)": lambda: circle(50.0),
     "Circle (r=65)": circle,
     "Square (diamond, d=140)": square,
     "Heart (~65mm)": heart,
