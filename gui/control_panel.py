@@ -36,6 +36,8 @@ from settings import (
     GUI_LOG_MAX_LINES,
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
+    ORBIT_CONE_OMEGA_MAX_RAD_S,
+    ORBIT_CONE_OMEGA_RAD_S,
     ORBIT_CONE_TILT_DEG,
     ORBIT_CONE_TILT_MAX_DEG,
     ORBIT_CONE_TILT_MIN_DEG,
@@ -112,6 +114,7 @@ class ControlPanel(QWidget):
     orbit_toggled = pyqtSignal(bool)
     orbit_radius_changed = pyqtSignal(float)         # mm
     orbit_cone_tilt_changed = pyqtSignal(float)      # deg
+    orbit_cone_omega_changed = pyqtSignal(float)     # rad/s; 0 = auto
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -464,6 +467,18 @@ class ControlPanel(QWidget):
         )
         self._orbit_tilt_spin.valueChanged.connect(self._on_orbit_tilt_changed)
         orbit_row.addWidget(self._orbit_tilt_spin)
+        self._orbit_omega_spin = QDoubleSpinBox()
+        self._orbit_omega_spin.setRange(0.0, float(ORBIT_CONE_OMEGA_MAX_RAD_S))
+        self._orbit_omega_spin.setSingleStep(0.1)
+        self._orbit_omega_spin.setValue(float(ORBIT_CONE_OMEGA_RAD_S))
+        self._orbit_omega_spin.setSuffix(" rad/s")
+        self._orbit_omega_spin.setSpecialValueText("ω auto")
+        self._orbit_omega_spin.setToolTip(
+            "Cone angular frequency — 0 = auto (derived from tilt + radius "
+            "via the warp-spring physics)"
+        )
+        self._orbit_omega_spin.valueChanged.connect(self._on_orbit_omega_changed)
+        orbit_row.addWidget(self._orbit_omega_spin)
         pg.addLayout(orbit_row)
 
         self._path_status_label = QLabel("path: idle")
@@ -631,8 +646,14 @@ class ControlPanel(QWidget):
     def _on_orbit_tilt_changed(self) -> None:
         self.orbit_cone_tilt_changed.emit(float(self._orbit_tilt_spin.value()))
 
+    def _on_orbit_omega_changed(self) -> None:
+        self.orbit_cone_omega_changed.emit(float(self._orbit_omega_spin.value()))
+
     def orbit_cone_tilt_deg(self) -> float:
         return float(self._orbit_tilt_spin.value())
+
+    def orbit_cone_omega_rad_s(self) -> float:
+        return float(self._orbit_omega_spin.value())
 
     def _on_path_speed_changed(self) -> None:
         mm_s = float(self._path_speed_slider.value())

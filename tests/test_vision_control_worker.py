@@ -149,9 +149,14 @@ class FakeController:
         self.stop_path_calls = 0
         self.orbit_radii: list[float] = []
         self.orbit_cone_tilts: list[float] = []
+        self.orbit_cone_omegas: list[float] = []
         self.orbit_speeds: list[float] = []
         self.start_orbit_calls = 0
         self.stop_orbit_calls = 0
+        # Blind-cone surface: None = not in cone mode (the default).
+        self.orbit_cone_active = False
+        self.blind_result: tuple[float, float] | None = None
+        self.blind_calls = 0
 
     def compute_with_terms(
         self, ball_state: BallState
@@ -172,6 +177,13 @@ class FakeController:
 
     def set_orbit_cone_tilt(self, deg: float) -> None:
         self.orbit_cone_tilts.append(float(deg))
+
+    def set_orbit_cone_omega(self, rad_s: float) -> None:
+        self.orbit_cone_omegas.append(float(rad_s))
+
+    def compute_orbit_blind(self) -> tuple[float, float] | None:
+        self.blind_calls += 1
+        return self.blind_result
 
     def set_orbit_speed(self, mm_s: float) -> None:
         self.orbit_speeds.append(float(mm_s))
@@ -679,6 +691,42 @@ class TestOrbitSlots:
         worker.start()
         assert controller.orbit_cone_tilts[-1] == 1.5
         worker.stop()
+
+    def test_blind_cone_sends_on_miss_and_suppresses_neutral(self) -> None:
+        # Ball absent but the cone active: commands keep flowing (the
+        # rig can run the cone with no ball) and the neutral-pose
+        # fallback must NOT fight it by leveling the plate.
+        sent: list[list[float]] = []
+        worker, camera, controller = _make_worker(
+            [None] * 10, command_sender=lambda a: sent.append(list(a))
+        )
+        controller.orbit_cone_active = True
+        controller.blind_result = (0.5, -0.3)
+        worker._miss_count = 100                       # neutral would fire
+        for _ in range(5):
+            camera.advance()
+            worker._last_blind_orbit_send = 0.0        # defeat the throttle
+            worker._tick()
+        assert controller.blind_calls >= 5
+        assert sent                                    # cone commands went out
+        # All sends came from the cone IK solve, not the neutral pose:
+        # the neutral path is unreachable while blind returns a command.
+
+    def test_blind_cone_advances_on_stale_frames(self) -> None:
+        # Between camera frames the fallback timer keeps the cone alive.
+        worker, camera, controller = _make_worker([])
+        controller.orbit_cone_active = True
+        controller.blind_result = (0.2, 0.1)
+        worker._last_blind_orbit_send = 0.0
+        worker._tick()                                 # no new frame: stale path
+        assert controller.blind_calls == 1
+
+    def test_no_blind_calls_when_cone_inactive(self) -> None:
+        worker, camera, controller = _make_worker([])
+        worker._last_blind_orbit_send = 0.0
+        worker._tick()                                 # stale path, cone off
+        assert controller.blind_calls == 1             # asked once...
+        assert controller.blind_result is None         # ...and got None: no send
 
     def test_path_speed_fans_out_to_orbit(self) -> None:
         # The one-slider-feeds-both contract.

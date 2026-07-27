@@ -392,7 +392,7 @@ ORBIT_ENTRAIN_MIN_RADIUS_MM = 15.0  # entrain radius floor (atan2 stability)
 # instability; "feedback demoted to trim" is achieved by the ff+table
 # carrying the drive, not by weakening the corrector.
 ORBIT_FB_GAIN_SCALE = 1.0
-ORBIT_FF_TILT_MAX_DEG = 4.5       # ff vector-norm cap (analytic + learned;
+ORBIT_FF_TILT_MAX_DEG = 8.5       # ff vector-norm cap (analytic + learned;
 #                                   must clear ORBIT_CONE_TILT_MAX_DEG —
 #                                   1.5 silently truncated the cone)
 ORBIT_ILC_BINS = 24               # per-phase correction bins (15 deg/bin)
@@ -462,7 +462,14 @@ ORBIT_CONE_ONLY = True
 # spinbox (ORBIT_CONE_TILT_MIN/MAX bounds).
 ORBIT_CONE_TILT_DEG = 2.0
 ORBIT_CONE_TILT_MIN_DEG = 0.25
-ORBIT_CONE_TILT_MAX_DEG = 4.0
+ORBIT_CONE_TILT_MAX_DEG = 8.0     # rig ask; the vision tilt clamp is 10
+# Manual angular-frequency override, rad/s. 0 = AUTO (derived from the
+# tilt + dialed radius via the warp-spring physics). Manual values may
+# sit on either side of the warp resonance (~0.97 rad/s): above it the
+# ball rides anti-phase, below it in-phase; near it the predicted ring
+# blows up (display capped at the platform edge).
+ORBIT_CONE_OMEGA_RAD_S = 0.0
+ORBIT_CONE_OMEGA_MAX_RAD_S = 6.0
 ORBIT_CONE_WARP_C = 0.0055        # rig-measured bowl coefficient (deg/mm)
 # Center corrector — the ONLY feedback in cone mode, and it acts on
 # the per-lap AVERAGE ball position (the orbit center), never the

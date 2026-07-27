@@ -35,6 +35,7 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    ORBIT_CONE_OMEGA_RAD_S,
     ORBIT_CONE_TILT_DEG,
     ORBIT_RADIUS_MM,
     PATH_SPEED_MM_S,
@@ -175,6 +176,10 @@ class VisionControlWorker(QtCore.QObject):
         # never cached.
         self._orbit_radius_init = float(ORBIT_RADIUS_MM)
         self._orbit_cone_tilt_init = float(ORBIT_CONE_TILT_DEG)
+        self._orbit_cone_omega_init = float(ORBIT_CONE_OMEGA_RAD_S)
+        # Blind-cone send throttle (cone runs without the ball, driven
+        # by the fallback QTimer between/without camera frames).
+        self._last_blind_orbit_send = 0.0
 
         self._timer: QtCore.QTimer | None = None
         self._running = False
@@ -284,6 +289,7 @@ class VisionControlWorker(QtCore.QObject):
             self.ball_controller.set_orbit_radius(self._orbit_radius_init)
             self.ball_controller.set_orbit_speed(self._path_speed_init)
             self.ball_controller.set_orbit_cone_tilt(self._orbit_cone_tilt_init)
+            self.ball_controller.set_orbit_cone_omega(self._orbit_cone_omega_init)
 
         # Event-driven tick: every published frame nudges _tick via the
         # queued _frame_arrived bridge (the QTimer below stays as the
@@ -496,6 +502,12 @@ class VisionControlWorker(QtCore.QObject):
         if self.ball_controller is not None:
             self.ball_controller.set_orbit_cone_tilt(float(deg))
 
+    @QtCore.pyqtSlot(float)
+    def set_orbit_cone_omega(self, rad_s: float) -> None:
+        self._orbit_cone_omega_init = float(rad_s)
+        if self.ball_controller is not None:
+            self.ball_controller.set_orbit_cone_omega(float(rad_s))
+
     # ------------------------------------------------------------------
     # Inner loop
     # ------------------------------------------------------------------
@@ -523,9 +535,13 @@ class VisionControlWorker(QtCore.QObject):
         self._counter += 1
 
         try:
-            # Stale frame: no new frame since last processed — skip silently.
-            # Do NOT reset controller state or advance miss count.
+            # Stale frame: no new frame since last processed — skip
+            # silently (no controller reset, no miss count). The BLIND
+            # cone still advances here: the fallback QTimer drives it
+            # between (or entirely without) camera frames, so the cone
+            # is smooth and camera-independent.
             if not self.camera.has_new_frame(self._last_frame_ts):
+                self._maybe_send_blind_orbit()
                 return
 
             # Single-pass read+flip into a reusable buffer. The two
@@ -573,10 +589,15 @@ class VisionControlWorker(QtCore.QObject):
                 self._was_missing = True
                 self._valid_streak = 0
 
-                # Neutral-pose fallback: on sustained ball loss, level the
-                # platform (throttled). This is the SAFETY action — it runs
-                # outside the reacquire gate and needs no tracking_valid.
-                self._maybe_send_neutral()
+                # Blind cone: with the ball absent the open-loop cone
+                # KEEPS RUNNING (rig testing without a ball). The
+                # neutral-pose safety fallback is suppressed while it
+                # does — leveling the plate would fight the cone.
+                if not self._maybe_send_blind_orbit():
+                    # Neutral-pose fallback: on sustained ball loss,
+                    # level the platform (throttled). The SAFETY action —
+                    # runs outside the reacquire gate.
+                    self._maybe_send_neutral()
 
                 timings_ms = self._build_miss_timings(t0, t1, loop_start, latest_ts)
                 h_source, quad_corners, quad_diag = self._quad_telemetry()
@@ -772,6 +793,43 @@ class VisionControlWorker(QtCore.QObject):
                         "sides": [dict(s) for s in d.get("sides", [])],
                     }
         return str(bt.homography_source), corners, diag_out
+
+    # ------------------------------------------------------------------
+    # Blind cone (orbit without the ball)
+    # ------------------------------------------------------------------
+
+    def _maybe_send_blind_orbit(self) -> bool:
+        """Advance and send the open-loop cone with no ball data.
+
+        Returns True when the cone is active (whether or not a command
+        went out this tick — the throttle bounds the send rate to
+        ~60 Hz; the streaming serial writer is latest-wins, and the T
+        protocol's 0.1-deg grid keeps the motion smooth)."""
+        ctrl = self.ball_controller
+        if ctrl is None:
+            return False
+        now = time.perf_counter()
+        if (now - self._last_blind_orbit_send) < (1.0 / 60.0):
+            return ctrl.orbit_cone_active
+        blind = ctrl.compute_orbit_blind()
+        if blind is None:
+            return False
+        self._last_blind_orbit_send = now
+        roll_cmd, pitch_cmd = blind
+        z = self._z_setpoint
+        ik_result = self._ik.solve(
+            Pose(x=0.0, y=0.0, z=z, roll=roll_cmd, pitch=pitch_cmd, yaw=0.0),
+            self._prev_arm_points,
+        )
+        if ik_result.success and self._command_sender is not None:
+            self._prev_arm_points = ik_result.arm_points
+            try:
+                self._command_sender(
+                    [float(a) for a in ik_result.servo_angles_deg]
+                )
+            except Exception as exc:
+                self.error.emit(f"blind orbit send failed: {exc}")
+        return True
 
     # ------------------------------------------------------------------
     # Neutral-pose fallback

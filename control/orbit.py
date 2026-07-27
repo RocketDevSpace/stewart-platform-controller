@@ -75,6 +75,8 @@ import numpy as np
 from settings import (
     ORBIT_CONE_CENTER_GAIN,
     ORBIT_CONE_DC_CLAMP_DEG,
+    ORBIT_CONE_OMEGA_MAX_RAD_S,
+    ORBIT_CONE_OMEGA_RAD_S,
     ORBIT_CONE_ONLY,
     ORBIT_CONE_TILT_DEG,
     ORBIT_CONE_TILT_MAX_DEG,
@@ -163,6 +165,7 @@ class HarmonicOrbit:
         self.cone_warp_c = float(ORBIT_CONE_WARP_C)
         self.cone_center_gain = float(ORBIT_CONE_CENTER_GAIN)
         self.cone_dc_clamp_deg = float(ORBIT_CONE_DC_CLAMP_DEG)
+        self.cone_omega_rad_s = float(ORBIT_CONE_OMEGA_RAD_S)  # 0 = auto
         self._cone_amp = 0.0
         self._center_x = 0.0     # slow EMA of the ball = orbit center
         self._center_y = 0.0
@@ -234,6 +237,13 @@ class HarmonicOrbit:
         slews to the new amplitude at the spin-up rate."""
         self.cone_tilt_deg = max(
             ORBIT_CONE_TILT_MIN_DEG, min(ORBIT_CONE_TILT_MAX_DEG, float(deg))
+        )
+
+    def set_cone_omega(self, rad_s: float) -> None:
+        """Live angular-frequency override (GUI spinbox); 0 = auto
+        (derived from tilt + radius via the warp-spring physics)."""
+        self.cone_omega_rad_s = max(
+            0.0, min(ORBIT_CONE_OMEGA_MAX_RAD_S, float(rad_s))
         )
 
     @property
@@ -468,33 +478,62 @@ class HarmonicOrbit:
     # Cone mode (open loop)
     # ------------------------------------------------------------------
 
+    def update_blind(self, g_eff: float) -> OrbitCommand:
+        """Cone step with NO ball: self-seeds if needed, advances the
+        cone, HOLDS the center corrector (no data to estimate a center
+        from), and reports the expected ball point. Lets the rig run
+        and inspect the cone with the ball off the platform, and keeps
+        the motion continuous between camera frames."""
+        g_eff = max(1.0, float(g_eff))
+        if self._state == STATE_IDLE or not self.cone_only:
+            return OrbitCommand(0.0, 0.0, (0.0, 0.0), (0.0, 0.0), 0.0)
+        if not self._seeded:
+            self._phi = 0.0
+            self._cone_amp = 0.0
+            self._center_x = 0.0
+            self._center_y = 0.0
+            self._dc_x = 0.0
+            self._dc_y = 0.0
+            self._seeded = True
+            self._last_t = self._clock()
+        return self._cone_step(None, None, g_eff)
+
     def _update_cone(
         self, ball_x: float, ball_y: float, g_eff: float
+    ) -> OrbitCommand:
+        return self._cone_step(ball_x, ball_y, g_eff)
+
+    def _cone_step(
+        self, ball_x: float | None, ball_y: float | None, g_eff: float
     ) -> OrbitCommand:
         """Pure open-loop cone: tilt vector of amplitude cone_tilt_deg
         rotating at omega = sqrt(g_eff*(warp_c + A/R)) — the plate's
         bowl warp acts as a central spring (omega_n^2 = g*warp_c), so
-        the driven orbit radius is g*A/(omega^2 - omega_n^2), ridden
-        anti-phase (driving above the warp resonance). The BALL input
-        is unused for control — feedback is off (feedback_scale 0);
-        the reported target is the physics-expected ball point for the
-        overlay and the err telemetry only."""
+        the driven orbit radius is g*A/|omega^2 - omega_n^2|, ridden
+        anti-phase above the warp resonance and in-phase below it. A
+        manual cone_omega_rad_s (> 0) overrides the derived rate. The
+        BALL input (None when running blind) never steers the cone —
+        feedback is off; it only feeds the slow center corrector and
+        the err telemetry."""
         now = self._clock()
         prev_t = self._last_t if self._last_t is not None else now
         dt = min(0.1, max(1e-4, now - prev_t))
         self._last_t = now
 
-        omega = math.sqrt(
-            g_eff * (
-                self.cone_warp_c
-                + self.cone_tilt_deg / max(20.0, self._r_target)
+        if self.cone_omega_rad_s > 0.0:
+            omega = self.cone_omega_rad_s
+        else:
+            omega = math.sqrt(
+                g_eff * (
+                    self.cone_warp_c
+                    + self.cone_tilt_deg / max(20.0, self._r_target)
+                )
             )
-        )
         # Amplitude ramp over the spin-up window (the plate eases into
         # the cone; the expected ring grows with it).
         rate = self.cone_tilt_deg / max(0.5, self.spinup_s)
         self._slew_toward(self.cone_tilt_deg, "_cone_amp", rate, dt)
-        if self._cone_amp >= self.cone_tilt_deg - 1e-9:
+        if abs(self._cone_amp - self.cone_tilt_deg) <= 1e-9:
             self._state = STATE_CONE
         else:
             self._state = STATE_ENTRAIN
@@ -512,28 +551,43 @@ class HarmonicOrbit:
         # steers the center back to the origin; without it a residual
         # trim bias of 0.3 deg parks the center ~50 mm off through the
         # weak warp spring (sim-caught: the orbit drifted off-platform).
-        lap_period = _TWO_PI / max(omega, 1e-3)
-        ema_alpha = dt / max(1.5 * lap_period, 1.0)
-        self._center_x += ema_alpha * (ball_x - self._center_x)
-        self._center_y += ema_alpha * (ball_y - self._center_y)
-        self._dc_x -= self.cone_center_gain * self._center_x * dt
-        self._dc_y -= self.cone_center_gain * self._center_y * dt
-        dc_mag = math.hypot(self._dc_x, self._dc_y)
-        if dc_mag > self.cone_dc_clamp_deg:
-            scale = self.cone_dc_clamp_deg / dc_mag
-            self._dc_x *= scale
-            self._dc_y *= scale
+        # Running blind (no ball) both the estimate and the correction
+        # HOLD their last values.
+        if ball_x is not None and ball_y is not None:
+            lap_period = _TWO_PI / max(omega, 1e-3)
+            ema_alpha = dt / max(1.5 * lap_period, 1.0)
+            self._center_x += ema_alpha * (ball_x - self._center_x)
+            self._center_y += ema_alpha * (ball_y - self._center_y)
+            self._dc_x -= self.cone_center_gain * self._center_x * dt
+            self._dc_y -= self.cone_center_gain * self._center_y * dt
+            dc_mag = math.hypot(self._dc_x, self._dc_y)
+            if dc_mag > self.cone_dc_clamp_deg:
+                scale = self.cone_dc_clamp_deg / dc_mag
+                self._dc_x *= scale
+                self._dc_y *= scale
 
         ff = (
             self._cone_amp * math.cos(self._phi) + self._dc_x,
             self._cone_amp * math.sin(self._phi) + self._dc_y,
         )
-        denom = max(1e-6, omega * omega - g_eff * self.cone_warp_c)
-        r_exp = g_eff * self._cone_amp / denom
+        # Predicted ring: anti-phase above the warp resonance, in-phase
+        # below; near the resonance the linear prediction diverges —
+        # display-capped at the platform edge.
+        denom = omega * omega - g_eff * self.cone_warp_c
+        if abs(denom) < 1e-3:
+            r_exp = 120.0
+            anti_phase = True
+        else:
+            r_exp = min(120.0, g_eff * self._cone_amp / abs(denom))
+            anti_phase = denom > 0.0
         self._r = r_exp
-        tx = -r_exp * math.cos(self._phi)       # anti-phase to the tilt
-        ty = -r_exp * math.sin(self._phi)
-        err = abs(math.hypot(ball_x, ball_y) - r_exp)
+        sign = -1.0 if anti_phase else 1.0
+        tx = sign * r_exp * math.cos(self._phi)
+        ty = sign * r_exp * math.sin(self._phi)
+        if ball_x is not None and ball_y is not None:
+            err = abs(math.hypot(ball_x, ball_y) - r_exp)
+        else:
+            err = 0.0
         self._last_err_mm = err
         self._last_ff_deg = self._cone_amp
         self._last_ilc_deg = math.hypot(self._dc_x, self._dc_y)

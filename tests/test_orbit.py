@@ -467,15 +467,54 @@ class TestConeMode:
                + cmd.ff_deg[1] * cmd.target_y_mm) / (ff_mag * t_mag)
         assert dot == pytest.approx(-1.0, abs=1e-9)  # ball rides opposite
 
-    def test_set_cone_tilt_clamps_and_applies_live(self) -> None:
+    def test_set_cone_tilt_and_omega_clamp_and_apply_live(self) -> None:
+        from settings import (
+            ORBIT_CONE_OMEGA_MAX_RAD_S,
+            ORBIT_CONE_TILT_MAX_DEG,
+            ORBIT_CONE_TILT_MIN_DEG,
+        )
         clock = FakeClock()
         o = self._cone(clock)
-        o.set_cone_tilt(10.0)
-        assert o.cone_tilt_deg == pytest.approx(4.0)  # max clamp
+        o.set_cone_tilt(99.0)
+        assert o.cone_tilt_deg == pytest.approx(ORBIT_CONE_TILT_MAX_DEG)
         o.set_cone_tilt(0.01)
-        assert o.cone_tilt_deg == pytest.approx(0.25)  # min clamp
+        assert o.cone_tilt_deg == pytest.approx(ORBIT_CONE_TILT_MIN_DEG)
         o.set_cone_tilt(2.5)
         assert o.cone_tilt_deg == pytest.approx(2.5)
+        o.set_cone_omega(99.0)
+        assert o.cone_omega_rad_s == pytest.approx(ORBIT_CONE_OMEGA_MAX_RAD_S)
+        o.set_cone_omega(0.0)
+        assert o.cone_omega_rad_s == 0.0               # 0 = auto
+
+    def test_manual_omega_overrides_physics(self) -> None:
+        clock = FakeClock()
+        o = self._cone(clock)
+        o.set_cone_omega(3.5)
+        o.start()
+        o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        clock.advance(DT)
+        o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        assert o.telemetry()["orbit_omega"] == pytest.approx(3.5)
+
+    def test_blind_update_self_seeds_and_advances(self) -> None:
+        # No ball at all: start + blind updates alone must produce the
+        # rotating tilt (the rig runs the cone with the ball off).
+        clock = FakeClock()
+        o = self._cone(clock)
+        o.start()
+        ffs = []
+        for _ in range(int(6.0 / DT)):
+            clock.advance(DT)
+            cmd = o.update_blind(G_EFF)
+            ffs.append(cmd.ff_deg)
+        assert o.state == STATE_CONE
+        assert math.hypot(*ffs[-1]) == pytest.approx(o.cone_tilt_deg, abs=1e-9)
+        # The tilt direction rotated (not a frozen vector).
+        a0 = math.atan2(ffs[-30][1], ffs[-30][0])
+        a1 = math.atan2(ffs[-1][1], ffs[-1][0])
+        assert abs(a1 - a0) > 0.5
+        # The center corrector held at zero (no data, no drift).
+        assert o._dc_x == 0.0 and o._dc_y == 0.0
 
     def test_feedback_off_and_integral_frozen(self) -> None:
         clock = FakeClock()

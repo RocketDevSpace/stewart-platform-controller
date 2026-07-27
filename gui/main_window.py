@@ -53,6 +53,7 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    ORBIT_CONE_OMEGA_RAD_S,
     ORBIT_CONE_TILT_DEG,
     ORBIT_RADIUS_MM,
     PATH_SPEED_MM_S,
@@ -94,6 +95,7 @@ class MainWindow(QWidget):
     vision_orbit_set = QtCore.pyqtSignal(bool)
     vision_orbit_radius_updated = QtCore.pyqtSignal(float)
     vision_orbit_cone_tilt_updated = QtCore.pyqtSignal(float)
+    vision_orbit_cone_omega_updated = QtCore.pyqtSignal(float)
     vision_snapshot_consumed = QtCore.pyqtSignal()
 
     def __init__(self) -> None:
@@ -178,6 +180,7 @@ class MainWindow(QWidget):
         self._orbit_active = False
         self._orbit_radius_mm = float(ORBIT_RADIUS_MM)
         self._orbit_cone_tilt_deg = float(ORBIT_CONE_TILT_DEG)
+        self._orbit_cone_omega_rad_s = float(ORBIT_CONE_OMEGA_RAD_S)
 
         # --- Routine timer ---
         self._routine_timer = QtCore.QTimer()
@@ -231,6 +234,9 @@ class MainWindow(QWidget):
         )
         self.control_panel.orbit_cone_tilt_changed.connect(
             self._on_orbit_cone_tilt_changed
+        )
+        self.control_panel.orbit_cone_omega_changed.connect(
+            self._on_orbit_cone_omega_changed
         )
         self.control_panel.path_speed_changed.connect(
             self._on_path_speed_changed
@@ -810,6 +816,7 @@ class MainWindow(QWidget):
         self._orbit_radius_mm = float(radius_mm)
         self.vision_orbit_radius_updated.emit(self._orbit_radius_mm)
         self.vision_orbit_cone_tilt_updated.emit(self._orbit_cone_tilt_deg)
+        self.vision_orbit_cone_omega_updated.emit(self._orbit_cone_omega_rad_s)
         if self._orbit_active:
             ring = circle(radius_mm=self._orbit_radius_mm)
             self._vision_monitor.set_path_overlay(ring.points, ring.closed)
@@ -817,6 +824,10 @@ class MainWindow(QWidget):
     def _on_orbit_cone_tilt_changed(self, deg: float) -> None:
         self._orbit_cone_tilt_deg = float(deg)
         self.vision_orbit_cone_tilt_updated.emit(self._orbit_cone_tilt_deg)
+
+    def _on_orbit_cone_omega_changed(self, rad_s: float) -> None:
+        self._orbit_cone_omega_rad_s = float(rad_s)
+        self.vision_orbit_cone_omega_updated.emit(self._orbit_cone_omega_rad_s)
 
     # ------------------------------------------------------------------
     # Vision mode enable / disable
@@ -942,6 +953,9 @@ class MainWindow(QWidget):
         self.vision_orbit_cone_tilt_updated.connect(
             self._vision_worker.set_orbit_cone_tilt
         )
+        self.vision_orbit_cone_omega_updated.connect(
+            self._vision_worker.set_orbit_cone_omega
+        )
         self.vision_snapshot_consumed.connect(
             self._vision_worker.mark_snapshot_consumed
         )
@@ -1002,6 +1016,8 @@ class MainWindow(QWidget):
              self._vision_worker.set_orbit_radius),
             (self.vision_orbit_cone_tilt_updated,
              self._vision_worker.set_orbit_cone_tilt),
+            (self.vision_orbit_cone_omega_updated,
+             self._vision_worker.set_orbit_cone_omega),
             (self.vision_snapshot_consumed,
              self._vision_worker.mark_snapshot_consumed),
         ]:

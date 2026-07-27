@@ -198,6 +198,12 @@ class BallController:
     def orbit_active(self) -> bool:
         return self._orbit.active
 
+    @property
+    def orbit_cone_active(self) -> bool:
+        """True when the open-loop cone is running (the only mode that
+        may run blind, i.e. without the ball)."""
+        return self._orbit.active and self._orbit.cone_only
+
     # ---------------------------
     # Gains / limits
     # ---------------------------
@@ -439,6 +445,27 @@ class BallController:
 
     def set_orbit_cone_tilt(self, deg: float) -> None:
         self._orbit.set_cone_tilt(float(deg))
+
+    def set_orbit_cone_omega(self, rad_s: float) -> None:
+        self._orbit.set_cone_omega(float(rad_s))
+
+    def compute_orbit_blind(self) -> tuple[float, float] | None:
+        """Cone-mode command with NO ball: lets the rig run and watch
+        the cone with the ball off the platform, and keeps the motion
+        continuous between camera frames. Only the open-loop cone may
+        run blind (every closed-loop mode needs the ball); returns
+        (roll_cmd, pitch_cmd) through the normal PID pipeline (trim +
+        tilt clamp + slew continuity), or None when not applicable."""
+        if not (self.enabled and self._orbit.active and self._orbit.cone_only):
+            return None
+        cmd = self._orbit.update_blind(float(PD_AUTOTUNE_G_EFF))
+        res = self._pd.compute(
+            0.0, 0.0, 0.0, 0.0, self.roll_offset, self.pitch_offset,
+            freeze_integrator=True,
+            ff=cmd.ff_deg,
+            gain_scale=0.0,
+        )
+        return res.roll_cmd, res.pitch_cmd
 
     def start_orbit(self) -> bool:
         """Begin the harmonic orbit. Same exclusion discipline as
