@@ -28,6 +28,7 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path as _FsPath
+from typing import Callable
 
 _REPO_ROOT = str(_FsPath(__file__).resolve().parents[1])
 if _REPO_ROOT not in sys.path:
@@ -36,9 +37,10 @@ if _REPO_ROOT not in sys.path:
 import numpy as np  # noqa: E402
 
 from control.ball_controller import BallController  # noqa: E402
-from control.patterns import PATTERNS, Path  # noqa: E402
+from control.patterns import PATTERNS, Path, circle  # noqa: E402
 from control.plant_model import (  # noqa: E402
     PlantParams,
+    ServoLag,
     apply_rolling_resistance,
     plant_step,
 )
@@ -47,6 +49,7 @@ from cv.measurement_filter import AlphaBetaFilter2D  # noqa: E402
 from settings import (  # noqa: E402
     PD_AUTOTUNE_G_EFF,
     PD_DEFAULT_KD,
+    PD_DEFAULT_KI,
     PD_DEFAULT_KP,
 )
 from tools.jitter_bench import FakeClock  # noqa: E402
@@ -223,6 +226,225 @@ def simulate_path_following(
     )
 
 
+# =====================================================================
+# Harmonic orbit sim (2026-07-27)
+# =====================================================================
+# A richer plant than simulate_path_following's (which stays byte-
+# identical — its pins are frozen): fractional-latency command replay +
+# first-order servo lag (the gain_design._run_closed_loop pattern), on
+# the rig-warp field. Both simulate_orbit and simulate_carrot_circle
+# run through the SAME driver and compute the SAME metrics, so the
+# smoothness A/B is honest.
+
+# servo_tau_s here is a CHOSEN constant (the fit lives in autotune
+# Apply, not persisted); every orbit bound is calibrated against it.
+_ORBIT_PLANT = PlantParams(
+    g_eff=G_EFF,
+    latency_s=2.0 / 30.0,
+    stiction_deg=0.06,
+    warp_c_deg_per_mm=0.0055,
+    bias_roll_deg=0.6,
+    bias_pitch_deg=0.6,
+    servo_tau_s=0.06,
+)
+
+
+@dataclass(frozen=True)
+class OrbitSimResult:
+    """Circle-quality metrics for one closed-loop run (orbit OR carrot
+    follower — same fields, same computation)."""
+    laps: int
+    mean_radius_err_mm: float      # mean |r_ball - R|, last 2 laps
+    radial_ripple_mm: float        # std(r_ball - R), last 2 laps
+    lap_ripple_mm: list[float]     # per-lap std(r_ball - R) (learning curve)
+    tangential_speed_std: float    # std(v . e_t), last 2 laps — smoothness
+    max_err_mm: float              # max tracking error while settled
+    err_trace: list[float]
+
+
+class _CircleMetrics:
+    """Per-lap radius/speed statistics from true ball state."""
+
+    def __init__(self, radius_mm: float) -> None:
+        self._r = float(radius_mm)
+        self._by_lap: dict[int, list[tuple[float, float]]] = {}
+        self.err_trace: list[float] = []
+        self._max_err = 0.0
+
+    def add(
+        self, lap: int, x: float, y: float, vx: float, vy: float,
+        track_err_mm: float, settled: bool,
+    ) -> None:
+        self.err_trace.append(track_err_mm)
+        if not settled:
+            return
+        self._max_err = max(self._max_err, track_err_mm)
+        r = math.hypot(x, y)
+        v_tan = 0.0
+        if r > 1e-6:
+            v_tan = (-y * vx + x * vy) / r
+        self._by_lap.setdefault(int(lap), []).append((r - self._r, v_tan))
+
+    def result(self, min_samples: int = 60) -> OrbitSimResult:
+        laps = sorted(
+            k for k, v in self._by_lap.items() if len(v) >= min_samples
+        )
+        lap_ripple = [
+            float(np.std([s[0] for s in self._by_lap[k]])) for k in laps
+        ]
+        last2 = [s for k in laps[-2:] for s in self._by_lap[k]]
+        if last2:
+            r_errs = np.array([s[0] for s in last2])
+            v_tans = np.array([s[1] for s in last2])
+            mean_r = float(np.mean(np.abs(r_errs)))
+            ripple = float(np.std(r_errs))
+            v_std = float(np.std(v_tans))
+        else:
+            mean_r = ripple = v_std = float("inf")
+        return OrbitSimResult(
+            laps=len(laps),
+            mean_radius_err_mm=mean_r,
+            radial_ripple_mm=ripple,
+            lap_ripple_mm=lap_ripple,
+            tangential_speed_std=v_std,
+            max_err_mm=self._max_err,
+            err_trace=self.err_trace,
+        )
+
+
+def _drive_circle_sim(
+    ctrl: BallController,
+    radius_mm: float,
+    duration_s: float,
+    hz: int,
+    noise_mm: float,
+    seed: int,
+    plant: PlantParams,
+    clock: FakeClock,
+    settled_fn: Callable[[dict, int], bool],
+    lap_fn: Callable[[dict], int],
+    kick_at_s: float | None = None,
+    kick_mm: float = 0.0,
+) -> OrbitSimResult:
+    """Shared closed-loop driver: real filter -> controller chain,
+    fractional-latency command replay + ServoLag, rig-warp plant."""
+    dt = 1.0 / float(hz)
+    steps = int(round(duration_s * hz))
+    rng = random.Random(seed)
+    filt = AlphaBetaFilter2D()
+    metrics = _CircleMetrics(radius_mm)
+
+    x, y, vx, vy = float(radius_mm), 0.0, 0.0, 0.0
+    roll_hist: list[float] = []
+    pitch_hist: list[float] = []
+    lag_roll = ServoLag(plant.servo_tau_s)
+    lag_pitch = ServoLag(plant.servo_tau_s)
+    lat_frames = plant.latency_s / dt   # fractional
+
+    kick_step = (
+        int(round(kick_at_s * hz)) if kick_at_s is not None else None
+    )
+
+    for i in range(steps):
+        clock.t += dt
+        if kick_step is not None and i == kick_step:
+            x += kick_mm
+
+        fx, fy, fvx, fvy = filt.update(
+            x + rng.gauss(0.0, noise_mm),
+            y + rng.gauss(0.0, noise_mm),
+            clock.t,
+        )
+        roll_cmd, pitch_cmd, terms = ctrl.compute_with_terms(
+            BallState(x_mm=fx, y_mm=fy, vx_mm_s=fvx, vy_mm_s=fvy)
+        )
+        roll_hist.append(roll_cmd)
+        pitch_hist.append(pitch_cmd)
+
+        # Fractional-latency lookup on the fixed frame grid, then the
+        # first-order servo lag.
+        k = i - lat_frames
+        if k <= 0:
+            roll_del = pitch_del = 0.0
+        else:
+            k0 = int(k)
+            frac = k - k0
+            k1 = min(k0 + 1, i)
+            roll_del = (1 - frac) * roll_hist[k0] + frac * roll_hist[k1]
+            pitch_del = (1 - frac) * pitch_hist[k0] + frac * pitch_hist[k1]
+        roll_act = lag_roll.step(roll_del, dt)
+        pitch_act = lag_pitch.step(pitch_del, dt)
+
+        err = math.hypot(
+            x - float(terms["target_x_mm"]), y - float(terms["target_y_mm"])
+        )
+        metrics.add(
+            int(lap_fn(terms)), x, y, vx, vy, err, bool(settled_fn(terms, i)),
+        )
+        x, y, vx, vy = plant_step(x, y, vx, vy, roll_act, pitch_act, dt, plant)
+
+    return metrics.result()
+
+
+def simulate_orbit(
+    radius_mm: float = 50.0,
+    speed_mm_s: float = 40.0,
+    duration_s: float = 90.0,
+    hz: int = 30,
+    kp: float = PD_DEFAULT_KP,
+    kd: float = PD_DEFAULT_KD,
+    ki: float = PD_DEFAULT_KI,
+    noise_mm: float = 0.15,
+    seed: int = 0,
+    plant: PlantParams | None = None,
+    kick_at_s: float | None = None,
+    kick_mm: float = 0.0,
+) -> OrbitSimResult:
+    """Closed-loop harmonic-orbit run on the rig-warp + servo-lag plant."""
+    clock = FakeClock()
+    ctrl = BallController(kp=kp, kd=kd, ki=ki, clock=clock)
+    ctrl.set_orbit_radius(radius_mm)
+    ctrl.set_orbit_speed(speed_mm_s)
+    ctrl.start_orbit()
+    return _drive_circle_sim(
+        ctrl, radius_mm, duration_s, hz, noise_mm, seed,
+        plant if plant is not None else _ORBIT_PLANT, clock,
+        settled_fn=lambda terms, i: terms["orbit_state"] == "track",
+        lap_fn=lambda terms: terms["orbit_lap"],
+        kick_at_s=kick_at_s, kick_mm=kick_mm,
+    )
+
+
+def simulate_carrot_circle(
+    radius_mm: float = 50.0,
+    speed_mm_s: float = 40.0,
+    duration_s: float = 90.0,
+    hz: int = 30,
+    kp: float = PD_DEFAULT_KP,
+    kd: float = PD_DEFAULT_KD,
+    ki: float = PD_DEFAULT_KI,
+    noise_mm: float = 0.15,
+    seed: int = 0,
+    plant: PlantParams | None = None,
+) -> OrbitSimResult:
+    """The carrot path follower on circle(radius_mm), through the SAME
+    driver/plant/metrics as simulate_orbit — the honest smoothness A/B.
+    "Settled" = past a 5 s pursuit spin-up (the follower has no state
+    machine to gate on)."""
+    clock = FakeClock()
+    ctrl = BallController(kp=kp, kd=kd, ki=ki, clock=clock)
+    ctrl.set_path(circle(radius_mm=radius_mm))
+    ctrl.set_path_speed(speed_mm_s)
+    ctrl.start_path()
+    settle_steps = 5 * hz
+    return _drive_circle_sim(
+        ctrl, radius_mm, duration_s, hz, noise_mm, seed,
+        plant if plant is not None else _ORBIT_PLANT, clock,
+        settled_fn=lambda terms, i: i >= settle_steps,
+        lap_fn=lambda terms: terms["path_lap"],
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -257,7 +479,29 @@ def main(argv: list[str] | None = None) -> int:
         "--warp-bias-pitch", type=float, default=0.0,
         help="constant pitch tilt error, deg (stale trim)",
     )
+    parser.add_argument(
+        "--orbit", action="store_true",
+        help="run the harmonic-orbit A/B (orbit vs carrot follower on "
+             "the rig-warp + servo-lag plant) instead of the path sweep",
+    )
+    parser.add_argument(
+        "--radius", type=float, default=50.0, help="orbit radius, mm"
+    )
     args = parser.parse_args(argv)
+
+    if args.orbit:
+        speeds = [float(s) for s in args.speed.split(",")]
+        print(f"=== orbit A/B: r={args.radius:g} mm, {args.duration:g} s ===")
+        for v in speeds:
+            o = simulate_orbit(args.radius, v, args.duration)
+            c = simulate_carrot_circle(args.radius, v, args.duration)
+            print(
+                f"v={v:5.1f}  orbit: laps {o.laps} ripple "
+                f"{o.radial_ripple_mm:5.2f} mm vstd {o.tangential_speed_std:6.2f}"
+                f"   carrot: laps {c.laps} ripple {c.radial_ripple_mm:5.2f} "
+                f"mm vstd {c.tangential_speed_std:6.2f}"
+            )
+        return 0
 
     path = PATTERNS[args.pattern]()
     speeds = [float(s) for s in args.speed.split(",")]
