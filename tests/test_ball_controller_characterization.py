@@ -122,6 +122,19 @@ TERMS_KEYS = frozenset({
     "pd_autotune_plant_stiction_deg",
     "pd_autotune_predict_s",
     "pd_autotune_predicted_cost",
+    # ADDED 2026-07-27 (harmonic orbit): additive telemetry from the
+    # feedforward-driven smooth-circle mode; all earlier keys stay frozen.
+    "orbit_active",
+    "orbit_state",
+    "orbit_phase",
+    "orbit_omega",
+    "orbit_r_mm",
+    "orbit_err_mm",
+    "orbit_ff_deg",
+    "orbit_ilc_deg",
+    "orbit_lap",
+    "orbit_recover_count",
+    "orbit_learning",
     "target_x_mm",
     "target_y_mm",
 })
