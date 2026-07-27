@@ -547,13 +547,21 @@ class HarmonicOrbit:
         # Center corrector (the only feedback here): the orbit center
         # is the slow EMA of the ball position — the rotating component
         # averages out over a lap, so this cannot react to (or jitter
-        # against) the orbital motion itself. A weak DC tilt integrator
-        # steers the center back to the origin; without it a residual
-        # trim bias of 0.3 deg parks the center ~50 mm off through the
-        # weak warp spring (sim-caught: the orbit drifted off-platform).
-        # Running blind (no ball) both the estimate and the correction
-        # HOLD their last values.
-        if ball_x is not None and ball_y is not None:
+        # against) the orbital motion itself. INTEGRAL-ONLY and slow by
+        # design: the center is itself a weakly damped oscillator at
+        # the warp frequency (~1 rad/s), and any faster/proportional
+        # feedback through the estimator's lag turns into NEGATIVE
+        # damping and pumps it (sim-caught: a P term at the physically
+        # "correct" gain flung the center off exponentially). Engaged
+        # only once the cone is fully spun up (rig-caught: estimating
+        # during the spiral-out transient poisons the center estimate
+        # and the correction chases it — the logged orbit ran clean
+        # 47-49 mm circles around a 13-26 mm wandering center).
+        # Running blind (no ball) everything HOLDS.
+        if (
+            ball_x is not None and ball_y is not None
+            and self._state == STATE_CONE
+        ):
             lap_period = _TWO_PI / max(omega, 1e-3)
             ema_alpha = dt / max(1.5 * lap_period, 1.0)
             self._center_x += ema_alpha * (ball_x - self._center_x)
