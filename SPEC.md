@@ -543,6 +543,51 @@ unreachable (max center excursion ~85 mm).
 
 ---
 
+### 2026-07-27 Harmonic Orbit — Feedforward-Driven Smooth Circles
+**Status:** Implemented (branch `rework/autotune-id`); merge gated on
+the rig session
+
+**Why:** carrot path-following circles remain visibly janky — the
+pacing law couples tracking error into reference speed. Hudson's ask:
+a predefined smooth periodic platform motion tuned to the plant that
+carries the ball around the circle, with only micro-corrections. A
+SEPARATE mode; path following is preserved unchanged.
+
+**Contract:**
+1. `control/orbit.py::HarmonicOrbit`: clock-driven reference at
+   omega = v/R (no error pacing), analytic feedforward (rotating
+   centripetal tilt, phase-advanced by the actuation delay ~ predict_s)
+   + a learned 24-bin per-phase correction table (ILC) that absorbs
+   the plate-specific periodic disturbances (warp ~0.28 deg at r=50 >
+   the 0.19 deg analytic term). Learning: one Gaussian-kernel write
+   per bin transit, gamma = kp_eff − omega²/g_eff, leak + clamp +
+   per-lap smoothing; omega soft-clamped below 0.85x the scaled-gain
+   resonance.
+2. States: entrain (seed at the ball, 4 s spin-up) → track (learning;
+   integral FROZEN — it owns DC only during entrain/recover) → recover
+   (>30 mm for 10 frames: table frozen, re-entrain — never drag).
+3. Feedback trim: `PIDCore.compute(gain_scale=0.5)` (p/d only); same
+   override-channel + mutual-exclusion discipline as path following;
+   rest suppressed; stop = motion-free transfer.
+4. GUI: Harmonic Orbit toggle + radius spinbox (30–70 mm) in the Path
+   Following group; speed = the shared Path Speed slider; reference
+   ring overlay; "orbit: track · lap N · err · ilc" status.
+
+**Acceptance criteria:**
+- Sim gates (526 passed): ILC convergence arbiter (lap RMS 15→1.5 mm,
+  harmonics clean); A/B on the shared rig-warp + servo-lag plant —
+  orbit mean radius error < 0.5x the carrot's (measured 1.9 vs
+  7.0 mm) and tangential speed std < 0.85x (0.38 vs 0.55 mm/s);
+  20/40 mm kick recovery; determinism; exclusion edges; TERMS
+  amendment ✅
+- Rig session (gates the PR): enable Harmonic Orbit at r=50 → ball
+  spirals out over ~4 s and laps continuously; the status error
+  visibly SHRINKS over the first ~5 laps (the table learning); a light
+  nudge re-converges smoothly with no lurch; motion history visibly
+  smoother than Follow Path on the same circle — pending
+
+---
+
 ## Future Features (not scheduled)
 
 ### Multi-Camera Ball Tracking

@@ -480,6 +480,61 @@ cross-check, and fallback.
   boundary holds corners < 1 px; gray-on-gray falls to "aruco" and
   relocks; the flat legacy `_scene` has no boundary so every existing
   test still exercises the pure ArUco path (asserted explicitly).
+- Rig-feedback hardening (same day): acquisition diagnostics (per-side
+  fail reasons with the MEASURED edge gradient, predicted/fitted quad
+  overlay, `[TRACK]` log lines) after the quad silently never locked;
+  and the BASELINE-RELATIVE cross-check after a metronomic ~1.5 s
+  unlock/relock cycle — ArUco's 2x boundary extrapolation is
+  structurally wrong on a real lens, so the audit now alarms on CHANGE
+  from the lock-time residual (slow blend on passes; raw > 25 px is a
+  hard identity-slip strike), with the audit disagreement surfaced
+  on-screen.
+
+### Harmonic orbit — feedforward-driven smooth circles (2026-07-27)
+
+A SEPARATE mode from carrot path following (which is preserved
+unchanged): the reference is CLOCK-driven at constant angular rate —
+the pacing law's error->speed coupling is the circle jank source — the
+platform plays a smooth rotating tilt tuned to the plant, and feedback
+is demoted to a trim role.
+
+#### Added
+- `control/orbit.py` — `HarmonicOrbit`: analytic feedforward
+  (centripetal tilt omega^2*r/g_eff as a rotating vector, phase-
+  advanced by the actuation delay; tangential term during spin-up) +
+  the mode's heart, a LEARNED per-phase correction table (iterative
+  learning control, 24 bins) that absorbs the plate-specific
+  disturbances — the bowl warp needs ~0.28 deg at r=50, dwarfing the
+  0.19 deg analytic term, and it is periodic at orbit frequency.
+  States: entrain (seed at the ball's angle/radius, ramp over 4 s —
+  pick the ball up, never drag) -> track (learning) -> recover (error
+  tripwire re-entrains with the table frozen). Update law
+  `delta_c = mu*gamma*(ref-ball)`, `gamma = kp_eff - omega^2/g_eff`
+  (the in-phase inverse of the closed-loop map; feedback-dominated at
+  these gains). Three sim-caught failure modes made structural:
+  bin-transit writes + a Gaussian write kernel band-limit learning
+  below the scaled-gain resonance (point-writes pumped sign-flipped
+  harmonics n>=3 to divergence); the integral runs only in
+  entrain/recover and freezes for all of track (running, it out-gains
+  the scaled P-term at orbit frequency with 90 deg lag and fights the
+  table; frozen mid-chase, it snapshots a bogus DC).
+- `PIDCore.compute(gain_scale=...)` — scales P/D only; default 1.0 is
+  bit-identical (pinned).
+- BallController wiring: same override-channel discipline as the path
+  follower, all mode exclusions pairwise, rest suppressed, 11 additive
+  `orbit_*` terms keys (dated TERMS amendment).
+- `tools/path_sim.py`: `simulate_orbit` + `simulate_carrot_circle` on
+  a richer shared plant (fractional latency + servo lag + rig warp;
+  `simulate_path_following` stays byte-identical). Measured A/B at
+  r=50 v=40: orbit lap-ripple learning curve 7.3 -> 0.8 mm, converged
+  mean radius error 1.9 mm vs the carrot's 7.0 mm (the bowl pulls the
+  carrot inside the circle and the pacing law cannot see radius
+  error); tangential speed std 0.38 vs 0.55 mm/s. Kicks: 20 mm
+  absorbed, 40 mm re-converges. All pinned (tests/test_orbit_sim.py).
+- GUI: "Harmonic Orbit" toggle + radius spinbox (30-70 mm) in the Path
+  Following group (speed shared with the Path Speed slider), reference
+  ring overlay, "orbit: track · lap N · err · ilc" status line, worker
+  slots with the never-auto-start rule.
 
 ---
 
