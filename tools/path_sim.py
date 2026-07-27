@@ -399,17 +399,24 @@ def simulate_orbit(
     plant: PlantParams | None = None,
     kick_at_s: float | None = None,
     kick_mm: float = 0.0,
+    cone: bool = False,
 ) -> OrbitSimResult:
-    """Closed-loop harmonic-orbit run on the rig-warp + servo-lag plant."""
+    """Closed-loop harmonic-orbit run on the rig-warp + servo-lag plant.
+
+    cone=False pins the CLOSED-LOOP machinery (reference + ILC), which
+    stays available behind ORBIT_CONE_ONLY; cone=True runs the shipping
+    open-loop cone mode."""
     clock = FakeClock()
     ctrl = BallController(kp=kp, kd=kd, ki=ki, clock=clock)
+    ctrl._orbit.cone_only = bool(cone)
     ctrl.set_orbit_radius(radius_mm)
     ctrl.set_orbit_speed(speed_mm_s)
     ctrl.start_orbit()
+    settled_states = ("cone",) if cone else ("track",)
     return _drive_circle_sim(
         ctrl, radius_mm, duration_s, hz, noise_mm, seed,
         plant if plant is not None else _ORBIT_PLANT, clock,
-        settled_fn=lambda terms, i: terms["orbit_state"] == "track",
+        settled_fn=lambda terms, i: terms["orbit_state"] in settled_states,
         lap_fn=lambda terms: terms["orbit_lap"],
         kick_at_s=kick_at_s, kick_mm=kick_mm,
     )

@@ -73,6 +73,9 @@ from typing import Any, Callable
 import numpy as np
 
 from settings import (
+    ORBIT_CONE_ONLY,
+    ORBIT_CONE_TILT_DEG,
+    ORBIT_CONE_WARP_C,
     ORBIT_ENTRAIN_MIN_RADIUS_MM,
     ORBIT_FB_GAIN_SCALE,
     ORBIT_FF_TILT_MAX_DEG,
@@ -101,6 +104,7 @@ STATE_IDLE = "idle"
 STATE_ENTRAIN = "entrain"
 STATE_TRACK = "track"
 STATE_RECOVER = "recover"
+STATE_CONE = "cone"
 
 _TWO_PI = 2.0 * math.pi
 # Fraction of the scaled-gain resonance the orbit omega may reach: past
@@ -147,6 +151,13 @@ class HarmonicOrbit:
         self.gov_track_cap = float(ORBIT_PHASE_GOV_TRACK_CAP)
         self.gov_entrain_per_s = float(ORBIT_PHASE_GOV_ENTRAIN_PER_S)
         self.track_entry_err_mm = float(ORBIT_TRACK_ENTRY_ERR_MM)
+        # Cone mode: open-loop rotating tilt, feedback off (see the
+        # settings block). The closed-loop machinery below stays
+        # available with cone_only=False.
+        self.cone_only = bool(ORBIT_CONE_ONLY)
+        self.cone_tilt_deg = float(ORBIT_CONE_TILT_DEG)
+        self.cone_warp_c = float(ORBIT_CONE_WARP_C)
+        self._cone_amp = 0.0
 
         self._state = STATE_IDLE
         self._seeded = False
@@ -249,6 +260,13 @@ class HarmonicOrbit:
         return self._state
 
     @property
+    def feedback_scale(self) -> float:
+        """P/D gain scale the controller applies while this mode is
+        active: 0 in cone mode (pure open-loop cone — no ball chasing),
+        else the configured trim scale."""
+        return 0.0 if self.cone_only else self.fb_gain_scale
+
+    @property
     def wants_integral_frozen(self) -> bool:
         """The controller freezes the PID integral when this is True —
         the whole TRACK state. Division of labor (both sides sim-
@@ -260,7 +278,11 @@ class HarmonicOrbit:
         at the handoff). So the integral runs only while the reference
         is not yet rotating fast (entrain/recover — it grabs the DC
         bias there), freezes for all of TRACK, and the table's n0
-        component finishes whatever DC remains."""
+        component finishes whatever DC remains. Cone mode freezes it
+        for the whole session — an integrator watching an orbiting
+        ball it isn't allowed to correct would only wind up."""
+        if self.cone_only:
+            return self._seeded and self._state != STATE_IDLE
         return self._state == STATE_TRACK
 
     # ------------------------------------------------------------------
@@ -286,11 +308,22 @@ class HarmonicOrbit:
 
         if not self._seeded:
             self._seed(ball_x, ball_y)
+            if self.cone_only:
+                # The expected ball point (anti-phase to the tilt)
+                # should START at the ball, so the tilt begins by
+                # pushing from where the ball already is.
+                self._phi = self._wrap_pi(self._phi + math.pi)
+                if self._phi < 0.0:
+                    self._phi += _TWO_PI
+                self._cone_amp = 0.0
             return OrbitCommand(
                 self._r * math.cos(self._phi),
                 self._r * math.sin(self._phi),
                 (0.0, 0.0), (0.0, 0.0), 0.0,
             )
+
+        if self.cone_only:
+            return self._update_cone(ball_x, ball_y, g_eff)
 
         now = self._clock()
         prev_t = self._last_t if self._last_t is not None else now
@@ -409,6 +442,63 @@ class HarmonicOrbit:
             "orbit_recover_count": self._recover_count,
             "orbit_learning": self._learning,
         }
+
+    # ------------------------------------------------------------------
+    # Cone mode (open loop)
+    # ------------------------------------------------------------------
+
+    def _update_cone(
+        self, ball_x: float, ball_y: float, g_eff: float
+    ) -> OrbitCommand:
+        """Pure open-loop cone: tilt vector of amplitude cone_tilt_deg
+        rotating at omega = sqrt(g_eff*(warp_c + A/R)) — the plate's
+        bowl warp acts as a central spring (omega_n^2 = g*warp_c), so
+        the driven orbit radius is g*A/(omega^2 - omega_n^2), ridden
+        anti-phase (driving above the warp resonance). The BALL input
+        is unused for control — feedback is off (feedback_scale 0);
+        the reported target is the physics-expected ball point for the
+        overlay and the err telemetry only."""
+        now = self._clock()
+        prev_t = self._last_t if self._last_t is not None else now
+        dt = min(0.1, max(1e-4, now - prev_t))
+        self._last_t = now
+
+        omega = math.sqrt(
+            g_eff * (
+                self.cone_warp_c
+                + self.cone_tilt_deg / max(20.0, self._r_target)
+            )
+        )
+        # Amplitude ramp over the spin-up window (the plate eases into
+        # the cone; the expected ring grows with it).
+        rate = self.cone_tilt_deg / max(0.5, self.spinup_s)
+        self._slew_toward(self.cone_tilt_deg, "_cone_amp", rate, dt)
+        if self._cone_amp >= self.cone_tilt_deg - 1e-9:
+            self._state = STATE_CONE
+        else:
+            self._state = STATE_ENTRAIN
+        self._omega = omega
+
+        self._phi += omega * dt
+        if self._phi >= _TWO_PI:
+            self._phi -= _TWO_PI
+            self._lap += 1
+
+        ff = (
+            self._cone_amp * math.cos(self._phi),
+            self._cone_amp * math.sin(self._phi),
+        )
+        denom = max(1e-6, omega * omega - g_eff * self.cone_warp_c)
+        r_exp = g_eff * self._cone_amp / denom
+        self._r = r_exp
+        tx = -r_exp * math.cos(self._phi)       # anti-phase to the tilt
+        ty = -r_exp * math.sin(self._phi)
+        err = abs(math.hypot(ball_x, ball_y) - r_exp)
+        self._last_err_mm = err
+        self._last_ff_deg = self._cone_amp
+        self._last_ilc_deg = 0.0
+        self._learning = False
+        return OrbitCommand(tx, ty, (0.0, 0.0), ff, err)
 
     # ------------------------------------------------------------------
     # Internals

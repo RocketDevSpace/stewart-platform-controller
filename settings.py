@@ -433,6 +433,26 @@ ORBIT_PHASE_GOV_TRACK_PER_S = 0.15    # rad/s of phase slew per rad of lag
 ORBIT_PHASE_GOV_TRACK_CAP = 0.2       # cap as a fraction of omega
 ORBIT_PHASE_GOV_ENTRAIN_PER_S = 1.5   # strong lock while entraining
 ORBIT_TRACK_ENTRY_ERR_MM = 25.0       # capture gate for entrain -> track
+# --- Cone mode (third rig session, 2026-07-27) ---
+# Hudson's clarified intent: the platform's DOMINANT motion is the
+# CONE itself — a pure open-loop rotating tilt (feedback OFF, integral
+# frozen, no ball chasing) — and the ball falls into orbit because the
+# physics says so. The plate's bowl warp acts as a central SPRING
+# (omega_n = sqrt(g_eff*warp_c) ~ 0.97 rad/s at the rig-measured
+# 0.0055 deg/mm — sim-caught: the naive gA/omega^2 formula missed it
+# and the ball landed at 88 mm instead of 50), so the driven orbit is
+# R = g_eff*A / (omega^2 - omega_n^2), ridden 180 deg out of phase
+# with the tilt (driving above the warp resonance). Inverted: A is
+# chosen ABOVE the rig's stiction breakaway (~0.3-0.5 deg) so the
+# ball actually rolls, and the rate follows from the dialed radius:
+#   omega = sqrt(g_eff * (warp_c + A/R))
+# At A=0.6, r=50: omega=1.73 rad/s (0.28 Hz, ~3.6 s/rev, ~86 mm/s).
+# ORBIT_CONE_ONLY=True makes the Harmonic Orbit button drive this
+# mode; the closed-loop reference/ILC machinery stays available
+# behind the flag.
+ORBIT_CONE_ONLY = True
+ORBIT_CONE_TILT_DEG = 0.6
+ORBIT_CONE_WARP_C = 0.0055        # rig-measured bowl coefficient (deg/mm)
 
 # =============================================================================
 # Loop rates

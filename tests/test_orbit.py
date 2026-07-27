@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from control.orbit import (
+    STATE_CONE,
     STATE_ENTRAIN,
     STATE_IDLE,
     STATE_RECOVER,
@@ -41,6 +42,10 @@ class FakeClock:
 
 def _orbit(clock: FakeClock, radius: float = 50.0, speed: float = 40.0) -> HarmonicOrbit:
     o = HarmonicOrbit(clock, radius_mm=radius, speed_mm_s=speed)
+    # These suites pin the CLOSED-LOOP machinery (reference + ILC),
+    # which stays available behind the cone_only flag; the shipping
+    # cone default is pinned in TestConeMode.
+    o.cone_only = False
     return o
 
 
@@ -353,6 +358,127 @@ class TestRecover:
         last_lap = max(k for k, v in per_lap.items() if len(v) > 50)
         late_rms = float(np.sqrt(np.mean(np.square(per_lap[last_lap]))))
         assert late_rms < 3.0
+
+
+class TestConeMode:
+    """The shipping default (ORBIT_CONE_ONLY): a pure open-loop cone —
+    tilt amplitude A rotating at omega = sqrt(g*A/R), feedback OFF,
+    ball input unused for control."""
+
+    def _cone(self, clock: FakeClock, radius: float = 50.0) -> HarmonicOrbit:
+        o = HarmonicOrbit(clock, radius_mm=radius, speed_mm_s=40.0)
+        assert o.cone_only is True                   # the shipping default
+        return o
+
+    def test_omega_and_amplitude_from_physics(self) -> None:
+        clock = FakeClock()
+        o = self._cone(clock)
+        o.start()
+        o.update(30.0, 0.0, 0.0, G_EFF, 0.0)         # seed
+        for _ in range(int(6.0 / DT)):
+            clock.advance(DT)
+            cmd = o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        tel = o.telemetry()
+        assert tel["orbit_state"] == STATE_CONE
+        # omega includes the warp-spring term (the plate's bowl acts as
+        # a central spring; sim-caught when the naive formula landed
+        # the ball at 88 mm instead of 50).
+        expected_omega = math.sqrt(
+            G_EFF * (o.cone_warp_c + o.cone_tilt_deg / 50.0)
+        )
+        assert tel["orbit_omega"] == pytest.approx(expected_omega, rel=1e-6)
+        assert math.hypot(*cmd.ff_deg) == pytest.approx(
+            o.cone_tilt_deg, abs=1e-9
+        )
+        # Expected ring radius = g*A/omega^2 = the dialed radius.
+        assert tel["orbit_r_mm"] == pytest.approx(50.0, rel=1e-6)
+
+    def test_open_loop_ball_input_does_not_change_tilt(self) -> None:
+        # Two runs with completely different ball feeds -> identical
+        # tilt sequences (the cone never chases the ball).
+        seqs = []
+        for feed in ((30.0, 0.0), (-45.0, 60.0)):
+            clock = FakeClock()
+            o = self._cone(clock)
+            o.start()
+            o.update(30.0, 0.0, 0.0, G_EFF, 0.0)     # same seed ball
+            seq = []
+            for _ in range(60):
+                clock.advance(DT)
+                cmd = o.update(feed[0], feed[1], 0.0, G_EFF, 0.0)
+                seq.append(cmd.ff_deg)
+            seqs.append(seq)
+        assert seqs[0] == seqs[1]
+
+    def test_amplitude_ramps_over_spinup(self) -> None:
+        clock = FakeClock()
+        o = self._cone(clock)
+        o.start()
+        o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        cmd = None
+        for _ in range(int(o.spinup_s / 2 / DT)):    # frame-wise: dt clamps
+            clock.advance(DT)
+            cmd = o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        assert cmd is not None
+        assert math.hypot(*cmd.ff_deg) == pytest.approx(
+            0.5 * o.cone_tilt_deg, rel=0.05
+        )
+        assert o.state == STATE_ENTRAIN
+
+    def test_target_is_anti_phase_to_tilt(self) -> None:
+        clock = FakeClock()
+        o = self._cone(clock)
+        o.start()
+        o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        for _ in range(int(6.0 / DT)):
+            clock.advance(DT)
+            cmd = o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        ff_mag = math.hypot(*cmd.ff_deg)
+        t_mag = math.hypot(cmd.target_x_mm, cmd.target_y_mm)
+        dot = (cmd.ff_deg[0] * cmd.target_x_mm
+               + cmd.ff_deg[1] * cmd.target_y_mm) / (ff_mag * t_mag)
+        assert dot == pytest.approx(-1.0, abs=1e-9)  # ball rides opposite
+
+    def test_feedback_off_and_integral_frozen(self) -> None:
+        clock = FakeClock()
+        o = self._cone(clock)
+        assert o.feedback_scale == 0.0
+        o.start()
+        o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        assert o.wants_integral_frozen is True       # whole session
+        assert o.telemetry()["orbit_learning"] is False
+
+    def test_ball_settles_on_the_predicted_ring_in_sim(self) -> None:
+        # Closed physics check: drive the cone ff through the plant
+        # (warp + drag + latency); the ball must settle onto the ring
+        # R = g*A/(omega^2 - g*warp_c). Measured on this plant: exact
+        # convergence to r=50.0 at ~86 mm/s; the open-loop transient
+        # (overshoot to ~87 mm) decays through rolling resistance
+        # alone over ~90 s (the real rig's higher friction settles
+        # faster), so the pin measures the settled window.
+        from control.plant_model import PlantParams
+        clock = FakeClock()
+        o = self._cone(clock)
+        plant = PlantParams(g_eff=G_EFF, latency_s=2 * DT, stiction_deg=0.06,
+                            warp_c_deg_per_mm=0.0055, bias_roll_deg=0.0,
+                            bias_pitch_deg=0.0)
+        o.start()
+        x, y, vx, vy = 10.0, 0.0, 0.0, 0.0
+        o.update(x, y, 0.0, G_EFF, 0.0)              # seed
+        queue = [(0.0, 0.0)] * 2
+        radii = []
+        for i in range(int(150.0 / DT)):
+            clock.advance(DT)
+            cmd = o.update(x, y, 0.0, G_EFF, 0.0)
+            # Tilt = ff only (feedback off): pitch = ff_x, roll = -ff_y.
+            queue.append((-cmd.ff_deg[1], cmd.ff_deg[0]))
+            roll_act, pitch_act = queue.pop(0)
+            x, y, vx, vy = plant_step(x, y, vx, vy, roll_act, pitch_act, DT, plant)
+            if i > int(120.0 / DT):
+                radii.append(math.hypot(x, y))
+        mean_r = float(np.mean(radii))
+        assert mean_r == pytest.approx(50.0, abs=5.0)   # measured 49.7
+        assert float(np.std(radii)) < 3.0               # circulating cleanly
 
 
 class TestConfig:

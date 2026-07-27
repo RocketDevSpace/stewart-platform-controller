@@ -31,8 +31,11 @@ def _ball(x: float, y: float, vx: float = 0.0, vy: float = 0.0) -> BallState:
 
 
 def _make(clock: FakeClock) -> BallController:
-    # Hermetic reference gains (the overlay-independence rule).
+    # Hermetic reference gains (the overlay-independence rule). These
+    # suites pin the CLOSED-LOOP wiring; the shipping cone default is
+    # pinned in TestConeModeWiring below.
     ctrl = BallController(kp=0.045, kd=0.022, ki=0.030, clock=clock)
+    ctrl._orbit.cone_only = False
     return ctrl
 
 
@@ -181,6 +184,37 @@ class TestScaledFeedbackAndFreeze:
             _, _, terms = ctrl.compute_with_terms(_ball(tx, ty))
         assert terms["orbit_state"] == STATE_TRACK
         assert terms["i_frozen"] is True               # table owns periodic
+
+
+class TestConeModeWiring:
+    """The shipping default: cone mode through the full controller —
+    feedback must be INERT while the cone tilt flows out."""
+
+    def _make_cone(self, clock: FakeClock) -> BallController:
+        ctrl = BallController(kp=0.045, kd=0.022, ki=0.030, clock=clock)
+        assert ctrl._orbit.cone_only is True         # shipping default
+        return ctrl
+
+    def test_feedback_inert_and_cone_tilt_flows(self) -> None:
+        clock = FakeClock()
+        ctrl = self._make_cone(clock)
+        ctrl.start_orbit()
+        clock.advance(1 / 30)
+        ctrl.compute_with_terms(_ball(30.0, 0.0))    # seed
+        for _ in range(240):                         # spin up fully
+            clock.advance(1 / 30)
+            _, _, terms = ctrl.compute_with_terms(_ball(30.0, 0.0))
+        assert terms["orbit_state"] == "cone"
+        # Ball far from the "target": P and D must contribute NOTHING.
+        clock.advance(1 / 30)
+        _, _, terms = ctrl.compute_with_terms(_ball(-40.0, 25.0))
+        assert terms["p_term"] == pytest.approx((0.0, 0.0))
+        assert terms["d_term"] == pytest.approx((0.0, 0.0))
+        assert terms["i_frozen"] is True
+        # The cone tilt IS the command (plus trim, zero here).
+        assert math.hypot(*terms["ff_vec"]) == pytest.approx(
+            ctrl._orbit.cone_tilt_deg, abs=1e-9
+        )
 
 
 class TestTermsKeys:

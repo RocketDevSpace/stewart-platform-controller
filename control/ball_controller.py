@@ -39,7 +39,6 @@ from settings import (
     HOME_CAL_CONVERGE_MAX_SPEED_MM_S,
     HOME_CAL_CONVERGE_WINDOW_S,
     HOME_CAL_TIMEOUT_S,
-    ORBIT_FB_GAIN_SCALE,
     PD_DEFAULT_KD,
     PD_DEFAULT_KI,
     PD_DEFAULT_KP,
@@ -594,7 +593,7 @@ class BallController:
                 x, y,
                 lead_s=self._predict_s,
                 g_eff=float(PD_AUTOTUNE_G_EFF),
-                kp_eff=self.kp * float(ORBIT_FB_GAIN_SCALE),
+                kp_eff=self.kp * self._orbit.feedback_scale,
             )
             tgt = (orbit_cmd.target_x_mm, orbit_cmd.target_y_mm)
             if not (
@@ -735,8 +734,11 @@ class BallController:
             ),
             v_des=v_des,
             ff=ff,
+            # Orbit modes scale the feedback: the trim scale in the
+            # closed-loop mode, ZERO in cone mode (pure open-loop cone
+            # — the plate never chases the ball).
             gain_scale=(
-                float(ORBIT_FB_GAIN_SCALE) if self._orbit.active else 1.0
+                self._orbit.feedback_scale if self._orbit.active else 1.0
             ),
         )
 
