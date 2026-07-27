@@ -383,14 +383,26 @@ ORBIT_RADIUS_MIN_MM = 30.0        # GUI spinbox bounds
 ORBIT_RADIUS_MAX_MM = 70.0
 ORBIT_SPINUP_S = 4.0              # omega 0 -> target ramp (also the r ramp window)
 ORBIT_ENTRAIN_MIN_RADIUS_MM = 15.0  # entrain radius floor (atan2 stability)
-ORBIT_FB_GAIN_SCALE = 0.5         # p/d scale while orbiting (integral untouched)
+# p/d scale while orbiting (integral untouched). Second rig session:
+# raised 0.5 -> 1.0 — at half gains the P authority (0.036 deg/mm) was
+# under the rig's stiction breakaway (0.3-0.5 deg = a +/-8-14 mm dead
+# band), producing a 0.25-0.33 Hz stick-slip radial limit cycle with
+# 5-10 mm amplitude at exactly the scaled-gain resonance. Full gains
+# halve the sim ripple on the rig-like plant (3.2 -> 1.4 mm) with no
+# instability; "feedback demoted to trim" is achieved by the ff+table
+# carrying the drive, not by weakening the corrector.
+ORBIT_FB_GAIN_SCALE = 1.0
 ORBIT_FF_TILT_MAX_DEG = 1.5       # ff vector-norm cap (analytic + learned)
 ORBIT_ILC_BINS = 24               # per-phase correction bins (15 deg/bin)
 ORBIT_ILC_MU = 0.5                # learning rate (fraction of residual per bin-visit)
 ORBIT_ILC_LEAK = 0.02             # per-LAP table leak (mis-learned corrections age out)
-ORBIT_ILC_CLAMP_DEG = 0.8         # per-bin correction vector-norm clamp
-#   (headroom: rotating warp ~0.28 deg + the residual DC the table
-#    inherits when the integral freezes at TRACK entry)
+ORBIT_ILC_CLAMP_DEG = 1.2         # per-bin correction vector-norm clamp
+#   Raised 0.8 -> 1.2 (second rig session): the rig's DC-plus-rotating
+#   correction exceeds 0.8 — 11-13 of 24 bins sat PINNED at the old
+#   clamp (starved), which is exactly the logged outward radius offset
+#   (ball riding 10+ mm outside the ring). At 1.2 the sim table peaks
+#   at ~1.18 with zero saturated bins and the radius error collapses
+#   3.1 -> 0.6 mm.
 # Gaussian write kernel width: each bin-transit update is spread over
 # neighboring bins, BAND-LIMITING what the table can learn. Sim-caught:
 # harmonics at n*omega above the scaled-gain resonance sqrt(g*kp_eff)

@@ -153,6 +153,7 @@ class TestRestSuppression:
 
 class TestScaledFeedbackAndFreeze:
     def test_p_term_reflects_orbit_gain_scale(self) -> None:
+        from settings import ORBIT_FB_GAIN_SCALE
         clock = FakeClock()
         ctrl = _make(clock)
         ctrl.start_orbit()
@@ -161,8 +162,9 @@ class TestScaledFeedbackAndFreeze:
         clock.advance(1 / 30)
         _, _, terms = ctrl.compute_with_terms(_ball(30.0, 10.0))
         ex, ey = terms["position_vec_mm"]
-        assert terms["p_term"][0] == pytest.approx(0.045 * 0.5 * ex)
-        assert terms["p_term"][1] == pytest.approx(0.045 * 0.5 * ey)
+        scale = float(ORBIT_FB_GAIN_SCALE)
+        assert terms["p_term"][0] == pytest.approx(0.045 * scale * ex)
+        assert terms["p_term"][1] == pytest.approx(0.045 * scale * ey)
 
     def test_integral_runs_in_entrain_freezes_in_track(self) -> None:
         clock = FakeClock()
