@@ -82,12 +82,16 @@ from settings import (
     ORBIT_ILC_MU,
     ORBIT_ILC_WRITE_SIGMA_BINS,
     ORBIT_LEARN_GATE_MM,
+    ORBIT_PHASE_GOV_ENTRAIN_PER_S,
+    ORBIT_PHASE_GOV_TRACK_CAP,
+    ORBIT_PHASE_GOV_TRACK_PER_S,
     ORBIT_RADIUS_MAX_MM,
     ORBIT_RADIUS_MIN_MM,
     ORBIT_RADIUS_MM,
     ORBIT_RECOVER_FRAMES,
     ORBIT_RECOVER_MM,
     ORBIT_SPINUP_S,
+    ORBIT_TRACK_ENTRY_ERR_MM,
     PATH_SPEED_MAX_MM_S,
     PATH_SPEED_MIN_MM_S,
     PATH_SPEED_MM_S,
@@ -139,6 +143,10 @@ class HarmonicOrbit:
         self.learn_gate_mm = float(ORBIT_LEARN_GATE_MM)
         self.recover_mm = float(ORBIT_RECOVER_MM)
         self.recover_frames = int(ORBIT_RECOVER_FRAMES)
+        self.gov_track_per_s = float(ORBIT_PHASE_GOV_TRACK_PER_S)
+        self.gov_track_cap = float(ORBIT_PHASE_GOV_TRACK_CAP)
+        self.gov_entrain_per_s = float(ORBIT_PHASE_GOV_ENTRAIN_PER_S)
+        self.track_entry_err_mm = float(ORBIT_TRACK_ENTRY_ERR_MM)
 
         self._state = STATE_IDLE
         self._seeded = False
@@ -304,15 +312,39 @@ class HarmonicOrbit:
         r_rate = self._r_rate_hold if self._r_rate_hold > 0.0 else 1.0
         r_dot = self._slew_toward(self._r_target, "_r", r_rate, dt)
 
+        # Phase governor (rig-caught): under real stiction the pure
+        # clock reference outruns the ball and the trailing error grows
+        # into the recover tripwire — churn. A weak PLL slews the
+        # reference phase toward the ball's actual angle: sustained lag
+        # is absorbed; the track-state bandwidth (~0.02 Hz) is far
+        # below jank frequencies so measurement jitter cannot couple
+        # into the reference (the carrot-pacing failure mode). During
+        # entrain/recover the lock is STRONG — the reference stays
+        # glued to the ball until capture.
+        gov = 0.0
+        r_ball = math.hypot(ball_x, ball_y)
+        if r_ball > 10.0:
+            dphi = self._wrap_pi(math.atan2(ball_y, ball_x) - self._phi)
+            if self._state == STATE_TRACK:
+                gov = self.gov_track_per_s * dphi
+                cap = self.gov_track_cap * max(self._omega, 1e-3)
+                gov = max(-cap, min(cap, gov))
+            else:
+                gov = self.gov_entrain_per_s * dphi
+                gov = max(-1.5, min(1.5, gov))
+        phi_rate = self._omega + gov
+
         # Advance phase; a wrap is one lap and triggers the smoothing
         # pass over the correction table.
-        self._phi += self._omega * dt
+        self._phi += phi_rate * dt
         if self._phi >= _TWO_PI:
             self._phi -= _TWO_PI
             self._lap += 1
             self._smooth_table()
+        elif self._phi < 0.0:
+            self._phi += _TWO_PI
 
-        ref_x, ref_y, v_des = self._reference(r_dot)
+        ref_x, ref_y, v_des = self._reference(r_dot, phi_rate)
         ex = ball_x - ref_x
         ey = ball_y - ref_y
         err = math.hypot(ex, ey)
@@ -324,7 +356,7 @@ class HarmonicOrbit:
             # frame's output from the fresh state (omega=0, no ramps) so
             # the command is continuous with the new entrainment.
             alpha = 0.0
-            ref_x, ref_y, v_des = self._reference(0.0)
+            ref_x, ref_y, v_des = self._reference(0.0, 0.0)
             ex = ball_x - ref_x
             ey = ball_y - ref_y
             err = math.hypot(ex, ey)
@@ -382,17 +414,23 @@ class HarmonicOrbit:
     # Internals
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _wrap_pi(angle: float) -> float:
+        """Wrap to (-pi, pi]."""
+        return math.atan2(math.sin(angle), math.cos(angle))
+
     def _reference(
-        self, r_dot: float
+        self, r_dot: float, phi_rate: float
     ) -> tuple[float, float, tuple[float, float]]:
-        """Current reference point + desired velocity."""
+        """Current reference point + desired velocity (phi_rate is the
+        ACTUAL phase rate incl. the governor)."""
         cos_p = math.cos(self._phi)
         sin_p = math.sin(self._phi)
         ref_x = self._r * cos_p
         ref_y = self._r * sin_p
         v_des = (
-            -self._omega * self._r * sin_p + r_dot * cos_p,
-            self._omega * self._r * cos_p + r_dot * sin_p,
+            -phi_rate * self._r * sin_p + r_dot * cos_p,
+            phi_rate * self._r * cos_p + r_dot * sin_p,
         )
         return ref_x, ref_y, v_des
 
@@ -438,7 +476,11 @@ class HarmonicOrbit:
         if self._state in (STATE_ENTRAIN, STATE_RECOVER):
             at_speed = abs(self._omega - self._omega_target_eff) < 1e-3
             at_radius = abs(self._r - self._r_target) < 0.5
-            if at_speed and at_radius:
+            # Capture gate: TRACK (which freezes the integral and
+            # starts learning) is entered only with the ball actually
+            # near the reference — never from a bad state.
+            captured = err <= self.track_entry_err_mm
+            if at_speed and at_radius and captured:
                 self._state = STATE_TRACK
                 self._err_frames = 0
             return False

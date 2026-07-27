@@ -400,9 +400,27 @@ ORBIT_ILC_CLAMP_DEG = 0.8         # per-bin correction vector-norm clamp
 # is attenuated 0.15x — under the per-lap smoothing + leak damping
 # even at mu=0.5 (fundamental contraction ~0.68/lap).
 ORBIT_ILC_WRITE_SIGMA_BINS = 2.5
-ORBIT_LEARN_GATE_MM = 20.0        # no learning above this tracking error
-ORBIT_RECOVER_MM = 30.0           # error tripwire -> RECOVER (freeze + re-entrain)
-ORBIT_RECOVER_FRAMES = 10         # consecutive frames above the tripwire
+ORBIT_LEARN_GATE_MM = 30.0        # no learning above this tracking error
+ORBIT_RECOVER_MM = 45.0           # error tripwire -> RECOVER (freeze + re-entrain)
+ORBIT_RECOVER_FRAMES = 20         # consecutive frames above the tripwire
+# Phase governor (first rig session, 2026-07-27): under the rig's real
+# stiction (~0.3-0.5 deg equivalent — the sim assumed 0.06) the pure
+# clock reference OUTRUNS the ball; the trailing error crossed the old
+# 30 mm tripwire and the orbit churned recover->entrain forever (data:
+# omega collapsing and re-ramping all session, radius ripple 5-10 mm,
+# the table never got uninterrupted laps to learn; reproduced in sim at
+# stiction 0.45). A WEAK phase-locked loop slews the reference phase
+# toward the ball's actual angle: sustained lag is absorbed, but the
+# bandwidth (~0.02 Hz in track) is far below jank frequencies, so —
+# unlike carrot pacing — measurement jitter cannot couple into the
+# reference. Entrain/recover use a STRONG lock (the reference stays
+# glued to the ball until capture), and TRACK entry additionally
+# requires the error under ORBIT_TRACK_ENTRY_ERR_MM so the integral
+# never freezes on a bad state.
+ORBIT_PHASE_GOV_TRACK_PER_S = 0.15    # rad/s of phase slew per rad of lag
+ORBIT_PHASE_GOV_TRACK_CAP = 0.2       # cap as a fraction of omega
+ORBIT_PHASE_GOV_ENTRAIN_PER_S = 1.5   # strong lock while entraining
+ORBIT_TRACK_ENTRY_ERR_MM = 25.0       # capture gate for entrain -> track
 
 # =============================================================================
 # Loop rates

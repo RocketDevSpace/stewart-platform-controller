@@ -19,6 +19,7 @@ hermetic reference gains (overlay independence — the 2026-07-23 rule).
 """
 import pytest
 
+from control.plant_model import PlantParams
 from tools.path_sim import (
     OrbitSimResult,
     simulate_carrot_circle as _simulate_carrot_circle,
@@ -106,6 +107,38 @@ class TestKickRobustness:
         )
         assert res.laps >= 8
         assert res.lap_ripple_mm[-1] < 1.5            # measured 0.84
+
+
+class TestRigStictionScenario:
+    """The first rig session's failure, reproduced and fixed
+    (2026-07-27): at rig-level stiction (~0.45 deg equivalent vs the
+    0.06 the plant default assumes) the pure clock reference outran the
+    ball, the trailing error crossed the old 30 mm tripwire, and the
+    orbit churned recover->entrain forever (8 laps in 120 s, ripple
+    stuck at 7-8 mm — matching the logged rig data). With the phase
+    governor + capture gate + softened tripwires the same scenario
+    CONVERGES: measured 12 laps, lap ripple 11.3 -> 3.6 mm, no
+    recovers."""
+
+    def test_heavy_stiction_converges_without_churn(self) -> None:
+        plant = PlantParams(
+            g_eff=171.0, latency_s=2.0 / 30.0, stiction_deg=0.45,
+            warp_c_deg_per_mm=0.0055, bias_roll_deg=0.6,
+            bias_pitch_deg=0.6, servo_tau_s=0.06,
+        )
+        # Rig-REPRESENTATIVE gains, passed as explicit literals (still
+        # hermetic — nothing read from the overlay): at the weak
+        # historical reference gains this plant is near-uncontrollable
+        # (P authority ~2x stiction at the tripwire) and churns
+        # regardless of orbit logic — a gain-adequacy fact, not an
+        # orbit property. The rig runs ~these gains.
+        res = _simulate_orbit(
+            65.0, 40.0, 120.0, kp=0.072, kd=0.030, ki=0.050, plant=plant
+        )
+        assert res.laps >= 10                     # was 8 while churning
+        curve = res.lap_ripple_mm
+        assert curve[3] < 0.6 * curve[0]          # measured 3.6 / 11.3
+        assert res.radial_ripple_mm < 5.0         # measured 3.6 (was 7.1)
 
 
 class TestDeterminism:
