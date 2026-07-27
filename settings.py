@@ -180,7 +180,19 @@ TRACKER_QUAD_MAX_CORNER_STEP_PX = 15.0  # gate: max per-frame corner motion whil
 TRACKER_QUAD_SIDE_RATIO_TOL = 0.06     # gate: side-length drift vs previous frame
 TRACKER_QUAD_MAX_ANGLE_DELTA_DEG = 5.0  # gate: corner-angle drift vs previous frame
 TRACKER_QUAD_CROSSCHECK_EVERY_N = 15   # run ArUco every N frames while locked
-TRACKER_QUAD_CROSSCHECK_TOL_PX = 4.0   # mean corner disagreement to pass a cross-check
+# The audit is BASELINE-RELATIVE (rig finding 2026-07-24): ArUco must
+# extrapolate the +/-60 mm marker square 2x outward to predict the
+# +/-120 mm boundary corners, and real-lens radial distortion makes that
+# prediction structurally wrong by several px — the quad measures where
+# the boundary actually IS. On the rig the raw disagreement exceeded the
+# old absolute tolerance on EVERY audit, so 3 strikes (45 frames = 1.5 s)
+# force-reacquired the quad in a perfectly periodic unlock/relock cycle.
+# The residual at lock time is now stored as the baseline; audits alarm
+# on CHANGE from it (genuine drift), with a slow blend on passes to
+# follow tilt. A raw disagreement over SLIP_PX is a hard strike
+# regardless of baseline (identity slip / false structure).
+TRACKER_QUAD_CROSSCHECK_TOL_PX = 4.0   # mean |change from baseline| to pass
+TRACKER_QUAD_CROSSCHECK_SLIP_PX = 25.0  # raw disagreement = hard strike
 TRACKER_QUAD_CROSSCHECK_FAILS_TO_REACQ = 3   # consecutive fails -> force reacquire
 # Skip the cross-check while the ball is within this distance of ANY
 # marker center: ArUco is exactly then untrustworthy (the occlusion this

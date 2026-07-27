@@ -73,6 +73,7 @@ from settings import (
     TRACKER_QUAD_CORNER_FAST_PX,
     TRACKER_QUAD_CORNER_SNAP_PX,
     TRACKER_QUAD_CROSSCHECK_FAILS_TO_REACQ,
+    TRACKER_QUAD_CROSSCHECK_SLIP_PX,
     TRACKER_QUAD_CROSSCHECK_TOL_PX,
     TRACKER_QUAD_MAX_ANGLE_DELTA_DEG,
     TRACKER_QUAD_MAX_CORNER_STEP_PX,
@@ -253,6 +254,7 @@ class PlatformQuadTracker:
         self.side_ratio_tol = float(TRACKER_QUAD_SIDE_RATIO_TOL)
         self.max_angle_delta_deg = float(TRACKER_QUAD_MAX_ANGLE_DELTA_DEG)
         self.crosscheck_tol_px = float(TRACKER_QUAD_CROSSCHECK_TOL_PX)
+        self.crosscheck_slip_px = float(TRACKER_QUAD_CROSSCHECK_SLIP_PX)
         self.crosscheck_fails_to_reacq = int(TRACKER_QUAD_CROSSCHECK_FAILS_TO_REACQ)
 
         self._corner_lp = [
@@ -280,6 +282,12 @@ class PlatformQuadTracker:
         # the measured mean peak |gradient| to tune against) /
         # "few-inliers" / "degenerate".
         self.last_diag: dict | None = None
+        # Audit telemetry: mean |change from the lock-time baseline| and
+        # the raw quad-vs-ArUco corner disagreement, from the last
+        # cross-check (None until one runs).
+        self.last_audit_px: float | None = None
+        self.last_audit_raw_px: float | None = None
+        self._audit_baseline: np.ndarray | None = None
         self._pred_corners: np.ndarray | None = None
         self._polarity: np.ndarray = np.zeros(4)
         self._side_offset: np.ndarray = np.zeros(4)
@@ -304,6 +312,9 @@ class PlatformQuadTracker:
         self._miss_count = 0
         self._crosscheck_fails = 0
         self.last_diag = None
+        self.last_audit_px = None
+        self.last_audit_raw_px = None
+        self._audit_baseline = None
         for lp in self._corner_lp:
             lp.reset()
 
@@ -311,6 +322,12 @@ class PlatformQuadTracker:
     def acq_progress(self) -> tuple[int, int]:
         """(consecutive good fits so far, fits required to lock)."""
         return self._acq_good, self.acq_frames
+
+    @property
+    def audit_strikes(self) -> int:
+        """Consecutive failed cross-checks (reacquire at
+        crosscheck_fails_to_reacq)."""
+        return self._crosscheck_fails
 
     # =========================
     # Public API
@@ -359,22 +376,34 @@ class PlatformQuadTracker:
     def notify_aruco_h(self, h_cam_to_warp: np.ndarray) -> bool:
         """Cross-check a fresh ArUco solve against the locked quad.
 
-        Returns True when the check passed (or wasn't applicable). A
-        mean corner disagreement above crosscheck_tol_px is a strike but
-        the quad stays the source (transient ArUco error is the rig
-        failure mode this module exists for); crosscheck_fails_to_reacq
-        CONSECUTIVE strikes force a reset to UNLOCKED — only ArUco
-        carries absolute identity/scale, so a persistently divergent
-        quad has locked onto a false structure and must reacquire."""
+        BASELINE-RELATIVE (rig finding 2026-07-24): ArUco predicts the
+        boundary corners by extrapolating the marker square 2x outward,
+        which real-lens radial distortion makes structurally wrong by
+        several px — a constant offset the quad correctly refuses to
+        share. The residual at lock time is the baseline; the audit
+        alarms on the CHANGE from it (genuine quad drift), blending the
+        baseline slowly on passes so legitimate tilt-driven shifts
+        follow. A raw disagreement over crosscheck_slip_px is a hard
+        strike regardless of baseline (identity slip / false
+        structure). Transient strikes keep the quad as the source;
+        crosscheck_fails_to_reacq CONSECUTIVE strikes force UNLOCKED —
+        only ArUco carries absolute identity/scale."""
         if self.state != STATE_LOCKED or self.last_corners_cam is None:
             return True
         corners = self._project_h_corners(h_cam_to_warp)
         if corners is None:
             return True
-        diff = corners - self.last_corners_cam
-        d = float(np.mean(np.hypot(diff[:, 0], diff[:, 1])))
-        if d <= self.crosscheck_tol_px:
+        d = self.last_corners_cam - corners           # quad − aruco (4,2)
+        raw = float(np.mean(np.hypot(d[:, 0], d[:, 1])))
+        if self._audit_baseline is None:
+            self._audit_baseline = d.copy()           # first audit seeds
+        dev = d - self._audit_baseline
+        score = float(np.mean(np.hypot(dev[:, 0], dev[:, 1])))
+        self.last_audit_px = score
+        self.last_audit_raw_px = raw
+        if raw < self.crosscheck_slip_px and score <= self.crosscheck_tol_px:
             self._crosscheck_fails = 0
+            self._audit_baseline = 0.9 * self._audit_baseline + 0.1 * d
             return True
         self._crosscheck_fails += 1
         if self._crosscheck_fails >= self.crosscheck_fails_to_reacq:
@@ -422,6 +451,13 @@ class PlatformQuadTracker:
         if corners is None:
             self._acq_good = 0          # degenerate at the finish: keep acquiring
             return
+        # Audit baseline: the structural quad-vs-ArUco corner residual
+        # at lock (see notify_aruco_h). _pred_corners still holds the
+        # seeding ArUco projection at this point.
+        if self._pred_corners is not None:
+            self._audit_baseline = corners - self._pred_corners
+        else:
+            self._audit_baseline = None
         for lp, c in zip(self._corner_lp, corners):
             lp.reset()
             lp.filter(c)

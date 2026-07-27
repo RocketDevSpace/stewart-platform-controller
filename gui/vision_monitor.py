@@ -338,6 +338,16 @@ def _draw_camera_overlays(
                       color=_QUAD_COLOR, thickness=1, lineType=cv2.LINE_AA)
         for x, y in pts.astype(np.int32):
             cv2.circle(frame, (int(x), int(y)), 3, _QUAD_COLOR, -1, cv2.LINE_AA)
+        # Locked-state audit readout: change-from-baseline px + strikes.
+        if quad_diag is not None and quad_diag.get("audit_px") is not None:
+            strikes = int(quad_diag.get("audit_strikes", 0))
+            col = (
+                _QUAD_SIDE_OK_COLOR if strikes == 0 else _QUAD_SIDE_BAD_COLOR
+            )
+            txt = f"audit {float(quad_diag['audit_px']):.1f}px"
+            if strikes:
+                txt += f" strike {strikes}"
+            _put_small(frame, txt, (8, 72), col)
     elif quad_diag is not None:
         _draw_quad_diag(frame, quad_diag)
 

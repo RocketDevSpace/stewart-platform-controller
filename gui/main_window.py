@@ -1287,6 +1287,17 @@ class MainWindow(QWidget):
         if (now - self._last_quad_diag_log_ts) < 5.0:
             return
         self._last_quad_diag_log_ts = now
+        if str(diag.get("state", "")) == "locked":
+            # Only worth a line when the audit is striking.
+            strikes = int(diag.get("audit_strikes", 0))
+            if strikes > 0:
+                self.control_panel.append_preview(
+                    f"[TRACK] quad audit disagree "
+                    f"{float(diag.get('audit_px', 0.0)):.1f}px "
+                    f"(raw {float(diag.get('audit_raw_px', 0.0)):.1f}px) "
+                    f"strike {strikes}"
+                )
+            return
         sides = diag.get("sides") or []
         fails = []
         for k, d in enumerate(sides):

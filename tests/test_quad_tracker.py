@@ -358,3 +358,41 @@ class TestCrossCheck:
     def test_not_applicable_while_unlocked(self) -> None:
         qt = PlatformQuadTracker(WARP)
         assert qt.notify_aruco_h(H_TRUE) is True
+
+    def test_structural_baseline_residual_is_tolerated(self) -> None:
+        # THE 1.5s-cycle rig fix: real-lens distortion makes ArUco's
+        # extrapolated boundary corners structurally wrong by a constant
+        # offset. If that residual is in the lock-time baseline, audits
+        # matching it must PASS forever — no periodic reacquire.
+        qt = _locked_tracker()
+        qt._audit_baseline = np.tile([-8.0, 0.0], (4, 1))
+        for _ in range(6):
+            assert qt.notify_aruco_h(self._h_shifted(8.0)) is True
+        assert qt.state == STATE_LOCKED
+        assert qt.last_audit_px is not None and qt.last_audit_px < 1.0
+        assert qt.last_audit_raw_px is not None and qt.last_audit_raw_px > 7.0
+
+    def test_change_from_baseline_still_strikes(self) -> None:
+        # With a nonzero baseline, agreement with TRUTH is now the
+        # anomaly — the audit alarms on change, not absolute error.
+        qt = _locked_tracker()
+        qt._audit_baseline = np.tile([-8.0, 0.0], (4, 1))
+        assert qt.notify_aruco_h(H_TRUE) is False
+
+    def test_gross_slip_strikes_regardless_of_baseline(self) -> None:
+        qt = _locked_tracker()
+        shift = qt.crosscheck_slip_px + 5.0
+        qt._audit_baseline = np.tile([-shift, 0.0], (4, 1))
+        for _ in range(qt.crosscheck_fails_to_reacq):
+            # Matches the baseline exactly, but the RAW disagreement is
+            # beyond the slip threshold: identity slip, hard strikes.
+            assert qt.notify_aruco_h(self._h_shifted(shift)) is False
+        assert qt.state == STATE_UNLOCKED
+
+    def test_lock_seeds_baseline_near_zero_on_ideal_camera(self) -> None:
+        # No lens distortion in the synthetic scene: the lock-time
+        # residual is sub-pixel, so behavior matches the old absolute
+        # audit exactly on the ideal camera.
+        qt = _locked_tracker()
+        assert qt._audit_baseline is not None
+        assert float(np.max(np.hypot(*qt._audit_baseline.T))) < 1.0

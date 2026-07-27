@@ -711,6 +711,13 @@ class VisionControlWorker(QtCore.QObject):
                 got = q.last_corners_cam
                 if got is not None:
                     corners = got.copy()
+                if q.last_audit_px is not None:
+                    diag_out = {
+                        "state": "locked",
+                        "audit_px": float(q.last_audit_px),
+                        "audit_raw_px": float(q.last_audit_raw_px or 0.0),
+                        "audit_strikes": int(q.audit_strikes),
+                    }
             else:
                 d = q.last_diag
                 if d is not None:

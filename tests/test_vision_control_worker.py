@@ -81,6 +81,9 @@ class FakeQuad:
         self.last_update_ms = 0.0
         self.last_diag: dict | None = None
         self.acq_progress = (0, 10)
+        self.last_audit_px: float | None = None
+        self.last_audit_raw_px: float | None = None
+        self.audit_strikes = 0
 
 
 class FakeTracker:
@@ -404,7 +407,7 @@ class TestQuadTelemetry:
         assert diag["sides"][1]["reason"] == "low-contrast"
         assert snaps[0].quad_corners_px is None          # not locked
 
-    def test_locked_quad_has_no_diag(self) -> None:
+    def test_locked_quad_has_no_acq_diag(self) -> None:
         snaps: list[ControlSnapshot] = []
         worker, camera, _ = _make_worker([_ball()])
         tracker = worker.ball_tracker
@@ -417,8 +420,31 @@ class TestQuadTelemetry:
         worker._last_snapshot_emit_perf = -1e9
         camera.advance()
         worker._tick()
+        # No audit has run yet -> no diag at all; corners present.
         assert snaps[0].quad_diag is None
         assert snaps[0].quad_corners_px is not None
+
+    def test_locked_quad_audit_numbers_propagate(self) -> None:
+        snaps: list[ControlSnapshot] = []
+        worker, camera, _ = _make_worker([_ball()])
+        tracker = worker.ball_tracker
+        assert tracker is not None
+        tracker.quad_enabled = True             # type: ignore[attr-defined]
+        tracker.quad.state = "locked"           # type: ignore[attr-defined]
+        tracker.quad.last_corners_cam = np.zeros((4, 2))  # type: ignore[attr-defined]
+        tracker.quad.last_audit_px = 1.7        # type: ignore[attr-defined]
+        tracker.quad.last_audit_raw_px = 8.9    # type: ignore[attr-defined]
+        tracker.quad.audit_strikes = 2          # type: ignore[attr-defined, misc]
+        worker.snapshot_ready.connect(snaps.append)
+        worker._last_snapshot_emit_perf = -1e9
+        camera.advance()
+        worker._tick()
+        diag = snaps[0].quad_diag
+        assert isinstance(diag, dict)
+        assert diag["state"] == "locked"
+        assert diag["audit_px"] == 1.7
+        assert diag["audit_raw_px"] == 8.9
+        assert diag["audit_strikes"] == 2
 
     def test_quad_fit_timing_key_only_when_enabled(self) -> None:
         # Disabled (the legacy default): no key — no fabricated zeros.
