@@ -1,0 +1,537 @@
+"""
+control/orbit.py
+
+HarmonicOrbit — feedforward-driven smooth circular motion (2026-07-27).
+
+A SEPARATE mode from the carrot-chasing PathFollower: the reference is
+CLOCK-driven (constant angular rate, no error-paced advance — the
+pacing law's error->speed coupling is the jank source in path-follow
+circles), the platform plays a smooth rotating tilt pattern tuned to
+the plant, and feedback is demoted to a trim role.
+
+Physics: for x_r = R(cos phi, sin phi), phi_dot = omega = v/R, exact
+tracking needs the centripetal tilt omega^2*R/g_eff as a constant-
+magnitude ROTATING vector (a coning motion), phase-ADVANCED by
+omega*lead_s to cancel the actuation delay. At rig numbers (r=50,
+v=40) that is only ~0.19 deg — the plate-specific disturbances DWARF
+it (bowl warp alone needs ~0.28 deg at r=50), and while orbiting they
+are PERIODIC at omega. So the heart of the mode is a LEARNED per-phase
+correction table (iterative learning control): ORBIT_ILC_BINS tilt
+vectors indexed by reference phase, refined every visit.
+
+ILC update law (the sign subtlety): with feedback active at these
+gains, the feedback stiffness g*kp_eff dominates ball inertia omega^2
+at the fundamental, so the position error is ALIGNED with the
+disturbance (rig confirmation: the center-attracting bowl parks the
+ball ~8 mm INSIDE the circle — the needed correction is outward,
+toward the reference). The per-visit update is
+
+    delta_c_k = mu * gamma * (ref - ball),
+    gamma = kp_eff - omega^2 / g_eff        [deg/mm]
+
+which is the in-phase inverse of the closed-loop correction->error
+map; it reduces to the inertia-dominated law mu*(omega^2/g)*(ball-ref)
+as kp_eff -> 0 and self-flips sign at the scaled-gain resonance
+omega = sqrt(g*kp_eff). The effective orbit speed is soft-clamped so
+omega stays below 0.85x that resonance.
+
+Learning stability (sim-caught, twice): (a) each write fires once per
+BIN TRANSIT using the mean error across the transit — per-frame
+point-writes hit each bin ~10x per lap and turned the intended 0.75
+per-lap contraction into near-instant (and, for wrong-signed
+harmonics, explosive) updates; (b) writes are spread over neighboring
+bins with a Gaussian kernel (ORBIT_ILC_WRITE_SIGMA_BINS), band-
+limiting the table below the resonance — harmonics n >= 3 at these
+numbers have a SIGN-FLIPPED closed-loop response, and unfiltered
+point-writes pumped n=3-4 to the clamp (divergence after 4 laps).
+Remaining aids: per-LAP table leak, per-bin norm clamp, a 1-2-1
+circular smoothing pass once per lap, and linear interpolation
+between bins on OUTPUT (a 15-deg-bin staircase would thump the
+servos).
+
+Phase bookkeeping (delay attribution): OUTPUT reads the table at
+phi + omega*lead_s; UPDATE writes at phi. The bin read lead_s ago is
+exactly the bin whose tilt is acting on the ball now, so writing the
+currently-observed error at the CURRENT phase charges the right bin.
+The learned error therefore uses the FILTERED ball position, not the
+predicted one.
+
+States: idle -> entrain (seed at the ball's current angle/radius, ramp
+omega and r over ORBIT_SPINUP_S — the ball is picked up where it is,
+never dragged) -> track (learning on) -> recover (error tripwire:
+freeze the table, re-entrain from the current ball state) -> track.
+
+Pure Python + numpy, injected clock, no Qt (PathFollower precedent).
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import numpy as np
+
+from settings import (
+    ORBIT_ENTRAIN_MIN_RADIUS_MM,
+    ORBIT_FB_GAIN_SCALE,
+    ORBIT_FF_TILT_MAX_DEG,
+    ORBIT_ILC_BINS,
+    ORBIT_ILC_CLAMP_DEG,
+    ORBIT_ILC_LEAK,
+    ORBIT_ILC_MU,
+    ORBIT_ILC_WRITE_SIGMA_BINS,
+    ORBIT_LEARN_GATE_MM,
+    ORBIT_RADIUS_MAX_MM,
+    ORBIT_RADIUS_MIN_MM,
+    ORBIT_RADIUS_MM,
+    ORBIT_RECOVER_FRAMES,
+    ORBIT_RECOVER_MM,
+    ORBIT_SPINUP_S,
+    PATH_SPEED_MAX_MM_S,
+    PATH_SPEED_MIN_MM_S,
+    PATH_SPEED_MM_S,
+)
+
+STATE_IDLE = "idle"
+STATE_ENTRAIN = "entrain"
+STATE_TRACK = "track"
+STATE_RECOVER = "recover"
+
+_TWO_PI = 2.0 * math.pi
+# Fraction of the scaled-gain resonance the orbit omega may reach: past
+# the resonance the ILC gain gamma crosses zero and learning stalls.
+_RESONANCE_MARGIN = 0.85
+
+
+@dataclass(frozen=True)
+class OrbitCommand:
+    """One frame's orbit output for the controller."""
+    target_x_mm: float
+    target_y_mm: float
+    v_des_mm_s: tuple[float, float]
+    ff_deg: tuple[float, float]      # analytic + learned, PIDCore ff space
+    err_mm: float                    # |ball - reference|
+
+
+class HarmonicOrbit:
+    """Clock-driven circular reference + feedforward + per-phase ILC.
+
+    See the module docstring for the physics and the state machine."""
+
+    def __init__(
+        self,
+        clock: Callable[[], float],
+        radius_mm: float = ORBIT_RADIUS_MM,
+        speed_mm_s: float = PATH_SPEED_MM_S,
+    ) -> None:
+        self._clock = clock
+        self._r_target = self._clamp_radius(radius_mm)
+        self._speed_mm_s = self._clamp_speed(speed_mm_s)
+
+        self.fb_gain_scale = float(ORBIT_FB_GAIN_SCALE)
+        self.spinup_s = float(ORBIT_SPINUP_S)
+        self.ff_tilt_max_deg = float(ORBIT_FF_TILT_MAX_DEG)
+        self.ilc_bins = int(ORBIT_ILC_BINS)
+        self.ilc_mu = float(ORBIT_ILC_MU)
+        self.ilc_leak = float(ORBIT_ILC_LEAK)
+        self.ilc_clamp_deg = float(ORBIT_ILC_CLAMP_DEG)
+        self.learn_gate_mm = float(ORBIT_LEARN_GATE_MM)
+        self.recover_mm = float(ORBIT_RECOVER_MM)
+        self.recover_frames = int(ORBIT_RECOVER_FRAMES)
+
+        self._state = STATE_IDLE
+        self._seeded = False
+        self._phi = 0.0
+        self._omega = 0.0
+        self._r = 0.0
+        self._r_rate_hold = 0.0        # fixed r ramp rate, set at seed
+        self._omega_target_eff = 0.0   # last resonance-clamped target
+        self._last_t: float | None = None
+        self._lap = 0
+        self._recover_count = 0
+        self._err_frames = 0
+        self._learning = False
+        self._last_err_mm = 0.0
+        self._last_ff_deg = 0.0
+        self._last_ilc_deg = 0.0
+        self._cx = np.zeros(self.ilc_bins)
+        self._cy = np.zeros(self.ilc_bins)
+
+        # Bin-transit accumulator: mean error while traversing one bin,
+        # flushed as a single kernel-spread write on bin exit.
+        self._bin_cur: int | None = None
+        self._bin_err_x = 0.0
+        self._bin_err_y = 0.0
+        self._bin_err_n = 0
+        # Circular Gaussian write kernel, normalized to sum 1.
+        sigma = max(0.5, float(ORBIT_ILC_WRITE_SIGMA_BINS))
+        idx = np.arange(self.ilc_bins)
+        dist = np.minimum(idx, self.ilc_bins - idx).astype(float)
+        kernel = np.exp(-0.5 * (dist / sigma) ** 2)
+        self._write_kernel = kernel / kernel.sum()
+
+    # ------------------------------------------------------------------
+    # Config
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clamp_radius(radius_mm: float) -> float:
+        return max(ORBIT_RADIUS_MIN_MM, min(ORBIT_RADIUS_MAX_MM, float(radius_mm)))
+
+    @staticmethod
+    def _clamp_speed(mm_s: float) -> float:
+        return max(PATH_SPEED_MIN_MM_S, min(PATH_SPEED_MAX_MM_S, float(mm_s)))
+
+    def set_radius(self, radius_mm: float) -> None:
+        """Change the reference radius. RESETS the correction table —
+        the learned warp correction is radius-specific."""
+        self._r_target = self._clamp_radius(radius_mm)
+        self._cx[:] = 0.0
+        self._cy[:] = 0.0
+        if self._seeded:
+            # Mid-orbit change: ramp to the new radius at the entrain rate.
+            self._r_rate_hold = abs(self._r_target - self._r) / max(
+                0.5, self.spinup_s
+            )
+
+    def set_speed(self, mm_s: float) -> None:
+        """Change the tangential speed. The table is KEPT: the dominant
+        warp part is omega-independent and the leak ages out the rest."""
+        self._speed_mm_s = self._clamp_speed(mm_s)
+
+    @property
+    def radius_mm(self) -> float:
+        return self._r_target
+
+    @property
+    def speed_mm_s(self) -> float:
+        return self._speed_mm_s
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> bool:
+        """Arm the orbit; the seed happens on the FIRST update() with a
+        ball, so the platform does not move on start (PathFollower's
+        armed-seed pattern)."""
+        if self._state != STATE_IDLE:
+            return True
+        self._state = STATE_ENTRAIN
+        self._seeded = False
+        self._lap = 0
+        self._recover_count = 0
+        self._err_frames = 0
+        return True
+
+    def stop(self) -> None:
+        """Back to idle. The correction table is kept — a restart on the
+        same radius resumes with everything already learned."""
+        self._state = STATE_IDLE
+        self._seeded = False
+        self._last_t = None
+
+    @property
+    def active(self) -> bool:
+        return self._state != STATE_IDLE
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def wants_integral_frozen(self) -> bool:
+        """The controller freezes the PID integral when this is True —
+        the whole TRACK state. Division of labor (both sides sim-
+        caught): a RUNNING integral at orbit frequency has more gain
+        than the scaled P-term with 90 deg lag, so it chases the
+        rotating error itself and fights the learning table
+        (convergence plateaued); and freezing it mid-chase later
+        snapshots a rotating component as a bogus DC (a 3x error jump
+        at the handoff). So the integral runs only while the reference
+        is not yet rotating fast (entrain/recover — it grabs the DC
+        bias there), freezes for all of TRACK, and the table's n0
+        component finishes whatever DC remains."""
+        return self._state == STATE_TRACK
+
+    # ------------------------------------------------------------------
+    # Per-cycle
+    # ------------------------------------------------------------------
+
+    def update(
+        self,
+        ball_x: float,
+        ball_y: float,
+        lead_s: float,
+        g_eff: float,
+        kp_eff: float,
+    ) -> OrbitCommand:
+        """One control cycle; see the module docstring for the flow.
+
+        lead_s: total actuation delay (the controller's _predict_s);
+        g_eff: mm/s^2 per deg; kp_eff: the SCALED feedback kp actually
+        flying (kp * ORBIT_FB_GAIN_SCALE) — both feed the ILC gain."""
+        g_eff = max(1.0, float(g_eff))
+        if self._state == STATE_IDLE:
+            return OrbitCommand(ball_x, ball_y, (0.0, 0.0), (0.0, 0.0), 0.0)
+
+        if not self._seeded:
+            self._seed(ball_x, ball_y)
+            return OrbitCommand(
+                self._r * math.cos(self._phi),
+                self._r * math.sin(self._phi),
+                (0.0, 0.0), (0.0, 0.0), 0.0,
+            )
+
+        now = self._clock()
+        prev_t = self._last_t if self._last_t is not None else now
+        dt = min(0.1, max(1e-4, now - prev_t))
+        self._last_t = now
+
+        # Soft resonance clamp on the commanded angular rate.
+        omega_res = math.sqrt(g_eff * max(1e-6, kp_eff))
+        omega_target = min(
+            self._speed_mm_s / max(1.0, self._r_target),
+            _RESONANCE_MARGIN * omega_res,
+        )
+        self._omega_target_eff = omega_target
+
+        # Slew omega and r toward their targets (the entrain/spin-up
+        # ramps); the APPLIED rates feed the feedforward below.
+        omega_rate = omega_target / max(0.5, self.spinup_s)
+        alpha = self._slew_toward(omega_target, "_omega", omega_rate, dt)
+        r_rate = self._r_rate_hold if self._r_rate_hold > 0.0 else 1.0
+        r_dot = self._slew_toward(self._r_target, "_r", r_rate, dt)
+
+        # Advance phase; a wrap is one lap and triggers the smoothing
+        # pass over the correction table.
+        self._phi += self._omega * dt
+        if self._phi >= _TWO_PI:
+            self._phi -= _TWO_PI
+            self._lap += 1
+            self._smooth_table()
+
+        ref_x, ref_y, v_des = self._reference(r_dot)
+        ex = ball_x - ref_x
+        ey = ball_y - ref_y
+        err = math.hypot(ex, ey)
+        self._last_err_mm = err
+
+        reseeded = self._step_state_machine(err, ball_x, ball_y)
+        if reseeded:
+            # The seed moved the reference onto the ball: recompute this
+            # frame's output from the fresh state (omega=0, no ramps) so
+            # the command is continuous with the new entrainment.
+            alpha = 0.0
+            ref_x, ref_y, v_des = self._reference(0.0)
+            ex = ball_x - ref_x
+            ey = ball_y - ref_y
+            err = math.hypot(ex, ey)
+            self._last_err_mm = err
+
+        # Feedforward at the ADVANCED phase: the tilt commanded now acts
+        # lead_s later, when the reference is at phi + omega*lead_s.
+        phi_a = self._phi + self._omega * max(0.0, float(lead_s))
+        cos_a = math.cos(phi_a)
+        sin_a = math.sin(phi_a)
+        a_cent = self._omega * self._omega * self._r
+        a_tan = alpha * self._r
+        ff_x = (-a_cent * cos_a - a_tan * sin_a) / g_eff
+        ff_y = (-a_cent * sin_a + a_tan * cos_a) / g_eff
+        ilc_x, ilc_y = self._ilc_read(phi_a)
+        self._last_ilc_deg = math.hypot(ilc_x, ilc_y)
+        ff_x += ilc_x
+        ff_y += ilc_y
+        ff_mag = math.hypot(ff_x, ff_y)
+        if ff_mag > self.ff_tilt_max_deg:
+            scale = self.ff_tilt_max_deg / ff_mag
+            ff_x *= scale
+            ff_y *= scale
+            ff_mag = self.ff_tilt_max_deg
+        self._last_ff_deg = ff_mag
+
+        self._learning = (
+            self._state == STATE_TRACK and err <= self.learn_gate_mm
+        )
+        self._ilc_step(-ex, -ey, g_eff, kp_eff)
+
+        return OrbitCommand(ref_x, ref_y, v_des, (ff_x, ff_y), err)
+
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
+
+    def telemetry(self) -> dict[str, Any]:
+        """Terms-dict fragment; identical key set in every state."""
+        return {
+            "orbit_active": self.active,
+            "orbit_state": self._state,
+            "orbit_phase": self._phi,
+            "orbit_omega": self._omega,
+            "orbit_r_mm": self._r,
+            "orbit_err_mm": self._last_err_mm,
+            "orbit_ff_deg": self._last_ff_deg,
+            "orbit_ilc_deg": self._last_ilc_deg,
+            "orbit_lap": self._lap,
+            "orbit_recover_count": self._recover_count,
+            "orbit_learning": self._learning,
+        }
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _reference(
+        self, r_dot: float
+    ) -> tuple[float, float, tuple[float, float]]:
+        """Current reference point + desired velocity."""
+        cos_p = math.cos(self._phi)
+        sin_p = math.sin(self._phi)
+        ref_x = self._r * cos_p
+        ref_y = self._r * sin_p
+        v_des = (
+            -self._omega * self._r * sin_p + r_dot * cos_p,
+            self._omega * self._r * cos_p + r_dot * sin_p,
+        )
+        return ref_x, ref_y, v_des
+
+    def _seed(self, ball_x: float, ball_y: float) -> None:
+        """Pick the ball up where it is: phase from its current angle,
+        radius from its current radius (floored), omega from zero."""
+        r_ball = math.hypot(ball_x, ball_y)
+        self._phi = math.atan2(ball_y, ball_x) if r_ball > 1.0 else 0.0
+        if self._phi < 0.0:
+            self._phi += _TWO_PI
+        self._r = max(
+            ORBIT_ENTRAIN_MIN_RADIUS_MM,
+            min(ORBIT_RADIUS_MAX_MM, r_ball),
+        )
+        # Fixed r ramp rate for the whole entrain (recomputing from the
+        # shrinking distance would asymptote instead of arriving).
+        self._r_rate_hold = abs(self._r_target - self._r) / max(0.5, self.spinup_s)
+        self._omega = 0.0
+        self._seeded = True
+        self._last_t = self._clock()
+        self._err_frames = 0
+
+    def _slew_toward(
+        self, target: float, attr: str, rate: float, dt: float
+    ) -> float:
+        """Move self.<attr> toward target at |rate|; returns the APPLIED
+        signed rate this frame (0 when already there)."""
+        current = float(getattr(self, attr))
+        delta = target - current
+        step = rate * dt
+        if abs(delta) <= step:
+            setattr(self, attr, target)
+            return delta / dt if dt > 0 else 0.0
+        applied = math.copysign(step, delta)
+        setattr(self, attr, current + applied)
+        return applied / dt
+
+    def _step_state_machine(
+        self, err: float, ball_x: float, ball_y: float
+    ) -> bool:
+        """Advance entrain/track/recover; returns True when a RECOVER
+        trip re-seeded the reference this frame."""
+        if self._state in (STATE_ENTRAIN, STATE_RECOVER):
+            at_speed = abs(self._omega - self._omega_target_eff) < 1e-3
+            at_radius = abs(self._r - self._r_target) < 0.5
+            if at_speed and at_radius:
+                self._state = STATE_TRACK
+                self._err_frames = 0
+            return False
+        # TRACK: error tripwire -> re-entrain (never drag the ball).
+        if err > self.recover_mm:
+            self._err_frames += 1
+            if self._err_frames >= self.recover_frames:
+                self._state = STATE_RECOVER
+                self._recover_count += 1
+                self._seed(ball_x, ball_y)
+                return True
+        else:
+            self._err_frames = 0
+        return False
+
+    # --- ILC table ---
+
+    def _bin_pos(self, phi: float) -> float:
+        return (phi % _TWO_PI) / _TWO_PI * self.ilc_bins
+
+    def _ilc_read(self, phi: float) -> tuple[float, float]:
+        """Linear interpolation between the two adjacent bins."""
+        pos = self._bin_pos(phi)
+        k0 = int(pos) % self.ilc_bins
+        k1 = (k0 + 1) % self.ilc_bins
+        frac = pos - int(pos)
+        return (
+            (1.0 - frac) * self._cx[k0] + frac * self._cx[k1],
+            (1.0 - frac) * self._cy[k0] + frac * self._cy[k1],
+        )
+
+    def _ilc_gain(self, g_eff: float, kp_eff: float) -> float:
+        """deg/mm error->correction gain: the in-phase inverse of the
+        closed-loop correction->error map (see module docstring)."""
+        return float(kp_eff) - self._omega * self._omega / g_eff
+
+    def _ilc_step(
+        self, ref_minus_ball_x: float, ref_minus_ball_y: float,
+        g_eff: float, kp_eff: float,
+    ) -> None:
+        """Accumulate the error over the current bin transit; flush ONE
+        kernel-spread write when the phase enters a new bin (per-lap
+        contraction as designed — see the module docstring)."""
+        k_now = int(self._bin_pos(self._phi)) % self.ilc_bins
+        if self._learning:
+            if k_now != self._bin_cur:
+                self._flush_bin(g_eff, kp_eff)
+                self._bin_cur = k_now
+            self._bin_err_x += ref_minus_ball_x
+            self._bin_err_y += ref_minus_ball_y
+            self._bin_err_n += 1
+        else:
+            # Not learning: drop any partial accumulation (stale data
+            # from before a gate trip must not be written later).
+            self._bin_cur = k_now
+            self._bin_err_x = 0.0
+            self._bin_err_y = 0.0
+            self._bin_err_n = 0
+
+    def _flush_bin(self, g_eff: float, kp_eff: float) -> None:
+        if self._bin_cur is None or self._bin_err_n == 0:
+            self._bin_err_x = 0.0
+            self._bin_err_y = 0.0
+            self._bin_err_n = 0
+            return
+        mean_x = self._bin_err_x / self._bin_err_n
+        mean_y = self._bin_err_y / self._bin_err_n
+        gamma = self._ilc_gain(g_eff, kp_eff)
+        kernel = np.roll(self._write_kernel, self._bin_cur)
+        self._cx += self.ilc_mu * gamma * mean_x * kernel
+        self._cy += self.ilc_mu * gamma * mean_y * kernel
+        self._clamp_table()
+        self._bin_err_x = 0.0
+        self._bin_err_y = 0.0
+        self._bin_err_n = 0
+
+    def _clamp_table(self) -> None:
+        mag = np.hypot(self._cx, self._cy)
+        over = mag > self.ilc_clamp_deg
+        if np.any(over):
+            scale = np.ones_like(mag)
+            scale[over] = self.ilc_clamp_deg / mag[over]
+            self._cx *= scale
+            self._cy *= scale
+
+    def _smooth_table(self) -> None:
+        """Once per lap: 1-2-1 circular smoothing (damps high-harmonic
+        content whose closed-loop response sign flips above the
+        resonance) plus the table leak (mis-learned corrections age
+        out; a restart on the same radius keeps what is still valid)."""
+        for table in (self._cx, self._cy):
+            table[:] = (
+                0.25 * np.roll(table, 1)
+                + 0.5 * table
+                + 0.25 * np.roll(table, -1)
+            ) * (1.0 - self.ilc_leak)

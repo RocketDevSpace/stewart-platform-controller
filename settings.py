@@ -386,9 +386,20 @@ ORBIT_ENTRAIN_MIN_RADIUS_MM = 15.0  # entrain radius floor (atan2 stability)
 ORBIT_FB_GAIN_SCALE = 0.5         # p/d scale while orbiting (integral untouched)
 ORBIT_FF_TILT_MAX_DEG = 1.5       # ff vector-norm cap (analytic + learned)
 ORBIT_ILC_BINS = 24               # per-phase correction bins (15 deg/bin)
-ORBIT_ILC_MU = 0.25               # learning rate (fraction of residual per visit)
-ORBIT_ILC_LEAK = 0.02             # per-visit leak (mis-learned corrections age out)
-ORBIT_ILC_CLAMP_DEG = 0.6         # per-bin correction vector-norm clamp
+ORBIT_ILC_MU = 0.5                # learning rate (fraction of residual per bin-visit)
+ORBIT_ILC_LEAK = 0.02             # per-LAP table leak (mis-learned corrections age out)
+ORBIT_ILC_CLAMP_DEG = 0.8         # per-bin correction vector-norm clamp
+#   (headroom: rotating warp ~0.28 deg + the residual DC the table
+#    inherits when the integral freezes at TRACK entry)
+# Gaussian write kernel width: each bin-transit update is spread over
+# neighboring bins, BAND-LIMITING what the table can learn. Sim-caught:
+# harmonics at n*omega above the scaled-gain resonance sqrt(g*kp_eff)
+# have a sign-flipped closed-loop response, so point-writes PUMP them
+# (n=3-4 grew to the clamp and the orbit diverged after 4 laps). At
+# sigma=2.5 of 24 bins the fundamental learns at 0.81x speed while n=3
+# is attenuated 0.15x — under the per-lap smoothing + leak damping
+# even at mu=0.5 (fundamental contraction ~0.68/lap).
+ORBIT_ILC_WRITE_SIGMA_BINS = 2.5
 ORBIT_LEARN_GATE_MM = 20.0        # no learning above this tracking error
 ORBIT_RECOVER_MM = 30.0           # error tripwire -> RECOVER (freeze + re-entrain)
 ORBIT_RECOVER_FRAMES = 10         # consecutive frames above the tripwire
