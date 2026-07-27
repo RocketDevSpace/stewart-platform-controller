@@ -368,6 +368,32 @@ PATH_MAX_RADIUS_MM = 85.0
 PATH_POINT_SPACING_MM = 2.0       # uniform resample spacing
 
 # =============================================================================
+# Harmonic orbit (control/orbit.py)
+# =============================================================================
+# A SEPARATE mode from path following: a clock-driven circular reference
+# with analytic feedforward tilt (rotating centripetal vector, phase-
+# advanced by the actuation delay) plus a LEARNED per-phase correction
+# table (iterative learning control — the plate-specific warp/drag
+# harmonics dwarf the analytic term: bowl warp alone needs ~0.28 deg at
+# r=50 vs 0.19 deg centripetal at v=40). Feedback is demoted to a trim
+# role (p/d scaled; integral untouched for DC trim). Speed reuses the
+# Path Speed slider (PATH_SPEED_* bounds).
+ORBIT_RADIUS_MM = 50.0            # default reference radius (marker-safe)
+ORBIT_RADIUS_MIN_MM = 30.0        # GUI spinbox bounds
+ORBIT_RADIUS_MAX_MM = 70.0
+ORBIT_SPINUP_S = 4.0              # omega 0 -> target ramp (also the r ramp window)
+ORBIT_ENTRAIN_MIN_RADIUS_MM = 15.0  # entrain radius floor (atan2 stability)
+ORBIT_FB_GAIN_SCALE = 0.5         # p/d scale while orbiting (integral untouched)
+ORBIT_FF_TILT_MAX_DEG = 1.5       # ff vector-norm cap (analytic + learned)
+ORBIT_ILC_BINS = 24               # per-phase correction bins (15 deg/bin)
+ORBIT_ILC_MU = 0.25               # learning rate (fraction of residual per visit)
+ORBIT_ILC_LEAK = 0.02             # per-visit leak (mis-learned corrections age out)
+ORBIT_ILC_CLAMP_DEG = 0.6         # per-bin correction vector-norm clamp
+ORBIT_LEARN_GATE_MM = 20.0        # no learning above this tracking error
+ORBIT_RECOVER_MM = 30.0           # error tripwire -> RECOVER (freeze + re-entrain)
+ORBIT_RECOVER_FRAMES = 10         # consecutive frames above the tripwire
+
+# =============================================================================
 # Loop rates
 # =============================================================================
 CONTROL_LOOP_INTERVAL_MS = 20
