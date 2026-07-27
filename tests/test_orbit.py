@@ -374,10 +374,14 @@ class TestConeMode:
         clock = FakeClock()
         o = self._cone(clock)
         o.start()
-        o.update(30.0, 0.0, 0.0, G_EFF, 0.0)         # seed
+        bx, by = 30.0, 0.0
+        cmd = o.update(bx, by, 0.0, G_EFF, 0.0)      # seed
         for _ in range(int(6.0 / DT)):
             clock.advance(DT)
-            cmd = o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+            # Ball rides the expected point: center EMA ~ 0 -> dc ~ 0,
+            # so the ff magnitude is the pure cone amplitude.
+            bx, by = cmd.target_x_mm, cmd.target_y_mm
+            cmd = o.update(bx, by, 0.0, G_EFF, 0.0)
         tel = o.telemetry()
         assert tel["orbit_state"] == STATE_CONE
         # omega includes the warp-spring term (the plate's bowl acts as
@@ -387,19 +391,23 @@ class TestConeMode:
             G_EFF * (o.cone_warp_c + o.cone_tilt_deg / 50.0)
         )
         assert tel["orbit_omega"] == pytest.approx(expected_omega, rel=1e-6)
+        # The center-EMA of a rotating point keeps ~5 mm of ripple,
+        # feeding a benign ~0.03 deg dc — hence the loose tolerance.
         assert math.hypot(*cmd.ff_deg) == pytest.approx(
-            o.cone_tilt_deg, abs=1e-9
+            o.cone_tilt_deg, abs=0.1
         )
         # Expected ring radius = g*A/omega^2 = the dialed radius.
         assert tel["orbit_r_mm"] == pytest.approx(50.0, rel=1e-6)
 
-    def test_open_loop_ball_input_does_not_change_tilt(self) -> None:
-        # Two runs with completely different ball feeds -> identical
-        # tilt sequences (the cone never chases the ball).
+    def test_open_loop_ball_input_does_not_change_cone(self) -> None:
+        # With the (slow, separate) center corrector disabled, two runs
+        # with completely different ball feeds produce IDENTICAL tilt
+        # sequences — the cone itself never chases the ball.
         seqs = []
         for feed in ((30.0, 0.0), (-45.0, 60.0)):
             clock = FakeClock()
             o = self._cone(clock)
+            o.cone_center_gain = 0.0                 # isolate the pure cone
             o.start()
             o.update(30.0, 0.0, 0.0, G_EFF, 0.0)     # same seed ball
             seq = []
@@ -409,6 +417,23 @@ class TestConeMode:
                 seq.append(cmd.ff_deg)
             seqs.append(seq)
         assert seqs[0] == seqs[1]
+
+    def test_center_corrector_opposes_a_parked_offset(self) -> None:
+        # Ball parked 40 mm off in +x for many laps: the center EMA
+        # converges there and the DC tilt grows NEGATIVE in x (pushing
+        # the orbit center back), never exceeding its clamp. This is
+        # the ONLY feedback in cone mode — it acts on the per-lap
+        # average, so it cannot jitter against the rotation.
+        clock = FakeClock()
+        o = self._cone(clock)
+        o.start()
+        o.update(40.0, 0.0, 0.0, G_EFF, 0.0)
+        for _ in range(int(60.0 / DT)):
+            clock.advance(DT)
+            o.update(40.0, 0.0, 0.0, G_EFF, 0.0)
+        assert o._center_x == pytest.approx(40.0, rel=0.1)
+        assert o._dc_x < -0.1                        # steering back
+        assert math.hypot(o._dc_x, o._dc_y) <= o.cone_dc_clamp_deg + 1e-9
 
     def test_amplitude_ramps_over_spinup(self) -> None:
         clock = FakeClock()
@@ -428,16 +453,29 @@ class TestConeMode:
     def test_target_is_anti_phase_to_tilt(self) -> None:
         clock = FakeClock()
         o = self._cone(clock)
+        o.cone_center_gain = 0.0                     # pure cone geometry
         o.start()
         o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        cmd = None
         for _ in range(int(6.0 / DT)):
             clock.advance(DT)
             cmd = o.update(30.0, 0.0, 0.0, G_EFF, 0.0)
+        assert cmd is not None
         ff_mag = math.hypot(*cmd.ff_deg)
         t_mag = math.hypot(cmd.target_x_mm, cmd.target_y_mm)
         dot = (cmd.ff_deg[0] * cmd.target_x_mm
                + cmd.ff_deg[1] * cmd.target_y_mm) / (ff_mag * t_mag)
         assert dot == pytest.approx(-1.0, abs=1e-9)  # ball rides opposite
+
+    def test_set_cone_tilt_clamps_and_applies_live(self) -> None:
+        clock = FakeClock()
+        o = self._cone(clock)
+        o.set_cone_tilt(10.0)
+        assert o.cone_tilt_deg == pytest.approx(4.0)  # max clamp
+        o.set_cone_tilt(0.01)
+        assert o.cone_tilt_deg == pytest.approx(0.25)  # min clamp
+        o.set_cone_tilt(2.5)
+        assert o.cone_tilt_deg == pytest.approx(2.5)
 
     def test_feedback_off_and_integral_frozen(self) -> None:
         clock = FakeClock()

@@ -392,7 +392,9 @@ ORBIT_ENTRAIN_MIN_RADIUS_MM = 15.0  # entrain radius floor (atan2 stability)
 # instability; "feedback demoted to trim" is achieved by the ff+table
 # carrying the drive, not by weakening the corrector.
 ORBIT_FB_GAIN_SCALE = 1.0
-ORBIT_FF_TILT_MAX_DEG = 1.5       # ff vector-norm cap (analytic + learned)
+ORBIT_FF_TILT_MAX_DEG = 4.5       # ff vector-norm cap (analytic + learned;
+#                                   must clear ORBIT_CONE_TILT_MAX_DEG —
+#                                   1.5 silently truncated the cone)
 ORBIT_ILC_BINS = 24               # per-phase correction bins (15 deg/bin)
 ORBIT_ILC_MU = 0.5                # learning rate (fraction of residual per bin-visit)
 ORBIT_ILC_LEAK = 0.02             # per-LAP table leak (mis-learned corrections age out)
@@ -451,8 +453,28 @@ ORBIT_TRACK_ENTRY_ERR_MM = 25.0       # capture gate for entrain -> track
 # mode; the closed-loop reference/ILC machinery stays available
 # behind the flag.
 ORBIT_CONE_ONLY = True
-ORBIT_CONE_TILT_DEG = 0.6
+# Cone amplitude. First rig attempt used 0.6 deg — the steady-state
+# textbook number — which moves the platform EDGE by ~1.3 mm:
+# invisible, and marginal against the real breakaway net of trim
+# errors ("genuinely not even moving"). 2.0 deg swings the edge
+# ~4 mm at omega=2.8 rad/s (r=50: one rev per ~2.3 s, predicted ball
+# speed ~140 mm/s) — an unmistakable cone. Live-tunable from the GUI
+# spinbox (ORBIT_CONE_TILT_MIN/MAX bounds).
+ORBIT_CONE_TILT_DEG = 2.0
+ORBIT_CONE_TILT_MIN_DEG = 0.25
+ORBIT_CONE_TILT_MAX_DEG = 4.0
 ORBIT_CONE_WARP_C = 0.0055        # rig-measured bowl coefficient (deg/mm)
+# Center corrector — the ONLY feedback in cone mode, and it acts on
+# the per-lap AVERAGE ball position (the orbit center), never the
+# instantaneous ball, so it cannot jitter the cone. Needed because the
+# warp spring is weak: sim-caught, a mere 0.3 deg residual trim bias
+# shifts the orbit center ~50 mm and the untethered orbit drifts off
+# the platform (a naive PID integral is WORSE — at cone frequency its
+# 90-deg-lagged chase pumps the orbit instead). Center estimate: EMA
+# with tau ~1.5 lap periods; correction: slow DC-tilt integrator with
+# closed-loop time constant ~ warp_c/(gain) ~ 8 s.
+ORBIT_CONE_CENTER_GAIN = 0.0007   # deg of DC tilt per mm of center error per s
+ORBIT_CONE_DC_CLAMP_DEG = 1.0     # DC correction clamp
 
 # =============================================================================
 # Loop rates

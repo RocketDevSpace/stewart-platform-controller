@@ -73,8 +73,12 @@ from typing import Any, Callable
 import numpy as np
 
 from settings import (
+    ORBIT_CONE_CENTER_GAIN,
+    ORBIT_CONE_DC_CLAMP_DEG,
     ORBIT_CONE_ONLY,
     ORBIT_CONE_TILT_DEG,
+    ORBIT_CONE_TILT_MAX_DEG,
+    ORBIT_CONE_TILT_MIN_DEG,
     ORBIT_CONE_WARP_C,
     ORBIT_ENTRAIN_MIN_RADIUS_MM,
     ORBIT_FB_GAIN_SCALE,
@@ -157,7 +161,13 @@ class HarmonicOrbit:
         self.cone_only = bool(ORBIT_CONE_ONLY)
         self.cone_tilt_deg = float(ORBIT_CONE_TILT_DEG)
         self.cone_warp_c = float(ORBIT_CONE_WARP_C)
+        self.cone_center_gain = float(ORBIT_CONE_CENTER_GAIN)
+        self.cone_dc_clamp_deg = float(ORBIT_CONE_DC_CLAMP_DEG)
         self._cone_amp = 0.0
+        self._center_x = 0.0     # slow EMA of the ball = orbit center
+        self._center_y = 0.0
+        self._dc_x = 0.0         # DC tilt correction steering the center
+        self._dc_y = 0.0
 
         self._state = STATE_IDLE
         self._seeded = False
@@ -218,6 +228,13 @@ class HarmonicOrbit:
         """Change the tangential speed. The table is KEPT: the dominant
         warp part is omega-independent and the leak ages out the rest."""
         self._speed_mm_s = self._clamp_speed(mm_s)
+
+    def set_cone_tilt(self, deg: float) -> None:
+        """Live cone-amplitude change (GUI spinbox); the running cone
+        slews to the new amplitude at the spin-up rate."""
+        self.cone_tilt_deg = max(
+            ORBIT_CONE_TILT_MIN_DEG, min(ORBIT_CONE_TILT_MAX_DEG, float(deg))
+        )
 
     @property
     def radius_mm(self) -> float:
@@ -316,6 +333,10 @@ class HarmonicOrbit:
                 if self._phi < 0.0:
                     self._phi += _TWO_PI
                 self._cone_amp = 0.0
+                self._center_x = ball_x
+                self._center_y = ball_y
+                self._dc_x = 0.0
+                self._dc_y = 0.0
             return OrbitCommand(
                 self._r * math.cos(self._phi),
                 self._r * math.sin(self._phi),
@@ -484,9 +505,28 @@ class HarmonicOrbit:
             self._phi -= _TWO_PI
             self._lap += 1
 
+        # Center corrector (the only feedback here): the orbit center
+        # is the slow EMA of the ball position — the rotating component
+        # averages out over a lap, so this cannot react to (or jitter
+        # against) the orbital motion itself. A weak DC tilt integrator
+        # steers the center back to the origin; without it a residual
+        # trim bias of 0.3 deg parks the center ~50 mm off through the
+        # weak warp spring (sim-caught: the orbit drifted off-platform).
+        lap_period = _TWO_PI / max(omega, 1e-3)
+        ema_alpha = dt / max(1.5 * lap_period, 1.0)
+        self._center_x += ema_alpha * (ball_x - self._center_x)
+        self._center_y += ema_alpha * (ball_y - self._center_y)
+        self._dc_x -= self.cone_center_gain * self._center_x * dt
+        self._dc_y -= self.cone_center_gain * self._center_y * dt
+        dc_mag = math.hypot(self._dc_x, self._dc_y)
+        if dc_mag > self.cone_dc_clamp_deg:
+            scale = self.cone_dc_clamp_deg / dc_mag
+            self._dc_x *= scale
+            self._dc_y *= scale
+
         ff = (
-            self._cone_amp * math.cos(self._phi),
-            self._cone_amp * math.sin(self._phi),
+            self._cone_amp * math.cos(self._phi) + self._dc_x,
+            self._cone_amp * math.sin(self._phi) + self._dc_y,
         )
         denom = max(1e-6, omega * omega - g_eff * self.cone_warp_c)
         r_exp = g_eff * self._cone_amp / denom
@@ -496,7 +536,7 @@ class HarmonicOrbit:
         err = abs(math.hypot(ball_x, ball_y) - r_exp)
         self._last_err_mm = err
         self._last_ff_deg = self._cone_amp
-        self._last_ilc_deg = 0.0
+        self._last_ilc_deg = math.hypot(self._dc_x, self._dc_y)
         self._learning = False
         return OrbitCommand(tx, ty, (0.0, 0.0), ff, err)
 

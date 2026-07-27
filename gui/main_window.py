@@ -53,6 +53,7 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    ORBIT_CONE_TILT_DEG,
     ORBIT_RADIUS_MM,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
@@ -92,6 +93,7 @@ class MainWindow(QWidget):
     vision_path_speed_updated = QtCore.pyqtSignal(float)
     vision_orbit_set = QtCore.pyqtSignal(bool)
     vision_orbit_radius_updated = QtCore.pyqtSignal(float)
+    vision_orbit_cone_tilt_updated = QtCore.pyqtSignal(float)
     vision_snapshot_consumed = QtCore.pyqtSignal()
 
     def __init__(self) -> None:
@@ -175,6 +177,7 @@ class MainWindow(QWidget):
         # Harmonic orbit mirrors (worker owns the truth via terms)
         self._orbit_active = False
         self._orbit_radius_mm = float(ORBIT_RADIUS_MM)
+        self._orbit_cone_tilt_deg = float(ORBIT_CONE_TILT_DEG)
 
         # --- Routine timer ---
         self._routine_timer = QtCore.QTimer()
@@ -225,6 +228,9 @@ class MainWindow(QWidget):
         self.control_panel.orbit_toggled.connect(self._on_orbit_toggled)
         self.control_panel.orbit_radius_changed.connect(
             self._on_orbit_radius_changed
+        )
+        self.control_panel.orbit_cone_tilt_changed.connect(
+            self._on_orbit_cone_tilt_changed
         )
         self.control_panel.path_speed_changed.connect(
             self._on_path_speed_changed
@@ -803,9 +809,14 @@ class MainWindow(QWidget):
     def _on_orbit_radius_changed(self, radius_mm: float) -> None:
         self._orbit_radius_mm = float(radius_mm)
         self.vision_orbit_radius_updated.emit(self._orbit_radius_mm)
+        self.vision_orbit_cone_tilt_updated.emit(self._orbit_cone_tilt_deg)
         if self._orbit_active:
             ring = circle(radius_mm=self._orbit_radius_mm)
             self._vision_monitor.set_path_overlay(ring.points, ring.closed)
+
+    def _on_orbit_cone_tilt_changed(self, deg: float) -> None:
+        self._orbit_cone_tilt_deg = float(deg)
+        self.vision_orbit_cone_tilt_updated.emit(self._orbit_cone_tilt_deg)
 
     # ------------------------------------------------------------------
     # Vision mode enable / disable
@@ -928,6 +939,9 @@ class MainWindow(QWidget):
         self.vision_orbit_radius_updated.connect(
             self._vision_worker.set_orbit_radius
         )
+        self.vision_orbit_cone_tilt_updated.connect(
+            self._vision_worker.set_orbit_cone_tilt
+        )
         self.vision_snapshot_consumed.connect(
             self._vision_worker.mark_snapshot_consumed
         )
@@ -986,6 +1000,8 @@ class MainWindow(QWidget):
              self._vision_worker.set_orbit_enabled),
             (self.vision_orbit_radius_updated,
              self._vision_worker.set_orbit_radius),
+            (self.vision_orbit_cone_tilt_updated,
+             self._vision_worker.set_orbit_cone_tilt),
             (self.vision_snapshot_consumed,
              self._vision_worker.mark_snapshot_consumed),
         ]:

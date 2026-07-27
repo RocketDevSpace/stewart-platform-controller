@@ -200,10 +200,11 @@ class TestConeModeWiring:
         ctrl = self._make_cone(clock)
         ctrl.start_orbit()
         clock.advance(1 / 30)
-        ctrl.compute_with_terms(_ball(30.0, 0.0))    # seed
-        for _ in range(240):                         # spin up fully
+        _, _, terms = ctrl.compute_with_terms(_ball(30.0, 0.0))    # seed
+        for _ in range(240):                         # spin up, riding the ring
             clock.advance(1 / 30)
-            _, _, terms = ctrl.compute_with_terms(_ball(30.0, 0.0))
+            bx, by = terms["target_x_mm"], terms["target_y_mm"]
+            _, _, terms = ctrl.compute_with_terms(_ball(bx, by))
         assert terms["orbit_state"] == "cone"
         # Ball far from the "target": P and D must contribute NOTHING.
         clock.advance(1 / 30)
@@ -211,9 +212,10 @@ class TestConeModeWiring:
         assert terms["p_term"] == pytest.approx((0.0, 0.0))
         assert terms["d_term"] == pytest.approx((0.0, 0.0))
         assert terms["i_frozen"] is True
-        # The cone tilt IS the command (plus trim, zero here).
+        # The cone tilt IS the command (plus trim + the slow center-DC
+        # term, both ~0 here since the ball rode the expected ring).
         assert math.hypot(*terms["ff_vec"]) == pytest.approx(
-            ctrl._orbit.cone_tilt_deg, abs=1e-9
+            ctrl._orbit.cone_tilt_deg, abs=0.15
         )
 
 

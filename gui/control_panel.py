@@ -15,6 +15,7 @@ from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -35,6 +36,9 @@ from settings import (
     GUI_LOG_MAX_LINES,
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
+    ORBIT_CONE_TILT_DEG,
+    ORBIT_CONE_TILT_MAX_DEG,
+    ORBIT_CONE_TILT_MIN_DEG,
     ORBIT_RADIUS_MAX_MM,
     ORBIT_RADIUS_MIN_MM,
     ORBIT_RADIUS_MM,
@@ -107,6 +111,7 @@ class ControlPanel(QWidget):
     path_speed_changed = pyqtSignal(float)           # mm/s
     orbit_toggled = pyqtSignal(bool)
     orbit_radius_changed = pyqtSignal(float)         # mm
+    orbit_cone_tilt_changed = pyqtSignal(float)      # deg
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -447,6 +452,18 @@ class ControlPanel(QWidget):
         self._orbit_radius_spin.setSuffix(" mm")
         self._orbit_radius_spin.valueChanged.connect(self._on_orbit_radius_changed)
         orbit_row.addWidget(self._orbit_radius_spin)
+        self._orbit_tilt_spin = QDoubleSpinBox()
+        self._orbit_tilt_spin.setRange(
+            float(ORBIT_CONE_TILT_MIN_DEG), float(ORBIT_CONE_TILT_MAX_DEG)
+        )
+        self._orbit_tilt_spin.setSingleStep(0.25)
+        self._orbit_tilt_spin.setValue(float(ORBIT_CONE_TILT_DEG))
+        self._orbit_tilt_spin.setSuffix(" °")
+        self._orbit_tilt_spin.setToolTip(
+            "Cone tilt amplitude — the platform's rotating tilt in cone mode"
+        )
+        self._orbit_tilt_spin.valueChanged.connect(self._on_orbit_tilt_changed)
+        orbit_row.addWidget(self._orbit_tilt_spin)
         pg.addLayout(orbit_row)
 
         self._path_status_label = QLabel("path: idle")
@@ -610,6 +627,12 @@ class ControlPanel(QWidget):
 
     def _on_orbit_radius_changed(self) -> None:
         self.orbit_radius_changed.emit(float(self._orbit_radius_spin.value()))
+
+    def _on_orbit_tilt_changed(self) -> None:
+        self.orbit_cone_tilt_changed.emit(float(self._orbit_tilt_spin.value()))
+
+    def orbit_cone_tilt_deg(self) -> float:
+        return float(self._orbit_tilt_spin.value())
 
     def _on_path_speed_changed(self) -> None:
         mm_s = float(self._path_speed_slider.value())

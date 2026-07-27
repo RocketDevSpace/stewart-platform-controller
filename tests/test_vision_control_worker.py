@@ -148,6 +148,7 @@ class FakeController:
         self.start_path_calls = 0
         self.stop_path_calls = 0
         self.orbit_radii: list[float] = []
+        self.orbit_cone_tilts: list[float] = []
         self.orbit_speeds: list[float] = []
         self.start_orbit_calls = 0
         self.stop_orbit_calls = 0
@@ -168,6 +169,9 @@ class FakeController:
 
     def set_orbit_radius(self, radius_mm: float) -> None:
         self.orbit_radii.append(float(radius_mm))
+
+    def set_orbit_cone_tilt(self, deg: float) -> None:
+        self.orbit_cone_tilts.append(float(deg))
 
     def set_orbit_speed(self, mm_s: float) -> None:
         self.orbit_speeds.append(float(mm_s))
@@ -661,6 +665,19 @@ class TestOrbitSlots:
         assert controller.orbit_radii[-1] == 60.0
         # Orbiting must NEVER auto-start on a fresh session.
         assert controller.start_orbit_calls == 0
+        worker.stop()
+
+    def test_cone_tilt_cached_and_forwarded(self) -> None:
+        worker, camera, controller = _make_worker([])
+        worker.set_orbit_cone_tilt(3.0)
+        assert controller.orbit_cone_tilts[-1] == 3.0
+        worker._running = False
+        saved = worker.ball_controller
+        worker.ball_controller = None
+        worker.set_orbit_cone_tilt(1.5)               # caches only
+        worker.ball_controller = saved
+        worker.start()
+        assert controller.orbit_cone_tilts[-1] == 1.5
         worker.stop()
 
     def test_path_speed_fans_out_to_orbit(self) -> None:

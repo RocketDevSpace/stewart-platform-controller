@@ -437,6 +437,9 @@ class BallController:
     def set_orbit_speed(self, mm_s: float) -> None:
         self._orbit.set_speed(float(mm_s))
 
+    def set_orbit_cone_tilt(self, deg: float) -> None:
+        self._orbit.set_cone_tilt(float(deg))
+
     def start_orbit(self) -> bool:
         """Begin the harmonic orbit. Same exclusion discipline as
         start_path: the orbit drives the arbiter override channel, so

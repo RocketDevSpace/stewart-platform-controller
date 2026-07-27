@@ -35,6 +35,7 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    ORBIT_CONE_TILT_DEG,
     ORBIT_RADIUS_MM,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
@@ -170,8 +171,10 @@ class VisionControlWorker(QtCore.QObject):
         # always begins with the follower idle.
         self._path_pattern_init: str = ""
         self._path_speed_init = float(PATH_SPEED_MM_S)
-        # Harmonic orbit: radius cached; orbiting itself never cached.
+        # Harmonic orbit: radius + cone tilt cached; orbiting itself
+        # never cached.
         self._orbit_radius_init = float(ORBIT_RADIUS_MM)
+        self._orbit_cone_tilt_init = float(ORBIT_CONE_TILT_DEG)
 
         self._timer: QtCore.QTimer | None = None
         self._running = False
@@ -280,6 +283,7 @@ class VisionControlWorker(QtCore.QObject):
             self.ball_controller.set_path_speed(self._path_speed_init)
             self.ball_controller.set_orbit_radius(self._orbit_radius_init)
             self.ball_controller.set_orbit_speed(self._path_speed_init)
+            self.ball_controller.set_orbit_cone_tilt(self._orbit_cone_tilt_init)
 
         # Event-driven tick: every published frame nudges _tick via the
         # queued _frame_arrived bridge (the QTimer below stays as the
@@ -485,6 +489,12 @@ class VisionControlWorker(QtCore.QObject):
         self._orbit_radius_init = float(radius_mm)
         if self.ball_controller is not None:
             self.ball_controller.set_orbit_radius(float(radius_mm))
+
+    @QtCore.pyqtSlot(float)
+    def set_orbit_cone_tilt(self, deg: float) -> None:
+        self._orbit_cone_tilt_init = float(deg)
+        if self.ball_controller is not None:
+            self.ball_controller.set_orbit_cone_tilt(float(deg))
 
     # ------------------------------------------------------------------
     # Inner loop
