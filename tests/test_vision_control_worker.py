@@ -147,6 +147,10 @@ class FakeController:
         self.path_speeds: list[float] = []
         self.start_path_calls = 0
         self.stop_path_calls = 0
+        self.orbit_radii: list[float] = []
+        self.orbit_speeds: list[float] = []
+        self.start_orbit_calls = 0
+        self.stop_orbit_calls = 0
 
     def compute_with_terms(
         self, ball_state: BallState
@@ -161,6 +165,19 @@ class FakeController:
 
     def set_path_speed(self, mm_s: float) -> None:
         self.path_speeds.append(float(mm_s))
+
+    def set_orbit_radius(self, radius_mm: float) -> None:
+        self.orbit_radii.append(float(radius_mm))
+
+    def set_orbit_speed(self, mm_s: float) -> None:
+        self.orbit_speeds.append(float(mm_s))
+
+    def start_orbit(self) -> bool:
+        self.start_orbit_calls += 1
+        return True
+
+    def stop_orbit(self) -> None:
+        self.stop_orbit_calls += 1
 
     def start_path(self) -> bool:
         self.start_path_calls += 1
@@ -616,6 +633,42 @@ class TestPathSlots:
         worker.set_path_pattern("")
         assert controller.paths == []
         assert worker._path_pattern_init == ""
+
+
+class TestOrbitSlots:
+    def test_slots_guard_none_controller(self) -> None:
+        worker, _, _ = _make_worker([])
+        worker.ball_controller = None
+        worker.set_orbit_enabled(True)
+        worker.set_orbit_enabled(False)
+        worker.set_orbit_radius(60.0)         # caches only, no raise
+
+    def test_toggle_forwards_to_controller(self) -> None:
+        worker, _, controller = _make_worker([])
+        worker.set_orbit_enabled(True)
+        worker.set_orbit_enabled(False)
+        assert controller.start_orbit_calls == 1
+        assert controller.stop_orbit_calls == 1
+
+    def test_radius_cached_prestart_applied_at_start(self) -> None:
+        worker, camera, controller = _make_worker([])
+        worker._running = False
+        saved = worker.ball_controller
+        worker.ball_controller = None
+        worker.set_orbit_radius(60.0)
+        worker.ball_controller = saved
+        worker.start()
+        assert controller.orbit_radii[-1] == 60.0
+        # Orbiting must NEVER auto-start on a fresh session.
+        assert controller.start_orbit_calls == 0
+        worker.stop()
+
+    def test_path_speed_fans_out_to_orbit(self) -> None:
+        # The one-slider-feeds-both contract.
+        worker, _, controller = _make_worker([])
+        worker.set_path_speed(35.0)
+        assert controller.path_speeds[-1] == 35.0
+        assert controller.orbit_speeds[-1] == 35.0
 
 
 class TestTrimFoldSlot:

@@ -172,15 +172,28 @@ def _draw_warped_overlays(
     cv2.line(frame, (tx - 14, ty), (tx + 14, ty), _TARGET_COLOR, 1, cv2.LINE_AA)
     cv2.line(frame, (tx, ty - 14), (tx, ty + 14), _TARGET_COLOR, 1, cv2.LINE_AA)
 
-    # Path following: moving carrot at the follower's current target +
-    # progress text bottom-right.
-    if control_terms is not None and bool(control_terms.get("path_active")):
+    # Path following OR harmonic orbit: moving target dot + status text
+    # bottom-right (the modes are mutually exclusive).
+    path_active = control_terms is not None and bool(
+        control_terms.get("path_active")
+    )
+    orbit_active = control_terms is not None and bool(
+        control_terms.get("orbit_active")
+    )
+    if control_terms is not None and (path_active or orbit_active):
         cv2.circle(frame, (tx, ty), 5, _PATH_COLOR, -1, cv2.LINE_AA)
-        path_txt = (
-            f"PATH {control_terms.get('path_state', '')} "
-            f"lap {int(control_terms.get('path_lap', 0))} "
-            f"{float(control_terms.get('path_progress', 0.0)):.0%}"
-        )
+        if orbit_active:
+            path_txt = (
+                f"ORBIT {control_terms.get('orbit_state', '')} "
+                f"lap {int(control_terms.get('orbit_lap', 0))} "
+                f"err {float(control_terms.get('orbit_err_mm', 0.0)):.1f}mm"
+            )
+        else:
+            path_txt = (
+                f"PATH {control_terms.get('path_state', '')} "
+                f"lap {int(control_terms.get('path_lap', 0))} "
+                f"{float(control_terms.get('path_progress', 0.0)):.0%}"
+            )
         size, _base = cv2.getTextSize(
             path_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1
         )

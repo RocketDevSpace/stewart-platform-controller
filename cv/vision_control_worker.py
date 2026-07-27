@@ -35,6 +35,7 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    ORBIT_RADIUS_MM,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KI,
@@ -169,6 +170,8 @@ class VisionControlWorker(QtCore.QObject):
         # always begins with the follower idle.
         self._path_pattern_init: str = ""
         self._path_speed_init = float(PATH_SPEED_MM_S)
+        # Harmonic orbit: radius cached; orbiting itself never cached.
+        self._orbit_radius_init = float(ORBIT_RADIUS_MM)
 
         self._timer: QtCore.QTimer | None = None
         self._running = False
@@ -275,6 +278,8 @@ class VisionControlWorker(QtCore.QObject):
                     PATTERNS[self._path_pattern_init]()
                 )
             self.ball_controller.set_path_speed(self._path_speed_init)
+            self.ball_controller.set_orbit_radius(self._orbit_radius_init)
+            self.ball_controller.set_orbit_speed(self._path_speed_init)
 
         # Event-driven tick: every published frame nudges _tick via the
         # queued _frame_arrived bridge (the QTimer below stays as the
@@ -457,9 +462,29 @@ class VisionControlWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot(float)
     def set_path_speed(self, mm_s: float) -> None:
+        """One slider feeds both modes: the path follower AND the
+        harmonic orbit take their tangential speed from here."""
         self._path_speed_init = float(mm_s)
         if self.ball_controller is not None:
             self.ball_controller.set_path_speed(float(mm_s))
+            self.ball_controller.set_orbit_speed(float(mm_s))
+
+    @QtCore.pyqtSlot(bool)
+    def set_orbit_enabled(self, enabled: bool) -> None:
+        """Start/stop the harmonic orbit. Deliberately NOT cached:
+        orbiting never auto-starts on a fresh session."""
+        if self.ball_controller is None:
+            return
+        if bool(enabled):
+            self.ball_controller.start_orbit()
+        else:
+            self.ball_controller.stop_orbit()
+
+    @QtCore.pyqtSlot(float)
+    def set_orbit_radius(self, radius_mm: float) -> None:
+        self._orbit_radius_init = float(radius_mm)
+        if self.ball_controller is not None:
+            self.ball_controller.set_orbit_radius(float(radius_mm))
 
     # ------------------------------------------------------------------
     # Inner loop

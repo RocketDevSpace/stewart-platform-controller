@@ -30,7 +30,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 import settings_store
-from control.patterns import PATTERNS
+from control.patterns import PATTERNS, circle
 from control.pose_commander import PoseCommander
 from control.routine_runner import RoutineRunner
 from core.ik_engine import IKEngine
@@ -53,6 +53,7 @@ from settings import (
     MANUAL_PITCH_TRIM_DEG,
     MANUAL_ROLL_TRIM_DEG,
     MAX_TILT_DEG,
+    ORBIT_RADIUS_MM,
     PATH_SPEED_MM_S,
     PD_DEFAULT_KD,
     PD_DEFAULT_KI,
@@ -89,6 +90,8 @@ class MainWindow(QWidget):
     vision_path_pattern_selected = QtCore.pyqtSignal(str)
     vision_path_following_set = QtCore.pyqtSignal(bool)
     vision_path_speed_updated = QtCore.pyqtSignal(float)
+    vision_orbit_set = QtCore.pyqtSignal(bool)
+    vision_orbit_radius_updated = QtCore.pyqtSignal(float)
     vision_snapshot_consumed = QtCore.pyqtSignal()
 
     def __init__(self) -> None:
@@ -169,6 +172,9 @@ class MainWindow(QWidget):
         self._path_following_active = False
         self._path_speed_mm_s = float(PATH_SPEED_MM_S)
         self._last_path_status = ""
+        # Harmonic orbit mirrors (worker owns the truth via terms)
+        self._orbit_active = False
+        self._orbit_radius_mm = float(ORBIT_RADIUS_MM)
 
         # --- Routine timer ---
         self._routine_timer = QtCore.QTimer()
@@ -216,6 +222,10 @@ class MainWindow(QWidget):
             self._on_path_pattern_selected
         )
         self.control_panel.path_toggled.connect(self._on_path_toggled)
+        self.control_panel.orbit_toggled.connect(self._on_orbit_toggled)
+        self.control_panel.orbit_radius_changed.connect(
+            self._on_orbit_radius_changed
+        )
         self.control_panel.path_speed_changed.connect(
             self._on_path_speed_changed
         )
@@ -733,6 +743,9 @@ class MainWindow(QWidget):
         self._home_calibration_active = False
         self.control_panel.sync_calibrate_button(False)
         self.vision_calibrate_home_set.emit(False)
+        self._orbit_active = False
+        self.control_panel.sync_orbit_button(False)
+        self.vision_orbit_set.emit(False)
 
         if label in PATTERNS:
             path = PATTERNS[label]()
@@ -744,6 +757,55 @@ class MainWindow(QWidget):
     def _on_path_speed_changed(self, mm_s: float) -> None:
         self._path_speed_mm_s = float(mm_s)
         self.vision_path_speed_updated.emit(self._path_speed_mm_s)
+
+    def _stop_orbit(self, message: str) -> None:
+        """Shared orbit stop: worker signal, button sync, overlay clear."""
+        self._orbit_active = False
+        self.control_panel.sync_orbit_button(False)
+        self.vision_orbit_set.emit(False)
+        self._vision_monitor.set_path_overlay(None)
+        self.control_panel.append_preview(message)
+
+    def _on_orbit_toggled(self, enabled: bool) -> None:
+        if not enabled:
+            self._stop_orbit("[ORBIT] stopped")
+            return
+
+        if not self._vision_enabled or self._vision_worker is None:
+            self.control_panel.append_preview("[ORBIT] start vision mode first")
+            self.control_panel.sync_orbit_button(False)
+            return
+
+        # Mutual exclusion mirrors (the controller enforces this too —
+        # belt and braces): autotune, home-cal, and path release.
+        self._pd_autotune_enabled = False
+        self._pd_autotune_auto_apply = False
+        self._pd_autotune_has_suggestion = False
+        self.control_panel.sync_autotune_buttons(False, False)
+        self.vision_pd_autotune_enabled.emit(False)
+        self.vision_pd_autotune_auto_apply.emit(False)
+        self._home_calibration_active = False
+        self.control_panel.sync_calibrate_button(False)
+        self.vision_calibrate_home_set.emit(False)
+        self._path_following_active = False
+        self.control_panel.sync_path_button(False)
+        self.vision_path_following_set.emit(False)
+
+        # Reference circle overlay (pure geometry for display).
+        ring = circle(radius_mm=self._orbit_radius_mm)
+        self._vision_monitor.set_path_overlay(ring.points, ring.closed)
+        self._orbit_active = True
+        self.vision_orbit_set.emit(True)
+        self.control_panel.append_preview(
+            f"[ORBIT] harmonic orbit r={self._orbit_radius_mm:.0f} mm"
+        )
+
+    def _on_orbit_radius_changed(self, radius_mm: float) -> None:
+        self._orbit_radius_mm = float(radius_mm)
+        self.vision_orbit_radius_updated.emit(self._orbit_radius_mm)
+        if self._orbit_active:
+            ring = circle(radius_mm=self._orbit_radius_mm)
+            self._vision_monitor.set_path_overlay(ring.points, ring.closed)
 
     # ------------------------------------------------------------------
     # Vision mode enable / disable
@@ -860,6 +922,12 @@ class MainWindow(QWidget):
         self.vision_path_speed_updated.connect(
             self._vision_worker.set_path_speed
         )
+        self.vision_orbit_set.connect(
+            self._vision_worker.set_orbit_enabled
+        )
+        self.vision_orbit_radius_updated.connect(
+            self._vision_worker.set_orbit_radius
+        )
         self.vision_snapshot_consumed.connect(
             self._vision_worker.mark_snapshot_consumed
         )
@@ -880,6 +948,7 @@ class MainWindow(QWidget):
             self.control_panel.current_pattern()
         )
         self.vision_path_speed_updated.emit(self._path_speed_mm_s)
+        self.vision_orbit_radius_updated.emit(self._orbit_radius_mm)
         self.vision_hsv_updated.emit(*self.control_panel.get_hsv())
 
     def _stop_vision_worker_async(self) -> None:
@@ -913,6 +982,10 @@ class MainWindow(QWidget):
              self._vision_worker.set_path_following),
             (self.vision_path_speed_updated,
              self._vision_worker.set_path_speed),
+            (self.vision_orbit_set,
+             self._vision_worker.set_orbit_enabled),
+            (self.vision_orbit_radius_updated,
+             self._vision_worker.set_orbit_radius),
             (self.vision_snapshot_consumed,
              self._vision_worker.mark_snapshot_consumed),
         ]:
@@ -957,6 +1030,8 @@ class MainWindow(QWidget):
         self.control_panel.sync_calibrate_button(False)
         self._path_following_active = False
         self.control_panel.sync_path_button(False)
+        self._orbit_active = False
+        self.control_panel.sync_orbit_button(False)
         self.control_panel.set_path_status("path: idle")
         self._last_path_status = ""
         self._vision_monitor.set_path_overlay(None)
@@ -1063,6 +1138,7 @@ class MainWindow(QWidget):
             self._sync_auto_trim_from_terms(terms)
             self._sync_home_calibration_from_terms(terms)
             self._sync_path_from_terms(terms)
+            self._sync_orbit_from_terms(terms)
 
             # Timing plot — derived metrics measured HERE are injected at
             # the call site; the widget owns history/trim/redraw cadence.
@@ -1202,6 +1278,27 @@ class MainWindow(QWidget):
         )
         # Update only when the formatted text changed — snapshots arrive at
         # GUI_SNAPSHOT_HZ and repainting an unchanged label is pure churn.
+        if status != self._last_path_status:
+            self._last_path_status = status
+            self.control_panel.set_path_status(status)
+
+    def _sync_orbit_from_terms(self, terms: dict) -> None:
+        if "orbit_active" not in terms:
+            return
+        active = bool(terms["orbit_active"])
+        if active != self._orbit_active:
+            self._orbit_active = active
+            self.control_panel.sync_orbit_button(active)
+        if not active:
+            return
+        # While orbiting, the shared status label shows the orbit line
+        # (path is idle — the modes are mutually exclusive).
+        status = (
+            f"orbit: {terms.get('orbit_state', 'idle')} · "
+            f"lap {int(terms.get('orbit_lap', 0))} · "
+            f"err {float(terms.get('orbit_err_mm', 0.0)):.1f}mm · "
+            f"ilc {float(terms.get('orbit_ilc_deg', 0.0)):.2f}deg"
+        )
         if status != self._last_path_status:
             self._last_path_status = status
             self.control_panel.set_path_status(status)
